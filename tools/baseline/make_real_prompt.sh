@@ -17,7 +17,7 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="${SONICBOOM_ROOT:-$(cd "$DIR/../.." && pwd)}"
 
-MODEL="${SONICBOOM_GEMMA_GGUF:-$ROOT/models/gemma-4-E4B-it-Q3_K_M.gguf}"
+MODEL="${SONICBOOM_GEMMA_GGUF:-$ROOT/models/gemma-4-E4B-it-Q5_K_M.gguf}"
 if [ ! -f "$MODEL" ]; then
   echo "model not found: $MODEL (set SONICBOOM_GEMMA_GGUF)" >&2
   exit 1

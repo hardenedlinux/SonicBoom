@@ -9,7 +9,7 @@
 ;;;            reported as milliseconds.
 ;;;
 ;;; Usage:
-;;;   LD_LIBRARY_PATH=build/core SONICBOOM_GEMMA_GGUF=models/gemma-4-E4B-it-Q3_K_M.gguf \
+;;;   LD_LIBRARY_PATH=build/core SONICBOOM_GEMMA_GGUF=models/gemma-4-E4B-it-Q5_K_M.gguf \
 ;;;     guile --no-auto-compile -L bindings/guile/scheme tools/baseline/measure_capi.scm
 
 (use-modules (system foreign)

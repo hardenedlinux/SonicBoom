@@ -1,4 +1,4 @@
-// C ABI sampling tests (qwen2.5-0.5b, CUDA).
+// C ABI sampling tests (Qwen2.5-7B, CUDA).
 //
 //  1. the same (temperature, top_p, seed) twice produces identical tokens;
 //  2. a different seed diverges within 64 tokens;
@@ -191,7 +191,7 @@ int main(void) {
   const char *root = SONICBOOM_SRC_DIR;
   char model_path[4096];
   snprintf(model_path, sizeof model_path, "%s/models/%s", root,
-           "qwen2.5-0.5b-instruct-q4_k_m.gguf");
+           "qwen2.5-7b-instruct-1m-q4_k_m.gguf");
 
   FILE *mf = fopen(model_path, "rb");
   if (!mf) {

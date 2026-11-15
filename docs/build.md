@@ -90,15 +90,14 @@ Download a model and verify it:
 
 ```sh
 mkdir -p models
-curl -L -o models/gemma-4-E4B-it-Q3_K_M.gguf \
-  https://huggingface.co/unsloth/gemma-4-e4b-it-GGUF/resolve/main/gemma-4-E4B-it-Q3_K_M.gguf
-echo "0980898d0e7d9c75cea05141bf4010393312101ef6cf5b31f8197e0de18655f4  models/gemma-4-E4B-it-Q3_K_M.gguf" | sha256sum -c
+curl -L -o models/gemma-4-E4B-it-Q5_K_M.gguf \
+  https://huggingface.co/unsloth/gemma-4-e4b-it-GGUF/resolve/main/gemma-4-E4B-it-Q5_K_M.gguf
+echo "a5d6e634db151368d2caa4270fd32ab604d96c2d1291950586989f46d8e17d36  models/gemma-4-E4B-it-Q5_K_M.gguf" | sha256sum -c
 ```
 
 Any GGUF the runtime supports runs the same way — for instance the other
-benchmarked files (`qwen2.5-0.5b-instruct-q4_k_m.gguf`,
-`DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf` and
-`qwen2.5-7b-instruct-1m-q4_k_m.gguf`); every file and checksum is in
+benchmarked files (`qwen2.5-7b-instruct-1m-q4_k_m.gguf` and
+`Qwen3.6-35B-A3B-Q4_K_M.gguf`); every file and checksum is in
 [Scope](scope.md).
 
 Then start Guile:
@@ -110,7 +109,7 @@ LD_LIBRARY_PATH=build/core guile -L bindings/guile/scheme
 ```scheme
 (use-modules (sonicboom inference))
 
-(define model   (load-model "models/gemma-4-E4B-it-Q3_K_M.gguf"))
+(define model   (load-model "models/gemma-4-E4B-it-Q5_K_M.gguf"))
 (define session (make-session model 4096))
 
 (display (generate model session "The three laws of thermodynamics are" 64))
@@ -154,7 +153,7 @@ LLAMA_BENCH=/path/to/llama-bench tools/sb-report.sh --model your-model.gguf
 `bench.sh` runs the canonical bench (3 process runs) for any GGUF the runtime
 loads; `--long` adds the 4K–32K decode and prefill tiers. `sb-report.sh` runs
 the canonical bench and prints the hardware and the build behind the numbers;
-`--gemma` / `--qwen` / `--deepseek` also run the golden checks, while `--model`
+`--gemma` / `--qwen` also run the golden checks, while `--model`
 is for a benchmark-only file with no golden tag.
 
 Every metric is the median of 3 process runs and both runtimes are measured in

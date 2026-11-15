@@ -51,43 +51,43 @@ std::string find_model() {
   if (const char* env = std::getenv("SONICBOOM_QWEN_GGUF")) candidates.push_back(env);
 #ifdef SONICBOOM_SRC_DIR
   candidates.push_back(std::string(SONICBOOM_SRC_DIR) +
-                       "/models/qwen2.5-0.5b-instruct-q4_k_m.gguf");
+                       "/models/qwen2.5-7b-instruct-1m-q4_k_m.gguf");
 #endif
-  candidates.push_back("models/qwen2.5-0.5b-instruct-q4_k_m.gguf");
+  candidates.push_back("models/qwen2.5-7b-instruct-1m-q4_k_m.gguf");
   for (const auto& c : candidates)
     if (std::filesystem::exists(c)) return c;
   return {};
 }
 
 void test_qwen2_config(const sbmodel::Gemma4Config& c) {
-  // --- frozen Qwen2.5-0.5B-Instruct facts (dump of the Q4_K_M GGUF) ----------
+  // --- frozen Qwen2.5-7B-Instruct-1M facts (dump of the Q4_K_M GGUF) ---------
   check(c.arch == sbmodel::ModelArch::Qwen2, "config: arch Qwen2");
-  check(c.block_count == 24, "config: block_count 24");
-  check(c.embedding_length == 896, "config: embedding_length 896");
-  check(c.feed_forward_length == 4864, "config: feed_forward_length 4864");
-  check(c.head_count == 14, "config: head_count 14");
-  check(c.head_count_kv == 2, "config: head_count_kv 2");
-  check(c.head_dim_global == 64, "config: head_dim_global 64 (896 / 14)");
+  check(c.block_count == 28, "config: block_count 28");
+  check(c.embedding_length == 3584, "config: embedding_length 3584");
+  check(c.feed_forward_length == 18944, "config: feed_forward_length 18944");
+  check(c.head_count == 28, "config: head_count 28");
+  check(c.head_count_kv == 4, "config: head_count_kv 4");
+  check(c.head_dim_global == 128, "config: head_dim_global 128 (3584 / 28)");
   check(c.head_dim_swa == 0, "config: head_dim_swa 0 (no SWA)");
   check(c.per_layer_input == 0, "config: per_layer_input 0 (no per-layer input)");
-  check(c.context_length == 32768, "config: context_length 32768");
+  check(c.context_length == 1010000, "config: context_length 1010000");
   check(c.sliding_window == 0, "config: sliding_window 0");
-  check(c.vocab_size == 151936, "config: vocab_size 151936");
-  check(std::fabs(c.rms_epsilon - 1e-6f) < 1e-7f, "config: rms_epsilon 1e-6");
+  check(c.vocab_size == 152064, "config: vocab_size 152064");
+  check(std::fabs(c.rms_epsilon - 1e-5f) < 1e-6f, "config: rms_epsilon 1e-5");
   check(c.final_logit_softcapping == 0.0f, "config: final_logit_softcapping 0");
-  check(c.rope_base == 1e6f, "config: rope_base 1e6");
+  check(c.rope_base == 1e7f, "config: rope_base 1e7");
   check(c.rope_base_swa == 0.0f, "config: rope_base_swa 0");
   check(c.shared_kv_layers == 0, "config: shared_kv_layers 0");
   check(c.sliding_window_pattern.empty(), "config: sliding_window_pattern empty");
   check(c.valid(), "config: valid()");
 
   // --- every layer is global (no SWA), no shared KV --------------------------
-  check(c.n_layer_kv() == 24, "config: 24 KV layers (no sharing)");
+  check(c.n_layer_kv() == 28, "config: 28 KV layers (no sharing)");
   const sbmodel::LayerConfig l0 = c.layer_config(0);
   check(l0.attention == sbmodel::AttentionKind::Global, "layer 0: global");
-  check(l0.head_dim == 64 && l0.rope_base == 1e6f && l0.sliding_window == 0,
-        "layer 0: head_dim 64 / rope 1e6 / no window");
-  check(c.has_kv(0) && c.has_kv(23), "config: layers 0/23 have KV");
+  check(l0.head_dim == 128 && l0.rope_base == 1e7f && l0.sliding_window == 0,
+        "layer 0: head_dim 128 / rope 1e7 / no window");
+  check(c.has_kv(0) && c.has_kv(27), "config: layers 0/27 have KV");
   check(c.kv_donor_layer(7) == 7, "config: kv_donor_layer identity (no sharing)");
 }
 

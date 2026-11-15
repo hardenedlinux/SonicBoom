@@ -1,9 +1,8 @@
 # Roadmap
 
-- **Formats and models:** Q6_K, Q8_0 and Q5_0 are native and four families are
-  benchmarked (Gemma 4, Qwen2.5-0.5B, DeepSeek-R1-Distill-Qwen-1.5B,
-  Qwen2.5-7B-Instruct-1M); next are further families (Llama, Mistral) and the
-  quant formats they ship with
+- **Formats and models:** Q6_K, Q8_0 and Q5_0 are native and three families are
+  benchmarked (Gemma 4, Qwen2.5-7B-Instruct-1M, Qwen3.6-35B-A3B); next are
+  further families (Llama, Mistral) and the quant formats they ship with
 - **Speed:** decode is ahead of llama.cpp on the d64 family and within 0.92× on
   Qwen2.5-7B at 4K; prefill is ahead on Gemma 4 and behind on the d128
   families, most visibly on 8K+ prompts. Next are a batched d128 matmul path

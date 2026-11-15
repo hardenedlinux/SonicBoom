@@ -77,9 +77,9 @@ std::string find_model() {
   if (const char* env = std::getenv("SONICBOOM_GEMMA_GGUF")) candidates.push_back(env);
 #ifdef SONICBOOM_SRC_DIR
   candidates.push_back(std::string(SONICBOOM_SRC_DIR) +
-                       "/models/gemma-4-E4B-it-Q3_K_M.gguf");
+                       "/models/gemma-4-E4B-it-Q5_K_M.gguf");
 #endif
-  candidates.push_back("models/gemma-4-E4B-it-Q3_K_M.gguf");
+  candidates.push_back("models/gemma-4-E4B-it-Q5_K_M.gguf");
   for (const auto& c : candidates)
     if (std::filesystem::exists(c)) return c;
   return {};
@@ -157,20 +157,24 @@ void test_model(const sbmodel::Gemma4Model& m) {
   const auto& b5 = m.weights.blocks[5];
   check(b5.attn_q.dims() == std::vector<uint64_t>({2560, 4096}),
         "weights: blk.5 attn_q [2560,4096] (global)");
-  // Mixed precision: attn_v / ffn_down are q5_K in blk.{0,1}, q4_K elsewhere.
-  check(b0.attn_v.type() == sbquant::QuantType::Q5_K, "weights: blk.0 attn_v q5_K");
-  check(b0.ffn_down.type() == sbquant::QuantType::Q5_K, "weights: blk.0 ffn_down q5_K");
-  // Explicit blk.1 (Q5_K) -> blk.2 (Q4_K) mixed-precision boundary: the
-  // last q5_K block is blk.1, the first q4_K block is blk.2.
-  check(m.weights.blocks[1].attn_v.type() == sbquant::QuantType::Q5_K,
-        "weights: blk.1 attn_v q5_K (last q5_K block)");
-  check(m.weights.blocks[1].ffn_down.type() == sbquant::QuantType::Q5_K,
-        "weights: blk.1 ffn_down q5_K (last q5_K block)");
-  check(m.weights.blocks[2].attn_v.type() == sbquant::QuantType::Q4_K,
-        "weights: blk.2 attn_v q4_K (mixed boundary)");
-  check(m.weights.blocks[2].ffn_down.type() == sbquant::QuantType::Q4_K,
-        "weights: blk.2 ffn_down q4_K (mixed boundary)");
-  check(b5.attn_v.type() == sbquant::QuantType::Q4_K, "weights: blk.5 attn_v q4_K");
+  // Mixed precision: attn_v / ffn_down are q6_K in the block set
+  // {0,1,2,3,4,7,10,13,16,19,22,25,28,31,34,36,37,38,39,40,41} and q5_K in the
+  // others. blk.0 opens the first run of q6_K, blk.5 is the q5_K block after
+  // it, and blk.7 opens the next run.
+  check(b0.attn_v.type() == sbquant::QuantType::Q6_K, "weights: blk.0 attn_v q6_K");
+  check(b0.ffn_down.type() == sbquant::QuantType::Q6_K, "weights: blk.0 ffn_down q6_K");
+  check(m.weights.blocks[4].attn_v.type() == sbquant::QuantType::Q6_K,
+        "weights: blk.4 attn_v q6_K (last q6_K block of the first run)");
+  check(b5.attn_v.type() == sbquant::QuantType::Q5_K, "weights: blk.5 attn_v q5_K");
+  check(b5.ffn_down.type() == sbquant::QuantType::Q5_K, "weights: blk.5 ffn_down q5_K");
+  check(m.weights.blocks[6].attn_v.type() == sbquant::QuantType::Q5_K,
+        "weights: blk.6 attn_v q5_K (last q5_K block)");
+  check(m.weights.blocks[7].attn_v.type() == sbquant::QuantType::Q6_K,
+        "weights: blk.7 attn_v q6_K (mixed boundary)");
+  check(m.weights.blocks[7].ffn_down.type() == sbquant::QuantType::Q6_K,
+        "weights: blk.7 ffn_down q6_K (mixed boundary)");
+  check(m.weights.blocks[41].ffn_down.type() == sbquant::QuantType::Q6_K,
+        "weights: blk.41 ffn_down q6_K (last block)");
   check(b0.attn_norm.size() == 2560 && b0.ffn_norm.size() == 2560,
         "weights: blk.0 norm weights [2560]");
   check(b0.layer_output_scale.size() == 1, "weights: blk.0 layer_output_scale [1]");

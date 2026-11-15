@@ -254,19 +254,19 @@ tests).
 # canonical table for one model (SonicBoom; set LLAMA_BENCH to add the
 # llama.cpp column and the ratios)
 LLAMA_BENCH=$LLAMA_ROOT/build-cuda/bin/llama-bench \
-  tools/bench.sh models/gemma-4-E4B-it-Q3_K_M.gguf
+  tools/bench.sh models/gemma-4-E4B-it-Q5_K_M.gguf
 
 # one metric by hand, e.g. decode at depth 512 (model from SONICBOOM_GEMMA_GGUF)
-SONICBOOM_GEMMA_GGUF=models/gemma-4-E4B-it-Q3_K_M.gguf \
+SONICBOOM_GEMMA_GGUF=models/gemma-4-E4B-it-Q5_K_M.gguf \
   tools/baseline/longctx_bench --depth 512 --steps 64
 
 # baseline (llama.cpp, same GGUF and machine)
 $LLAMA_ROOT/build-cuda/bin/llama-bench \
-  -m models/gemma-4-E4B-it-Q3_K_M.gguf -p 512 -n 64 -ngl 99 -r 1
+  -m models/gemma-4-E4B-it-Q5_K_M.gguf -p 512 -n 64 -ngl 99 -r 1
 
 # extended-context tiers: decode at depth 4K/8K/16K/32K and prefill 4K–32K
 LLAMA_BENCH=$LLAMA_ROOT/build-cuda/bin/llama-bench \
-  tools/bench.sh models/gemma-4-E4B-it-Q3_K_M.gguf --long
+  tools/bench.sh models/gemma-4-E4B-it-Q5_K_M.gguf --long
 
 # correctness
 ctest --test-dir build

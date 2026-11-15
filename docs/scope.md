@@ -4,20 +4,19 @@ SonicBoom v0.0.6 is a working runtime, not a drop-in replacement for
 llama.cpp. It adds speculative decoding through every entry point — the C ABI,
 Guile and the OpenAI-compatible server — to the v0.0.5 runtime. Its limits:
 
-- **Four benchmarked language-model families:** Gemma 4 E4B-it Q3_K_M,
-  Qwen2.5-0.5B-Instruct Q4_K_M, DeepSeek-R1-Distill-Qwen-1.5B Q4_K_M and
-  Qwen2.5-7B-Instruct-1M Q4_K_M. All run end to end — load, tokenize, prefill
-  and decode on CPU and CUDA, prefix reuse, OpenAI-compatible serving. Gemma 4
-  and Qwen2.5-0.5B are checked against llama.cpp by the committed golden
-  suites; DeepSeek is covered by the engine regression suite; Qwen2.5-7B is
-  benchmarked for speed and is not part of the golden set.
+- **Three benchmarked language-model families:** Gemma 4 E4B-it Q5_K_M,
+  Qwen2.5-7B-Instruct-1M Q4_K_M and Qwen3.6-35B-A3B Q4_K_M. All run end to
+  end — load, tokenize, prefill and decode on CPU and CUDA, prefix reuse,
+  OpenAI-compatible serving. Gemma 4 and Qwen2.5-7B are checked against
+  llama.cpp by the committed golden suites; Qwen3.6-35B-A3B is benchmarked for
+  speed and is checked against llama.cpp tokens by the engine token-golden
+  suites maintained separately.
 
   | | file | sha256 |
   |---|---|---|
-  | Gemma 4 E4B-it | `gemma-4-E4B-it-Q3_K_M.gguf` (4,058,137,728 bytes) | `0980898d0e7d9c75cea05141bf4010393312101ef6cf5b31f8197e0de18655f4` |
-  | Qwen2.5-0.5B-Instruct | `qwen2.5-0.5b-instruct-q4_k_m.gguf` (491,400,032 bytes) | `74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db` |
-  | DeepSeek-R1-Distill-Qwen-1.5B | `DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf` (1,117,321,312 bytes) | `f3bdf9cf31dee4b57ae4e455a1cb0d01b5c2c1b50d72d3112141c195506c2840` |
+  | Gemma 4 E4B-it | `gemma-4-E4B-it-Q5_K_M.gguf` (5,481,798,784 bytes) | `a5d6e634db151368d2caa4270fd32ab604d96c2d1291950586989f46d8e17d36` |
   | Qwen2.5-7B-Instruct-1M | `qwen2.5-7b-instruct-1m-q4_k_m.gguf` (4,683,073,888 bytes) | `6dba997502a27b5f0c840346f45d9d62c0a04e6eb3cf72adc6c7ceb18804f380` |
+  | Qwen3.6-35B-A3B | `Qwen3.6-35B-A3B-Q4_K_M.gguf` (20,542,732,576 bytes) | `f4ffe03c9139e6a905a5d346f77d9fabdd179367c3280dfd005d1e75ca5ed8c8` |
 
   The GGUF's architecture string selects the plan and the chat format. There is
   no `if (arch == ...)` in the planner or the backends, and no model-specific
@@ -25,8 +24,8 @@ Guile and the OpenAI-compatible server — to the v0.0.5 runtime. Its limits:
   (a SiLU-gated FFN, full attention with no sliding window, a bias on each
   Q/K/V projection, an attention scale) are all generic ops and attributes, and
   the fallback to the token embedding when a file omits `output.weight` is
-  generic too. DeepSeek and the 1M variant load through that same qwen2 path;
-  their vocabulary, context length and RoPE base come from the GGUF.
+  generic too. The 1M variant loads through that same qwen2 path;
+  its vocabulary, context length and RoPE base come from the GGUF.
 - **Quant formats:** Q3_K, Q4_K, Q5_K, Q6_K, Q5_0 and Q8_0. `f16` and `q4_0`
   tensors are converted to Q5_K at load time, which requires the row length to
   be a multiple of 256; anything else is refused rather than converted. Q6_K

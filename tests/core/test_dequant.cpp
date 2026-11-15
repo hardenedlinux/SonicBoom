@@ -449,9 +449,9 @@ void test_differential_model() {
   if (const char* env = std::getenv("SONICBOOM_GEMMA_GGUF")) candidates.push_back(env);
 #ifdef SONICBOOM_SRC_DIR
   candidates.push_back(std::string(SONICBOOM_SRC_DIR) +
-                       "/models/gemma-4-E4B-it-Q3_K_M.gguf");
+                       "/models/gemma-4-E4B-it-Q5_K_M.gguf");
 #endif
-  candidates.push_back("models/gemma-4-E4B-it-Q3_K_M.gguf");
+  candidates.push_back("models/gemma-4-E4B-it-Q5_K_M.gguf");
 
   std::string path;
   for (const auto& c : candidates)

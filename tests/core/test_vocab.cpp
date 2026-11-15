@@ -65,9 +65,9 @@ std::string find_model() {
     candidates.push_back(env);
 #ifdef SONICBOOM_SRC_DIR
   candidates.push_back(std::string(SONICBOOM_SRC_DIR) +
-                       "/models/gemma-4-E4B-it-Q3_K_M.gguf");
+                       "/models/gemma-4-E4B-it-Q5_K_M.gguf");
 #endif
-  candidates.push_back("models/gemma-4-E4B-it-Q3_K_M.gguf");
+  candidates.push_back("models/gemma-4-E4B-it-Q5_K_M.gguf");
   for (const auto& c : candidates)
     if (std::filesystem::exists(c)) return c;
   return {};
@@ -291,9 +291,9 @@ std::string find_qwen_model() {
     candidates.push_back(env);
 #ifdef SONICBOOM_SRC_DIR
   candidates.push_back(std::string(SONICBOOM_SRC_DIR) +
-                       "/models/qwen2.5-0.5b-instruct-q4_k_m.gguf");
+                       "/models/qwen2.5-7b-instruct-1m-q4_k_m.gguf");
 #endif
-  candidates.push_back("models/qwen2.5-0.5b-instruct-q4_k_m.gguf");
+  candidates.push_back("models/qwen2.5-7b-instruct-1m-q4_k_m.gguf");
   for (const auto& c : candidates)
     if (std::filesystem::exists(c)) return c;
   return {};

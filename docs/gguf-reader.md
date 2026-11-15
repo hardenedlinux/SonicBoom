@@ -75,13 +75,13 @@ against `reader.cpp`; registered in CTest as `test_gguf`.
 ## Real-model validation
 
 Validated against a real Gemma 4 GGUF file now present in the workspace
-(`models/gemma-4-E4B-it-Q3_K_M.gguf`, 4.06 GB, GGUF v3):
+(`models/gemma-4-E4B-it-Q5_K_M.gguf`, 5.48 GB, GGUF v3):
 
 | file | size | tensors | result |
 |---|---|---|---|
 | `~/Project/velum/models/hift.gguf` | 83 MB | 246 | parsed OK (vocoder, f32) |
 | `~/Project/velum/models/llm.gguf` | 2.5 GB | 293 | parsed OK (transformer LLM, f32) |
-| `models/gemma-4-E4B-it-Q3_K_M.gguf` | 4.06 GB | 720 | parsed OK (Gemma 4 E4B-It, mixed quant) |
+| `models/gemma-4-E4B-it-Q5_K_M.gguf` | 5.48 GB | 720 | parsed OK (Gemma 4 E4B-It, mixed quant) |
 
 The Gemma 4 file parses cleanly end to end: `version=3`, `n_kv=56`,
 `alignment=32`, `general.architecture = "gemma4"`, `general.name =
@@ -91,20 +91,19 @@ resolve to a correct data span (`resolvable=720 bad=0 unknown_type=0`), proving
 the header → KV → tensor-directory → offset/alignment → raw-bytes path on a real
 quantized model.
 
-Tensor dtype mix (the "_M" in Q3_K_M means mixed):
+Tensor dtype mix (the "_M" in Q5_K_M means mixed):
 
 | ggml type | count |
 |---|---|
 | `f32` | 423 (norms, biases, `layer_output_scale`) |
-| `q3_K` | 169 (`token_embd`, `attn_q/k`, `ffn_gate/up`) |
-| `q4_K` | 123 (`attn_output`, `per_layer_token_embd`) |
-| `q5_K` | 4 (`attn_v`, `ffn_down`) |
+| `q5_K` | 254 (`token_embd`, `attn_q/k`, `attn_output`, `ffn_gate/up`, `per_layer_token_embd`) |
+| `q6_K` | 42 (`attn_v`, `ffn_down` in 21 of the 42 blocks) |
 | `bf16` | 1 (`per_layer_model_proj`) |
 
 Two Gemma-4-specific structure notes relevant to execution: (1) there is **no
 `output.weight`** — the LM head is a per-layer token embedding
 (`per_layer_model_proj.weight` [2560×10752, bf16] × `per_layer_token_embd.weight`
-[10752×262144, q4_K]); (2) every block carries a learned `layer_output_scale`
+[10752×262144, q5_K]); (2) every block carries a learned `layer_output_scale`
 (f32 scalar) applied to its residual output. Neither is a plain tied embedding.
 The reader exposes all of this by name/shape/offset/bytes; none of the dequant
 or computation is in scope here.

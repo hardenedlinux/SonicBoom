@@ -864,7 +864,7 @@ std::expected<Gemma4Config, std::string> load_config(const gguf::Reader& r) {
   return std::unexpected(std::string("unknown architecture"));
 }
 
-// Qwen2 weight binding (Qwen2.5-0.5B-Instruct, Q4_K_M). A standard decoder
+// Qwen2 weight binding (Qwen2.5-7B-Instruct, Q4_K_M). A standard decoder
 // block: no per-layer embedding gate, no Q/K per-head norm, no post-attention /
 // post-ffw norm, no whole-block output scale — and two things Gemma 4 does not
 // have: a bias on each of the Q/K/V projections, and an untied output
@@ -1203,8 +1203,9 @@ std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
       bw.attn_q = *q;
     if (auto q = bind_quant(r, p + "attn_k.weight", {kQ3K}, {d, kv_width}, errs, m.owned_quant_buffers, converted))
       bw.attn_k = *q;
-    // attn_v / ffn_down are mixed-precision (Unsloth Q3_K_M): q5_K in the first
-    // two blocks, q4_K elsewhere — both are supported, so accept either.
+    // attn_v / ffn_down are mixed-precision in the Unsloth files (q6_K in 21
+    // of the 42 blocks, q5_K in the rest); both are native quant types, and the
+    // binder accepts any native type, so the file's mix is kept as written.
     if (auto q = bind_quant(r, p + "attn_v.weight", {kQ5K, kQ4K}, {d, kv_width}, errs, m.owned_quant_buffers, converted))
       bw.attn_v = *q;
     if (auto q = bind_quant(r, p + "attn_output.weight", {kQ4K}, {q_width, d}, errs, m.owned_quant_buffers, converted))

@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
   if (path.empty()) {
     const char* root = std::getenv("SONICBOOM_ROOT");
     std::string base = root ? std::string(root) : std::string(".");
-    path = base + "/models/gemma-4-E4B-it-Q3_K_M.gguf";
+    path = base + "/models/gemma-4-E4B-it-Q5_K_M.gguf";
   }
   if (!std::filesystem::exists(path)) {
     fprintf(stderr, "model not found: %s\n", path.c_str());

@@ -1,4 +1,4 @@
-// The published inference guarantees, on qwen2.5-0.5b and Gemma 4 E4B through
+// The published inference guarantees, on Qwen2.5-7B and Gemma 4 E4B through
 // the stable C ABI, greedy, with the numerics-bearing choices pinned the way
 // the golden tests pin them:
 //
@@ -355,9 +355,9 @@ int main(int argc, char** argv) {
   }
 
   const std::string qwen =
-      model_path("SONICBOOM_QWEN_GGUF", "qwen2.5-0.5b-instruct-q4_k_m.gguf");
+      model_path("SONICBOOM_QWEN_GGUF", "qwen2.5-7b-instruct-1m-q4_k_m.gguf");
   const std::string gemma =
-      model_path("SONICBOOM_GEMMA_GGUF", "gemma-4-E4B-it-Q3_K_M.gguf");
+      model_path("SONICBOOM_GEMMA_GGUF", "gemma-4-E4B-it-Q5_K_M.gguf");
   std::error_code ec;
   const bool have_qwen = std::filesystem::exists(qwen, ec);
   const bool have_gemma = std::filesystem::exists(gemma, ec);
@@ -369,9 +369,9 @@ int main(int argc, char** argv) {
     return 77;
   }
 
-  run_model("SONICBOOM_QWEN_GGUF", "qwen2.5-0.5b-instruct-q4_k_m.gguf",
-            "qwen2.5-0.5b");
-  run_model("SONICBOOM_GEMMA_GGUF", "gemma-4-E4B-it-Q3_K_M.gguf",
+  run_model("SONICBOOM_QWEN_GGUF", "qwen2.5-7b-instruct-1m-q4_k_m.gguf",
+            "qwen2.5-7b");
+  run_model("SONICBOOM_GEMMA_GGUF", "gemma-4-E4B-it-Q5_K_M.gguf",
             "gemma-4-E4B");
 
   if (g_failures) {

@@ -120,8 +120,8 @@ class Boom_QuantType<string name, string typeMnemonic, string formatName,
 }
 
 // The K-quants: 256-element super-blocks. Listed in quant::QuantType's order;
-// the set is that table's, and q3_K is the format the primary model
-// (gemma-4-E4B-it-Q3_K_M) stores its weights in.
+// the set is that table's, and q5_K is the format the primary model
+// (gemma-4-E4B-it-Q5_K_M) stores most of its weights in.
 def Boom_Q3KType : Boom_QuantType<"Q3K", "q3_k", "q3_K", 256>;
 def Boom_Q4KType : Boom_QuantType<"Q4K", "q4_k", "q4_K", 256>;
 def Boom_Q5KType : Boom_QuantType<"Q5K", "q5_k", "q5_K", 256>;

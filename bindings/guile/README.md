@@ -353,7 +353,7 @@ other keywords are unused: the greedy path is a plain argmax, so `#:min-p`,
 ```scheme
 (use-modules (sonicboom inference))
 
-(define model   (load-model "models/gemma-4-E4B-it-Q3_K_M.gguf"))
+(define model   (load-model "models/gemma-4-E4B-it-Q5_K_M.gguf"))
 (define session (make-session model 512))
 
 (display (generate model session "Hello" 16))
@@ -388,7 +388,7 @@ repeats the reply exactly:
 ```sh
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H 'content-type: application/json' \
-  -d '{"model":"gemma-4-E4B-it-Q3_K_M",
+  -d '{"model":"gemma-4-E4B-it-Q5_K_M",
        "messages":[{"role":"user","content":"hi"}],
        "max_tokens":32,"temperature":0.8,"top_p":0.95,"seed":7}'
 ```

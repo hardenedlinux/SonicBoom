@@ -70,18 +70,14 @@ struct Case {
 };
 
 const Case kCases[] = {
-    {"gemma4-decode", "SONICBOOM_GEMMA_GGUF", "gemma-4-E4B-it-Q3_K_M.gguf",
+    {"gemma4-decode", "SONICBOOM_GEMMA_GGUF", "gemma-4-E4B-it-Q5_K_M.gguf",
      true, 0},
-    {"gemma4-prefill", "SONICBOOM_GEMMA_GGUF", "gemma-4-E4B-it-Q3_K_M.gguf",
+    {"gemma4-prefill", "SONICBOOM_GEMMA_GGUF", "gemma-4-E4B-it-Q5_K_M.gguf",
      false, 8},
     {"qwen2-decode", "SONICBOOM_QWEN_GGUF",
-     "qwen2.5-0.5b-instruct-q4_k_m.gguf", true, 0},
+     "qwen2.5-7b-instruct-1m-q4_k_m.gguf", true, 0},
     {"qwen2-prefill", "SONICBOOM_QWEN_GGUF",
-     "qwen2.5-0.5b-instruct-q4_k_m.gguf", false, 8},
-    {"deepseek-r1-decode", "SONICBOOM_DEEPSEEK_GGUF",
-     "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf", true, 0},
-    {"deepseek-r1-prefill", "SONICBOOM_DEEPSEEK_GGUF",
-     "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf", false, 8},
+     "qwen2.5-7b-instruct-1m-q4_k_m.gguf", false, 8},
 };
 
 int g_failures = 0;

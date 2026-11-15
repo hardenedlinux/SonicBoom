@@ -169,7 +169,7 @@ add_executable(test_capi_binding test_capi_binding.c)
 target_link_libraries(test_capi_binding PRIVATE sonicboom)
 sb_add_cpp_test(test_capi_binding)
 
-# Seeded sampling through the C ABI (qwen2.5-0.5b, CUDA): determinism, seed
+# Seeded sampling through the C ABI (Qwen2.5-7B, CUDA): determinism, seed
 # sensitivity, prefix-reuse identity, the greedy golden and grammar+sampling.
 # Skips cleanly (exit 77) without the model, the golden or a CUDA device.
 if(SONICBOOM_USE_CUDA)
@@ -205,7 +205,7 @@ if(SONICBOOM_USE_CUDA)
 endif()
 
 # The published inference guarantees (determinism, prefix reuse, KV-capacity
-# independence, speculative-decoding identity) on qwen2.5-0.5b and Gemma 4 E4B,
+# independence, speculative-decoding identity) on Qwen2.5-7B and Gemma 4 E4B,
 # greedy, with the decode chunk pinned. Skips (77) without a CUDA device or the
 # model GGUFs; one process per (model, check) keeps the device pools bounded.
 if(SONICBOOM_USE_CUDA)
@@ -220,7 +220,7 @@ if(SONICBOOM_USE_CUDA)
     ENVIRONMENT "SONICBOOM_TUNE=canonical")
 endif()
 
-# Plan recording smoke: the six model/mode cases recorded twice each in one
+# Plan recording smoke: the four model/mode cases recorded twice each in one
 # process are identical, and no CUDA error survives a recording. The
 # recordings themselves (device lines, kernel geometry, dispatch decisions) and
 # the pinned tune table they were recorded against are engine internals: their

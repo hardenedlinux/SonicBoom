@@ -50,8 +50,7 @@ Every row comes from the two commands under
 [Reproduce the table](#reproduce-the-table). Model files, checksums and the
 long-context tiers are in [docs/benchmark.md](docs/benchmark.md). Models under
 2B parameters are no longer benchmarked, because they have little practical
-use. Gemma 4 E4B, the DeepSeek-R1-Distill-Qwen family and the other Qwen2.5
-sizes run as well.
+use. Gemma 4 E4B, Qwen2.5-7B and Qwen3.6-35B-A3B run as well.
 
 ## Reproducible
 

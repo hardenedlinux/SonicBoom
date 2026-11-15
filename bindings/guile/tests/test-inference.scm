@@ -44,9 +44,9 @@
                   (and=> (getenv "SONICBOOM_SRC_DIR")
                          (lambda (d)
                            (string-append d
-                             "/models/gemma-4-E4B-it-Q3_K_M.gguf")))
-                  "models/gemma-4-E4B-it-Q3_K_M.gguf"
-                  "../../models/gemma-4-E4B-it-Q3_K_M.gguf"))))
+                             "/models/gemma-4-E4B-it-Q5_K_M.gguf")))
+                  "models/gemma-4-E4B-it-Q5_K_M.gguf"
+                  "../../models/gemma-4-E4B-it-Q5_K_M.gguf"))))
     (and (pair? cands) (car cands))))
 
 (test-begin "sonicboom-inference")

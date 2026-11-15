@@ -523,8 +523,8 @@ void run_streams(Dump& d, const std::string& only) {
     const char* rel;
     const char* tag;
   } specs[] = {
-      {"SONICBOOM_GEMMA_GGUF", "gemma-4-E4B-it-Q3_K_M.gguf", "gemma"},
-      {"SONICBOOM_QWEN_GGUF", "qwen2.5-0.5b-instruct-q4_k_m.gguf", "qwen"},
+      {"SONICBOOM_GEMMA_GGUF", "gemma-4-E4B-it-Q5_K_M.gguf", "gemma"},
+      {"SONICBOOM_QWEN_GGUF", "qwen2.5-7b-instruct-1m-q4_k_m.gguf", "qwen"},
   };
   for (const auto& s : specs) {
     // One model per process: the device weight cache is keyed by host pointer,
@@ -885,10 +885,8 @@ struct ProfileModel {
 };
 
 constexpr ProfileModel kProfileModels[] = {
-    {"SONICBOOM_GEMMA_GGUF", "gemma-4-E4B-it-Q3_K_M.gguf", "gemma"},
-    {"SONICBOOM_QWEN_GGUF", "qwen2.5-0.5b-instruct-q4_k_m.gguf", "qwen"},
-    {"SONICBOOM_DEEPSEEK_GGUF", "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf",
-     "deepseek"},
+    {"SONICBOOM_GEMMA_GGUF", "gemma-4-E4B-it-Q5_K_M.gguf", "gemma"},
+    {"SONICBOOM_QWEN_GGUF", "qwen2.5-7b-instruct-1m-q4_k_m.gguf", "qwen"},
 };
 
 // The gate's thresholds and its fixed corpus are internal engineering data, so
@@ -911,7 +909,7 @@ constexpr ProfileModel kProfileModels[] = {
 //   gate=profile                    "profile" (strict vs standard) or "arm"
 //                                    (standard baseline vs standard + pin,
 //                                    envs read from strict_env/standard_env)
-//   models=deepseek                 optional comma list; empty = all models
+//   models=qwen                     optional comma list; empty = all models
 //   top1_min_prompts=50              prompts compared for top-1 (informational
 //                                    since gate v2)
 //   top1_min=0.99                    required top-1 agreement (informational)
@@ -939,7 +937,7 @@ struct ProfileGateConfig {
   // (TF32 dense, f32 tree reduce, df32, d128 prefill attention) is judged by
   // the same gate-v2 metrics against the standard default it would replace.
   std::string gate = "profile";
-  // Optional comma-separated model tags for an arm run (e.g. "deepseek" when
+  // Optional comma-separated model tags for an arm run (e.g. "qwen" when
   // the arm's switch only exists on one architecture). Empty = every model.
   std::string models;
   // Extra environment for each profile's child, e.g. a pinned arm under test:
@@ -1671,7 +1669,7 @@ int main(int argc, char** argv) {
   if (argc >= 2 && std::string_view(argv[1]) == "profile-dump") {
     if (argc < 4 || argc > 6) {
       std::fprintf(stderr, "usage: %s profile-dump <file> "
-                           "<gemma|qwen|deepseek> "
+                           "<gemma|qwen> "
                            "[trace-file [decode-trace-file]]\n",
                    argv[0]);
       return 2;
