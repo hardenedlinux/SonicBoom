@@ -283,20 +283,23 @@ void maybe_analyze(mlir::ModuleOp module, llvm::StringRef label) {
     }
   }
 
-  // The program form: lift a clone of a decode graph into boom.program and
-  // analyze its step (the same node list, with the same marks).
+  // The program form: the module lower_program is lowering already holds the
+  // lifted program, so it is analyzed as it is — the same module the plan's
+  // graph comes from, with the same marks.
   if (envOn("SONICBOOM_BOOM_ANALYSIS_PROGRAM")) {
-    bool has_decode = false;
-    module.walk([&](compiler::boom::GraphOp g) {
-      if (g.getGraphName() == "gemma4_decode") has_decode = true;
-    });
-    if (has_decode) {
-      mlir::OwningOpRef<mlir::ModuleOp> clone(
-          mlir::cast<mlir::ModuleOp>(module->clone()));
-      if (mark) compiler::markBufferReuse(*clone);
-      if (mlir::succeeded(compiler::addGreedyProgram(*clone, "analysis",
-                                                     "prefill", {1}, {}, 0)))
-        analysisReport(*clone, "boom.program", facts);
+    bool has_program = false;
+    module.walk([&](compiler::boom::ProgramOp) { has_program = true; });
+    if (has_program) {
+      if (mark) {
+        mlir::OwningOpRef<mlir::ModuleOp> clone(
+            mlir::cast<mlir::ModuleOp>(module->clone()));
+        if (compiler::markBufferReuse(*clone))
+          analysisReport(*clone, "boom.program", facts);
+        else
+          analysisReport(module, "boom.program", facts);
+      } else {
+        analysisReport(module, "boom.program", facts);
+      }
     }
   }
 }
@@ -1313,6 +1316,9 @@ struct GreedyProgramDesc {
   // sample). The step node is still present: it is the drafter's k == 0
   // fallback, replayed as the captured decode step.
   bool speculative = false;
+  // The plain loop draws from the distribution instead of taking the mode
+  // (boom.sample's stochastic attribute).
+  bool stochastic = false;
   std::string prefill_graph;
   std::string verify_graph;    // the graph the verify node deals over rows
   int64_t max_rows = 0;        // its row budget (max_drafts + 1)
@@ -1448,10 +1454,10 @@ static void log_plain_loop(const Gemma4Model& m) {
 
 // Read the program back out of the lifted module. The program verifier has
 // already checked the shape; this only recovers the attributes the executor
-// needs (the prefill call's name, the stop set and the emitted-count bound, and
-// the speculation pipeline's drafter/verify description) and confirms that one
-// of each loop op is present.
-static GreedyProgramDesc read_greedy_program(mlir::ModuleOp module) {
+// needs (the prefill call's name, the stop set and the emitted-count bound, the
+// plain loop's draw, and the speculation pipeline's drafter/verify description)
+// and confirms that one of each loop op is present.
+static GreedyProgramDesc read_program(mlir::ModuleOp module) {
   namespace boom = compiler::boom;
   GreedyProgramDesc desc;
   boom::ProgramOp program;
@@ -1472,8 +1478,9 @@ static GreedyProgramDesc read_greedy_program(mlir::ModuleOp module) {
       desc.prefill_graph = p.getGraphName().str();
     } else if (llvm::isa<boom::StepOp>(op)) {
       ++steps;
-    } else if (llvm::isa<boom::SampleOp>(op)) {
+    } else if (auto s = llvm::dyn_cast<boom::SampleOp>(op)) {
       ++samples;
+      desc.stochastic = s.getStochastic();
     } else if (auto d = llvm::dyn_cast<boom::DraftOp>(op)) {
       ++drafts;
       desc.draft_strategy = d.getStrategy().str();
@@ -1505,6 +1512,78 @@ static GreedyProgramDesc read_greedy_program(mlir::ModuleOp module) {
                incs == 1 && (spec || greedy);
   desc.speculative = desc.valid && spec;
   return desc;
+}
+
+// What the program-first lowering produces: the plan its step lowers to, and
+// the loop read back from the program around it.
+struct ProgramLowering {
+  planner::Graph graph;
+  GreedyProgramDesc program;
+};
+
+// The program-first lowering (design §2): the emitter's graph is lifted into
+// the loop before anything reads it, so the step's consumer comes from the loop
+// that reads it and not from a declaration the emitter wrote (§2.1). The phase's
+// passes then run on the module — they reach the step — and the consumer is
+// finished there. A failed lift, pass, consumer resolution or lowering returns
+// an empty graph and an invalid desc.
+static ProgramLowering lower_program(GraphIr& ir, const compiler::ProgramSpec& p,
+                                     planner::IrPassPhase phase, bool rewrite,
+                                     bool skip_kv_append_fusion = false,
+                                     bool fuse_silu_mul = false,
+                                     bool rows_mmq = false) {
+  ProgramLowering out;
+  if (!ir.module)
+    return out;
+  // A step carries no graph name of its own (boomToGraph names it "step"), but
+  // the plan's graph name is part of the model identity the plan record hashes
+  // (planner::model_fingerprint) and of the plan it is derived into. The
+  // emitter's name is kept, so the program-first lowering plans the same graph
+  // the graph-first lowering did.
+  std::string graph_name;
+  ir.module->walk([&](compiler::boom::GraphOp g) {
+    if (graph_name.empty()) graph_name = g.getGraphName().str();
+  });
+  if (mlir::failed(compiler::addProgram(*ir.module, p))) {
+    std::cerr << "[plan] lowering boom.program failed (diagnostic above)\n";
+    return out;
+  }
+  // What each tensor depends on, recorded while the ops are still readable.
+  (void)compiler::recordStages(*ir.module);
+  if (!compiler::resolveConsumer(*ir.module)) {
+    std::cerr << "[plan] resolving the step's consumer failed (diagnostic "
+                 "above)\n";
+    return out;
+  }
+  if (rewrite &&
+      !compiler::runBoomPasses(*ir.module, phase, skip_kv_append_fusion,
+                               fuse_silu_mul, rows_mmq))
+    return out;
+  if (!compiler::finishConsumer(*ir.module)) {
+    std::cerr << "[plan] resolving the step's consumer failed (diagnostic "
+                 "above)\n";
+    return out;
+  }
+  maybe_analyze(*ir.module, "program");
+  mlir::Operation* step = nullptr;
+  ir.module->walk([&](compiler::boom::StepOp s) { step = s.getOperation(); });
+  if (!step) {
+    std::cerr << "[plan] the program holds no boom.step\n";
+    return out;
+  }
+  auto graph = compiler::boomToGraph(step, 0);
+  if (!graph) {
+    std::cerr << "[plan] Boom IR -> graph failed (diagnostic above)\n";
+    return out;
+  }
+  out.graph = std::move(*graph);
+  if (!graph_name.empty()) out.graph.name = graph_name;
+  out.program = read_program(*ir.module);
+  if (!out.program.valid) {
+    std::cerr << "[plan] boom.program did not read back as a generation loop\n";
+    return {};
+  }
+  return out;
 }
 
 // The stop_check node: EOS membership, and the emitted-count bound. The count
@@ -3105,46 +3184,41 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
     const planner::KvCacheSession* session = nullptr, bool gather = false) {
   diag::spec_diag_note_runtime_build();
   auto rt = std::make_unique<DecodeRuntime>();
-  const DecodeGraphSpec spec =
+  DecodeGraphSpec spec =
       device_decode_spec(DecodeConsumer::Argmax, /*rows=*/1, gather);
+  // §10: the loop's shape follows SONICBOOM_SPEC — the plain greedy program
+  // under an explicit "off", the draft/verify/accept program otherwise. An
+  // undecided mode may still become auto at the probe, and the loop shape is
+  // fixed when the runtime is built, so it is built speculative and the
+  // dispatch gate (spec_enabled()) picks the plain loop if the probe selects
+  // off. The program is lifted first, so the passes below see its step and the
+  // step's consumer comes from the loop. A program that does not construct
+  // fails the runtime: the loop's structure is not an optional decoration of
+  // the step, and silently running something else would make the default path
+  // the hand-written loop again.
+  compiler::ProgramSpec ps;
+  const bool spec_loop = env_spec_mode() != SpecMode::Off;
+  ps.loop = spec_loop ? compiler::ProgramSpec::Loop::Speculative
+                      : compiler::ProgramSpec::Loop::Plain;
+  ps.listed = gather;
+  ps.name = spec_loop ? "speculative" : "greedy";
+  ps.prefill_graph = "prefill";
+  ps.prompt_shape = {1};
+  if (spec_loop) {
+    ps.max_drafts = kSpecMaxDrafts;
+    ps.draft_strategy = "ngram";
+  }
   GraphIr ir = emit_decode_ir(recipe_for(m), spec);
-  rt->graph = lower_decode_graph(ir, spec);
-  // §10: lift the post-pass decode graph into the generation program and read
-  // the loop back. Done on a clone so the module that produced the plan is left
-  // exactly as it was; the clone is discarded once the desc is extracted. A
-  // program that does not construct fails the runtime: the loop's structure is
-  // not an optional decoration of the step, and silently running something else
-  // would make the default path the hand-written loop again.
+  ProgramLowering lowered =
+      lower_program(ir, ps,
+                    spec.rows > 1 ? planner::IrPassPhase::Verify
+                                  : planner::IrPassPhase::Decode,
+                    spec.rewrite, /*skip_kv_append_fusion=*/false,
+                    /*fuse_silu_mul=*/false, spec.rows_mmq);
+  rt->graph = std::move(lowered.graph);
+  rt->program = std::move(lowered.program);
   if (rt->graph.nodes.empty())
     return nullptr;
-  {
-    mlir::OwningOpRef<mlir::ModuleOp> program_module(
-        mlir::cast<mlir::ModuleOp>((*ir.module)->clone()));
-    // The loop's shape follows SONICBOOM_SPEC: the plain greedy program under
-    // an explicit "off", the draft/verify/accept program otherwise. An
-    // undecided mode may still become auto at the probe, and the loop shape is
-    // fixed when the runtime is built, so it is built speculative and the
-    // dispatch gate (spec_enabled()) picks the plain loop if the probe selects
-    // off. Both forms lift the same decode graph; only the loop around it
-    // differs.
-    const mlir::LogicalResult lifted =
-        env_spec_mode() != SpecMode::Off
-            ? compiler::addSpeculativeProgram(*program_module, "speculative",
-                                              "prefill", {1}, {}, 0,
-                                              kSpecMaxDrafts, "ngram")
-            : compiler::addGreedyProgram(*program_module, "greedy", "prefill",
-                                         {1}, {}, 0);
-    if (mlir::failed(lifted)) {
-      std::cerr << "[plan] lowering boom.program failed (diagnostic above)\n";
-      return nullptr;
-    }
-    maybe_analyze(*program_module, "program");
-    rt->program = read_greedy_program(*program_module);
-    if (!rt->program.valid) {
-      std::cerr << "[plan] boom.program did not read back as a greedy loop\n";
-      return nullptr;
-    }
-  }
   // After every graph-level pass, so the transform sees the graph the plan is
   // actually derived from (plan.h: GraphTransform).
   if (transform && *transform) (*transform)(rt->graph);
@@ -3393,6 +3467,7 @@ struct SampledRuntime {
   std::unique_ptr<planner::SonicCudaBackend> cuda;
   std::unique_ptr<planner::RuntimeExecutor> exec;
   std::unique_ptr<hal::StepProgram> prog;  // captured sampled decode step
+  GreedyProgramDesc program;               // the lowered loop around the step
   // The session cache this runtime (and its capture) is bound to.
   std::shared_ptr<void> cache;
   uint64_t cache_id = 0;
@@ -3409,8 +3484,25 @@ static std::unique_ptr<SampledRuntime> build_sampled_runtime(
     const planner::KvCacheSession& session, bool gather = false) {
   diag::spec_diag_note_runtime_build();
   auto rt = std::make_unique<SampledRuntime>();
-  rt->graph = build_decode_graph(
-      m, device_decode_spec(DecodeConsumer::SampleSelect, /*rows=*/1, gather));
+  // The same program-first lowering as the greedy runtime, with the plain loop
+  // drawing instead of taking the mode: the step's consumer is the loop's
+  // stochastic sample, and finishConsumer appends the selection node to the
+  // step after the passes.
+  DecodeGraphSpec spec =
+      device_decode_spec(DecodeConsumer::SampleSelect, /*rows=*/1, gather);
+  compiler::ProgramSpec ps;
+  ps.loop = compiler::ProgramSpec::Loop::Plain;
+  ps.stochastic = true;
+  ps.listed = gather;
+  ps.name = "sampled";
+  ps.prefill_graph = "prefill";
+  ps.prompt_shape = {1};
+  GraphIr ir = emit_decode_ir(recipe_for(m), spec);
+  ProgramLowering lowered = lower_program(
+      ir, ps, planner::IrPassPhase::Decode, spec.rewrite,
+      /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false, spec.rows_mmq);
+  rt->graph = std::move(lowered.graph);
+  rt->program = std::move(lowered.program);
   if (rt->graph.nodes.empty()) return nullptr;
   auto s = planner::CpuResourceProvider::snapshot();
   if (!s) return nullptr;
