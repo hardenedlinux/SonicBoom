@@ -57,11 +57,13 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 
 #include <cstdint>
+#include <optional>
 
 namespace sonicboom::compiler {
 
@@ -153,6 +155,22 @@ struct DemandFacts {
   Demand of(mlir::Value v) const;
   IndexSet weightRows(mlir::Operation *node) const;
 };
+
+// What a unit's output is observed by (design §2.1): the consumer kind in the
+// Boom consumer vocabulary, and the runtime index list it ranges over when it
+// has one. A graph reads its own declaration; a step derives the answer from
+// the loop op that reads its result — a sample takes the mode unless it draws
+// (argmax / sample_select), and the speculative loop's accept node takes the
+// verifier's argmax — with that reader's allowed_list as its list. A unit no
+// declaration or loop reader speaks for has no consumer.
+struct ConsumerDecl {
+  std::optional<llvm::StringRef> kind;
+  bool listed = false;
+  int64_t list_capacity = 0;
+};
+
+// The declaration for a boom.graph or a boom.step; empty for any other op.
+ConsumerDecl consumerOf(mlir::Operation *unit);
 
 // Run the analysis over `top` (a module, a boom.graph or a boom.program) and
 // everything nested in it. The IR is not modified. `ok` is false when the

@@ -911,6 +911,23 @@ static ProgramSpec specForLegacyLift(mlir::ModuleOp module, ProgramSpec spec) {
   return spec;
 }
 
+// The lift the two legacy entry points perform, over a graph that has already
+// been through resolveConsumer and finishConsumer — their callers clone a
+// lowered module — so the step they produce stands resolved from the start.
+// addProgram itself never marks a step: a program built from an unresolved
+// graph is resolved afterwards by the pipeline, and the loop op that reads the
+// step is what derives the answer (BoomDemand.h consumerOf).
+static mlir::LogicalResult addResolvedProgram(mlir::ModuleOp module,
+                                              const ProgramSpec &spec) {
+  if (mlir::failed(addProgram(module, spec)))
+    return mlir::failure();
+  module.walk([](boom::StepOp step) {
+    step.setConsumerResolvedAttr(
+        mlir::StringAttr::get(step.getContext(), "done"));
+  });
+  return mlir::success();
+}
+
 mlir::LogicalResult addGreedyProgram(mlir::ModuleOp module,
                                      llvm::StringRef program_name,
                                      llvm::StringRef prefill_graph,
@@ -924,7 +941,7 @@ mlir::LogicalResult addGreedyProgram(mlir::ModuleOp module,
   spec.prompt_shape.assign(prompt_shape.begin(), prompt_shape.end());
   spec.eos_tokens.assign(eos_tokens.begin(), eos_tokens.end());
   spec.max_tokens = max_tokens;
-  return addProgram(module, specForLegacyLift(module, std::move(spec)));
+  return addResolvedProgram(module, specForLegacyLift(module, std::move(spec)));
 }
 
 mlir::LogicalResult addSpeculativeProgram(mlir::ModuleOp module,
@@ -944,7 +961,7 @@ mlir::LogicalResult addSpeculativeProgram(mlir::ModuleOp module,
   spec.max_tokens = max_tokens;
   spec.max_drafts = max_drafts;
   spec.draft_strategy = draft_strategy.str();
-  return addProgram(module, specForLegacyLift(module, std::move(spec)));
+  return addResolvedProgram(module, specForLegacyLift(module, std::move(spec)));
 }
 
 } // namespace sonicboom::compiler

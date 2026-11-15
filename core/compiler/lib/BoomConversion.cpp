@@ -443,14 +443,29 @@ std::optional<Graph> boomToGraph(mlir::Operation *unitOp,
   // A declared consumer is not a node: a graph that still carries one has not
   // been through the consumer resolution, and lowering it would plan the
   // model's logits where the caller asked for something else. A step carries
-  // no consumer declaration (it is the graph after the resolution).
-  if (!step)
+  // no declaration — the loop that reads it is the declaration — so the
+  // resolution records its progress on the step instead, and only a finished
+  // one is lowered.
+  if (!step) {
     if (auto consumer = llvm::cast<boom::GraphOp>(unitOp).getConsumer()) {
       u.emitError() << "still declares the consumer '" << *consumer
                     << "'; resolveConsumer/finishConsumer "
                        "(BoomPasses.h) run before the lowering";
       return std::nullopt;
     }
+  } else {
+    const std::optional<llvm::StringRef> state =
+        llvm::cast<boom::StepOp>(unitOp).getConsumerResolved();
+    if (!state || *state != "done") {
+      const std::string why =
+          state ? "consumer_resolved is \"" + state->str() + "\""
+                : std::string("consumer_resolved is unset");
+      u.emitError() << "has not had its consumer resolved (" << why
+                    << "); resolveConsumer/finishConsumer (BoomPasses.h) run "
+                       "before the lowering";
+      return std::nullopt;
+    }
+  }
 
   Graph graph;
   // A step carries no name of its own: the program it belongs to names the

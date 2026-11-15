@@ -3640,19 +3640,19 @@ bool narrowToLists(GraphEditor &view, const DemandFacts &facts) {
   return true;
 }
 
-// Append the consumer's own node, reading the graph's output and producing a
+// Append the consumer's own node, reading the unit's output and producing a
 // new one: `rows` values of `width` f32 each.
-bool appendConsumerNode(boom::GraphOp graph, planner::OpKind kind,
+bool appendConsumerNode(unit::Unit u, planner::OpKind kind,
                         llvm::StringRef tensorName, bool listed) {
-  GraphEditor view(graph);
+  GraphEditor view(u);
   const std::optional<GraphOutput> out = singleOutput(view);
   if (!out) {
-    graph.emitOpError() << "a consumer reads exactly one output";
+    u.emitError() << "a consumer reads exactly one output";
     return false;
   }
   mlir::MLIRContext *ctx = view.ctx();
   mlir::OpBuilder builder(ctx);
-  const mlir::Location loc = graph.getLoc();
+  const mlir::Location loc = u.loc();
   const int64_t rows = rowsOf(out->producer);
 
   // The emitter's order: the node's own attributes, then the row count.
@@ -3690,6 +3690,33 @@ void clearConsumer(boom::GraphOp graph) {
   graph.removeConsumerListAttr();
 }
 
+// A step's results are its output tensors, in order, and the step verifier
+// compares each result's type with its table entry. The consumer resolution
+// moves the output id onto the consumer's node and narrows the output's shape,
+// so the result types are brought back in line here; a graph has no results of
+// its own and needs nothing.
+void syncStepResults(unit::Unit u) {
+  if (!u.isStep())
+    return;
+  auto step = llvm::cast<boom::StepOp>(u.op());
+  const llvm::ArrayRef<int64_t> outputs = u.outputs();
+  const unsigned n = std::min<unsigned>(unsigned(outputs.size()),
+                                        unsigned(step.getNumResults()));
+  for (unsigned i = 0; i < n; ++i) {
+    boom::TensorDescAttr desc;
+    for (mlir::Attribute entry : u.tensors())
+      if (auto d = llvm::dyn_cast<boom::TensorDescAttr>(entry))
+        if (d.getId() == outputs[i]) {
+          desc = d;
+          break;
+        }
+    if (!desc)
+      continue;
+    step.getResult(i).setType(boom::TensorType::get(
+        u.context(), desc.getShape(), desc.getDtype()));
+  }
+}
+
 bool verifyResolved(mlir::ModuleOp module, const char *what) {
   if (mlir::succeeded(mlir::verify(module.getOperation())))
     return true;
@@ -3699,6 +3726,16 @@ bool verifyResolved(mlir::ModuleOp module, const char *what) {
   return false;
 }
 
+// Every boom.graph and boom.step in the module, in walk order.
+llvm::SmallVector<mlir::Operation *> collectUnits(mlir::ModuleOp module) {
+  llvm::SmallVector<mlir::Operation *> units;
+  module->walk([&](mlir::Operation *op) {
+    if (unit::Unit::from(op))
+      units.push_back(op);
+  });
+  return units;
+}
+
 } // namespace
 
 bool resolveConsumer(mlir::ModuleOp module) {
@@ -3706,22 +3743,40 @@ bool resolveConsumer(mlir::ModuleOp module) {
   if (!parseDisabledPasses(off)) off = DisabledPasses{};
 
   bool resolved = false;
-  for (boom::GraphOp graph : module.getOps<boom::GraphOp>()) {
-    const std::optional<llvm::StringRef> declared = graph.getConsumer();
-    if (!declared)
-      continue;
-    resolved = true;
-    const std::string consumer = declared->str();
-    const bool listed = graph.getConsumerList().has_value();
+  for (mlir::Operation *op : collectUnits(module)) {
+    const unit::Unit u = unit::Unit::from(op);
 
-    const DemandFacts facts = analyzeDemand(graph.getOperation());
+    std::string consumer;
+    bool listed = false;
+    if (auto graph = llvm::dyn_cast<boom::GraphOp>(op)) {
+      const std::optional<llvm::StringRef> declared = graph.getConsumer();
+      if (!declared)
+        continue;
+      consumer = declared->str();
+      listed = graph.getConsumerList().has_value();
+    } else {
+      // The loop op that reads the step is the step's declaration (§2.1). Once
+      // resolution has recorded where it stands, it is not derived again.
+      const std::optional<llvm::StringRef> state =
+          llvm::cast<boom::StepOp>(op).getConsumerResolved();
+      if (state)
+        continue;
+      const ConsumerDecl decl = consumerOf(op);
+      if (!decl.kind)
+        continue;
+      consumer = decl.kind->str();
+      listed = decl.listed;
+    }
+    resolved = true;
+
+    const DemandFacts facts = analyzeDemand(op);
     if (!facts.ok) {
-      graph.emitOpError() << "the demand analysis did not converge";
+      op->emitOpError() << "the demand analysis did not converge";
       return false;
     }
 
     {
-      GraphEditor view(graph);
+      GraphEditor view(u);
       if (!off.prune_by_demand)
         pruneByDemand(view, facts);
       if (!narrowToLists(view, facts))
@@ -3739,42 +3794,87 @@ bool resolveConsumer(mlir::ModuleOp module) {
       view.commitTable();
     }
 
-    if (consumer == "argmax") {
-      if (!appendConsumerNode(graph, planner::OpKind::Argmax, "argmax", listed))
-        return false;
-      clearConsumer(graph);
-    } else if (consumer != "sample_select") {
-      clearConsumer(graph);
+    if (auto graph = llvm::dyn_cast<boom::GraphOp>(op)) {
+      if (consumer == "argmax") {
+        if (!appendConsumerNode(u, planner::OpKind::Argmax, "argmax", listed))
+          return false;
+        clearConsumer(graph);
+      } else if (consumer != "sample_select") {
+        clearConsumer(graph);
+      }
+      continue;
     }
+
+    // A step's results are its output tensors; pruning, narrowing and the
+    // consumer node changed them.
+    syncStepResults(u);
+    if (consumer == "argmax") {
+      if (!appendConsumerNode(u, planner::OpKind::Argmax, "argmax", listed))
+        return false;
+      syncStepResults(u);
+    }
+    llvm::cast<boom::StepOp>(op).setConsumerResolvedAttr(mlir::StringAttr::get(
+        op->getContext(), consumer == "sample_select" ? "pre" : "done"));
   }
   return !resolved || verifyResolved(module, "resolveConsumer");
 }
 
 bool finishConsumer(mlir::ModuleOp module) {
   bool resolved = false;
-  for (boom::GraphOp graph : module.getOps<boom::GraphOp>()) {
-    const std::optional<llvm::StringRef> declared = graph.getConsumer();
-    if (!declared)
+  for (mlir::Operation *op : collectUnits(module)) {
+    const unit::Unit u = unit::Unit::from(op);
+    if (auto graph = llvm::dyn_cast<boom::GraphOp>(op)) {
+      const std::optional<llvm::StringRef> declared = graph.getConsumer();
+      if (!declared)
+        continue;
+      resolved = true;
+      if (*declared != "sample_select") {
+        graph.emitOpError() << "consumer '" << *declared
+                            << "' was not resolved before the phase's passes";
+        return false;
+      }
+      const bool listed = graph.getConsumerList().has_value();
+      {
+        GraphEditor view(u);
+        const std::optional<GraphOutput> out = singleOutput(view);
+        if (out && rowsOf(out->producer) != 1) {
+          graph.emitOpError() << "a row-dealt graph has no sampling consumer";
+          return false;
+        }
+      }
+      if (!appendConsumerNode(u, planner::OpKind::SampleSelect,
+                              "sample_count", listed))
+        return false;
+      clearConsumer(graph);
+      continue;
+    }
+
+    auto step = llvm::cast<boom::StepOp>(op);
+    const std::optional<llvm::StringRef> state = step.getConsumerResolved();
+    if (!state || *state != "pre")
       continue;
     resolved = true;
-    if (*declared != "sample_select") {
-      graph.emitOpError() << "consumer '" << *declared
-                          << "' was not resolved before the phase's passes";
+    const ConsumerDecl decl = consumerOf(op);
+    if (!decl.kind || *decl.kind != "sample_select") {
+      step.emitOpError() << "consumer_resolved is \"pre\", but the loop reads '"
+                         << (decl.kind ? decl.kind->str() : "nothing")
+                         << "'; only a sampling consumer is finished here";
       return false;
     }
-    const bool listed = graph.getConsumerList().has_value();
     {
-      GraphEditor view(graph);
+      GraphEditor view(u);
       const std::optional<GraphOutput> out = singleOutput(view);
       if (out && rowsOf(out->producer) != 1) {
-        graph.emitOpError() << "a row-dealt graph has no sampling consumer";
+        step.emitOpError() << "a row-dealt graph has no sampling consumer";
         return false;
       }
     }
-    if (!appendConsumerNode(graph, planner::OpKind::SampleSelect,
-                            "sample_count", listed))
+    if (!appendConsumerNode(u, planner::OpKind::SampleSelect,
+                            "sample_count", decl.listed))
       return false;
-    clearConsumer(graph);
+    syncStepResults(u);
+    step.setConsumerResolvedAttr(
+        mlir::StringAttr::get(op->getContext(), "done"));
   }
   return !resolved || verifyResolved(module, "finishConsumer");
 }

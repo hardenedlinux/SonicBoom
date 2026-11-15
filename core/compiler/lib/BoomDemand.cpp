@@ -177,6 +177,46 @@ void Demand::print(llvm::raw_ostream &os) const {
 
 //--- the analysis ------------------------------------------------------------
 
+ConsumerDecl consumerOf(mlir::Operation *unit) {
+  ConsumerDecl decl;
+  if (!unit)
+    return decl;
+  if (auto graph = llvm::dyn_cast<boom::GraphOp>(unit)) {
+    decl.kind = graph.getConsumer();
+    if (auto list = graph.getConsumerList()) {
+      decl.listed = true;
+      decl.list_capacity = int64_t(*list);
+    }
+    return decl;
+  }
+  auto step = llvm::dyn_cast<boom::StepOp>(unit);
+  if (!step)
+    return decl;
+  // The loop op that reads the step's result says what its consumer is
+  // (design §2.1). The program verifier rejects two readers that disagree, so
+  // the first reader found states it for the step.
+  for (mlir::Value result : step.getResults())
+    for (mlir::Operation *user : result.getUsers()) {
+      if (auto sample = llvm::dyn_cast<boom::SampleOp>(user)) {
+        decl.kind = sample.getStochastic() ? "sample_select" : "argmax";
+        if (auto list = sample.getAllowedList()) {
+          decl.listed = true;
+          decl.list_capacity = int64_t(*list);
+        }
+        return decl;
+      }
+      if (auto accept = llvm::dyn_cast<boom::AcceptOp>(user)) {
+        decl.kind = "argmax";
+        if (auto list = accept.getAllowedList()) {
+          decl.listed = true;
+          decl.list_capacity = int64_t(*list);
+        }
+        return decl;
+      }
+    }
+  return decl;
+}
+
 namespace {
 
 class DemandLattice : public mlir::dataflow::Lattice<Demand> {
@@ -196,15 +236,15 @@ unsigned rankOf(mlir::Type type) {
 
 unsigned rankOf(mlir::Value v) { return rankOf(v.getType()); }
 
-// The demand a graph's declared consumer places on its output.
-Demand consumerDemand(boom::GraphOp graph, unsigned rank) {
-  const std::optional<llvm::StringRef> consumer = graph.getConsumer();
-  const Observation obs = consumer && *consumer == "argmax" ? Observation::Order
-                                                            : Observation::Exact;
+// The demand a unit's consumer places on its output.
+Demand consumerDemand(mlir::Operation *unit, unsigned rank) {
+  const ConsumerDecl decl = consumerOf(unit);
+  const Observation obs =
+      decl.kind && *decl.kind == "argmax" ? Observation::Order
+                                          : Observation::Exact;
   Demand d = Demand::whole(rank, obs);
-  if (auto list = graph.getConsumerList())
-    if (rank > 0)
-      d.dims.back() = IndexSet::list(int64_t(*list));
+  if (decl.listed && rank > 0)
+    d.dims.back() = IndexSet::list(decl.list_capacity);
   return d;
 }
 
@@ -268,20 +308,29 @@ private:
       mlir::Value out = unit::valueOf(body, graph.getTensors(), id);
       if (!out)
         continue;
-      demand(getLatticeElement(out), consumerDemand(graph, rankOf(out)));
+      demand(getLatticeElement(out),
+             consumerDemand(graph.getOperation(), rankOf(out)));
     }
   }
 
   // A step is transparent: its result is its body's output, and its body's
-  // free variables are its operands, in order.
+  // free variables are its operands, in order. The output's demand is the one
+  // the loop's reader derives (consumerDemand); a step no loop reads keeps the
+  // demand its result carries from the enclosing scope.
   void visitStep(boom::StepOp step, llvm::ArrayRef<DemandLattice *> operands,
                  llvm::ArrayRef<const DemandLattice *> results) {
     mlir::Block &body = step.getBody().front();
+    const ConsumerDecl consumer = consumerOf(step.getOperation());
     for (auto [index, id] : llvm::enumerate(step.getOutputIds())) {
       if (index >= results.size())
         break;
       mlir::Value out = unit::valueOf(body, step.getTensors(), id);
-      if (out)
+      if (!out)
+        continue;
+      if (consumer.kind)
+        demand(getLatticeElement(out),
+               consumerDemand(step.getOperation(), rankOf(out)));
+      else
         demand(getLatticeElement(out), results[index]->getValue());
     }
     mlir::ProgramPoint *after = getProgramPointAfter(step.getOperation());
