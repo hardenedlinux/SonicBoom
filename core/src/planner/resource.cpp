@@ -23,6 +23,7 @@
 #include "fingerprint.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <unordered_set>
 #include <utility>
@@ -95,7 +96,17 @@ const MemorySpace* ResourceSnapshot::find_memory_space(MemorySpaceId id) const n
   return nullptr;
 }
 
-uint64_t resource_fingerprint(const ResourceSnapshot& s) noexcept {
+namespace {
+
+// `used` null keeps every device capability entry; otherwise only the op kinds
+// in the set are hashed, and the count is of the kept entries so a plan that
+// uses an op no device advertises still differs from one that does not.
+uint64_t fingerprint(const ResourceSnapshot& s,
+                     const std::span<const OpKind>* used) noexcept {
+  std::array<bool, 256> keep{};
+  if (used != nullptr)
+    for (OpKind o : *used) keep[static_cast<uint8_t>(o)] = true;
+
   detail::Fnv1a h;
   h.u32(s.version);
   h.u32(static_cast<uint32_t>(s.devices.size()));
@@ -106,9 +117,18 @@ uint64_t resource_fingerprint(const ResourceSnapshot& s) noexcept {
     h.u8(d.capability.can_execute ? 1 : 0);
     h.u8(d.capability.supports_async ? 1 : 0);
     h.u8(d.capability.supports_concurrent_copy ? 1 : 0);
-    h.u32(static_cast<uint32_t>(d.capability.supported_ops.size()));
-    for (OpKind o : d.capability.supported_ops)
-      h.u8(static_cast<uint8_t>(o));
+    if (used == nullptr) {
+      h.u32(static_cast<uint32_t>(d.capability.supported_ops.size()));
+      for (OpKind o : d.capability.supported_ops)
+        h.u8(static_cast<uint8_t>(o));
+    } else {
+      uint32_t kept = 0;
+      for (OpKind o : d.capability.supported_ops)
+        if (keep[static_cast<uint8_t>(o)]) ++kept;
+      h.u32(kept);
+      for (OpKind o : d.capability.supported_ops)
+        if (keep[static_cast<uint8_t>(o)]) h.u8(static_cast<uint8_t>(o));
+    }
     h.u32(static_cast<uint32_t>(d.capability.supported_dtypes.size()));
     for (sx::DType t : d.capability.supported_dtypes)
       h.u8(static_cast<uint8_t>(t));
@@ -123,6 +143,17 @@ uint64_t resource_fingerprint(const ResourceSnapshot& s) noexcept {
     h.u64(m.alignment_bytes);
   }
   return h.get();
+}
+
+}  // namespace
+
+uint64_t resource_fingerprint(const ResourceSnapshot& s) noexcept {
+  return fingerprint(s, nullptr);
+}
+
+uint64_t resource_fingerprint(const ResourceSnapshot& s,
+                              std::span<const OpKind> used) noexcept {
+  return fingerprint(s, &used);
 }
 
 std::expected<void, PlannerError> validate_snapshot(const ResourceSnapshot& s) {

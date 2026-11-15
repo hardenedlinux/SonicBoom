@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <expected>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -104,6 +105,14 @@ struct ResourceSnapshot {
 // Deterministic 64-bit fingerprint (FNV-1a over a canonical serialization of
 // every planning-relevant property). Not cryptographic; documented as such.
 uint64_t resource_fingerprint(const ResourceSnapshot& s) noexcept;
+
+// The same fingerprint restricted to the op kinds a plan uses: a device's
+// supported_ops contributes only the ops in `used`, so a capability entry for
+// an op the plan never executes does not reach the value. Everything else
+// (devices, dtypes, memory spaces) is hashed as above. `used` is a set; its
+// order does not matter.
+uint64_t resource_fingerprint(const ResourceSnapshot& s,
+                              std::span<const OpKind> used) noexcept;
 
 // Validate a snapshot's structural invariants. Returns the specific
 // PlannerError on failure; success means the snapshot is internally consistent.

@@ -434,10 +434,22 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
         PlannerErrorCode::CostModelError,
         "plan cost summary overflow", Phase::Planning));
 
-  // Deterministic plan id: FNV-1a over the two fingerprints (v0).
+  // Deterministic plan id: FNV-1a over the model fingerprint and the resource
+  // fingerprint restricted to the op kinds this graph uses. A device that
+  // advertises an op the graph never executes does not change the id, so two
+  // plans over the same graph and the same relevant resources agree.
+  std::vector<OpKind> used_ops;
+  used_ops.reserve(graph.nodes.size());
+  for (const auto& node : graph.nodes) used_ops.push_back(node.op);
+  std::sort(used_ops.begin(), used_ops.end(),
+            [](OpKind a, OpKind b) {
+              return static_cast<uint8_t>(a) < static_cast<uint8_t>(b);
+            });
+  used_ops.erase(std::unique(used_ops.begin(), used_ops.end()), used_ops.end());
+
   detail::Fnv1a h;
   h.u64(plan.model_fingerprint);
-  h.u64(plan.resource_fingerprint);
+  h.u64(resource_fingerprint(snapshot_, used_ops));
   plan.plan_id = h.get();
 
   return plan;
