@@ -155,7 +155,16 @@ sonicboom_sanitize(sonicboom)
 # the C ABI is exported there; the static table is a quarter of the file and
 # nothing in the runtime reads it. A non-Release build keeps every symbol.
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-  target_link_options(sonicboom PRIVATE -Wl,-s)
+  # -s drops the static symbol table. --exclude-libs localizes the symbols of
+  # the implementation archives (native-torch, cpuinfo) so .dynsym/.dynstr do
+  # not carry them. The compiler and MLIR/LLVM archives are deliberately left
+  # exported: the C++ test executables link those same archives alongside
+  # libsonicboom.so, and their calls must bind to the library's single copy of
+  # MLIR's address-keyed type identity, not to a second copy inside the test.
+  target_link_options(sonicboom PRIVATE -Wl,-s
+    -Wl,--exclude-libs,libaten_core.a
+    -Wl,--exclude-libs,libc10.a
+    -Wl,--exclude-libs,libcpuinfo.a)
 endif()
 
 target_include_directories(sonicboom

@@ -369,6 +369,17 @@ endif()
 # findSchema -> callBoxed. Links the dispatcher core and proves registration
 # + lookup + boxed invocation without the Tensor op facade (manifest M1).
 # ---------------------------------------------------------------------------
+# Hide every symbol these archives define from libsonicboom.so's dynamic
+# symbol table. They are linked whole into the one published library and no
+# consumer outside it names them; the C ABI is exported by the core target,
+# not here. Symbols that carry an upstream default-visibility attribute are
+# additionally localized by --exclude-libs at the final link.
+set_target_properties(c10 aten_core PROPERTIES
+  CXX_VISIBILITY_PRESET hidden
+  C_VISIBILITY_PRESET hidden
+  CUDA_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON)
+
 add_executable(dispatch_proof tests/dispatch_proof.cpp)
 target_include_directories(dispatch_proof PRIVATE ${NATIVE_TORCH_INCLUDE_DIRS})
 target_compile_features(dispatch_proof PRIVATE cxx_std_17)

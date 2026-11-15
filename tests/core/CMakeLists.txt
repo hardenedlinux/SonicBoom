@@ -20,6 +20,13 @@
 # on the command line, so -UNDEBUG restores them.
 add_compile_options(-UNDEBUG)
 
+# Every suite that links the compiler archive also links libsonicboom.so ahead
+# of it, and the library no longer re-exports the archive's symbols
+# (--exclude-libs at the library link). An --as-needed link would therefore
+# drop libsonicboom.so before the archive's references to it are seen; the
+# suites also load the library at runtime, so it is always kept.
+add_link_options(-Wl,--no-as-needed)
+
 if(SONICBOOM_SANITIZE)
   # SONICBOOM_SANITIZE_COMPILE_EXTRA carries -fno-sanitize=vptr for the
   # address;undefined build (no RTTI in MLIR; root CMakeLists.txt explains).
