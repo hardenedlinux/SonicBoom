@@ -3,13 +3,13 @@
 
 The unit of measurement is the *substantive line*: a source line after all
 whitespace has been removed, with blank lines, punctuation-only lines and
-comment-only lines discarded. A SonicBoom line is counted as upstream if the
-same substantive line occurs anywhere in llama.cpp's sources at the pinned
-commit.
+comment-only lines discarded. A line counts as upstream only when it sits in a
+run of W consecutive substantive lines whose normalized form occurs as a run in
+llama.cpp's sources at the pinned commit. W defaults to 4.
 
 Usage:
     python3 tools/provenance/ggml-share.py --upstream /path/to/llama.cpp \
-        [--tsv OUT.tsv]
+        [--window W] [--tsv OUT.tsv]
 
 Only the Python standard library is used.
 """
@@ -75,15 +75,32 @@ def excluded(relpath):
     return any(part in EXCLUDED_DIRS for part in relpath.split("/")[:-1])
 
 
-def upstream_lines(upstream):
-    lines = set()
+def windows_of(lines, size):
+    """Yield every run of `size` consecutive lines, as a tuple."""
+    for start in range(len(lines) - size + 1):
+        yield tuple(lines[start:start + size])
+
+
+def upstream_windows(upstream, size):
+    windows = set()
     for sub in ("ggml/src", "src"):
         root = os.path.join(upstream, sub)
         if not os.path.isdir(root):
             continue
         for path in walk_files(root, UPSTREAM_EXTS):
-            lines.update(substantive_lines(path, "c"))
-    return lines
+            lines = list(substantive_lines(path, "c"))
+            windows.update(windows_of(lines, size))
+    return windows
+
+
+def matched_lines(lines, reference, size):
+    """Count the lines that sit in a run present in the upstream windows."""
+    marked = bytearray(len(lines))
+    for start in range(len(lines) - size + 1):
+        if tuple(lines[start:start + size]) in reference:
+            for offset in range(size):
+                marked[start + offset] = 1
+    return sum(marked)
 
 
 def repo_files(repo):
@@ -109,7 +126,7 @@ def is_derived(relpath):
 
 
 def is_engine(relpath):
-    return relpath.startswith("core/") and not is_derived(relpath)
+    return relpath.startswith("core/")
 
 
 def percent(part, whole):
@@ -124,8 +141,14 @@ def main():
     )
     parser.add_argument("--upstream", required=True,
                         help="path to the llama.cpp checkout")
+    parser.add_argument("--window", type=int, default=4,
+                        help="run length in substantive lines (default 4)")
     parser.add_argument("--tsv", help="write per-file results to this TSV file")
     args = parser.parse_args()
+
+    if args.window < 1:
+        print("error: --window must be at least 1", file=sys.stderr)
+        return 2
 
     try:
         head = subprocess.check_output(
@@ -142,14 +165,14 @@ def main():
         return 2
 
     repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    reference = upstream_lines(args.upstream)
+    reference = upstream_windows(args.upstream, args.window)
 
     rows = []
     for path, scheme in repo_files(repo):
         relpath = relative(repo, path)
         lines = list(substantive_lines(path, scheme))
         total = len(lines)
-        matched = sum(1 for line in lines if line in reference)
+        matched = matched_lines(lines, reference, args.window)
         ratio = (float(matched) / total) if total else 0.0
         rows.append((relpath, total, matched, ratio))
     rows.sort()
@@ -165,16 +188,27 @@ def main():
     engine_n, engine_u = totals(engine)
     product_n, product_u = totals(product)
 
+    print("measure: a line counts as upstream only inside a run of %d consecutive "
+          "lines identical to a run in upstream llama.cpp %s."
+          % (args.window, UPSTREAM_REV))
     print("ggml_derived: n=%d u=%d (%s)"
           % (derived_n, derived_u, percent(derived_u, derived_n)))
-    print("engine (core/, excluding ggml_derived): n=%d u=%d (%s)"
+    print("engine (core/, including ggml_derived): n=%d u=%d (%s)"
           % (engine_n, engine_u, percent(engine_u, engine_n)))
+    print("  from ggml_derived: u=%d" % derived_u)
+    print("  from the rest of core/: u=%d" % (engine_u - derived_u))
     print("product (core/, capi/, bindings/): n=%d u=%d (%s)"
           % (product_n, product_u, percent(product_u, product_n)))
 
-    high_outside = [r for r in rows
-                    if r[3] >= THRESHOLD and not is_derived(r[0])]
-    low_inside = [r for r in derived if r[3] < THRESHOLD]
+    # A file needs at least two windows' worth of lines to be judged.
+    smallest = 2 * args.window
+    high_candidates = [r for r in rows
+                       if r[3] >= THRESHOLD and not is_derived(r[0])]
+    high_outside = [r for r in high_candidates if r[1] >= smallest]
+    low_inside = [r for r in derived
+                  if r[1] >= smallest and r[3] < THRESHOLD]
+    too_small = sorted([r for r in derived if r[1] < smallest]
+                       + [r for r in high_candidates if r[1] < smallest])
 
     print("")
     print("files >= %d%% outside ggml_derived (%d):" % (THRESHOLD * 100, len(high_outside)))
@@ -182,8 +216,15 @@ def main():
         print("  %s\tn=%d\tu=%d\t%.4f" % (relpath, total, matched, ratio))
 
     print("")
-    print("files < %d%% inside ggml_derived (%d):" % (THRESHOLD * 100, len(low_inside)))
+    print("files < %d%% inside ggml_derived (%d, informational):"
+          % (THRESHOLD * 100, len(low_inside)))
     for relpath, total, matched, ratio in low_inside:
+        print("  %s\tn=%d\tu=%d\t%.4f" % (relpath, total, matched, ratio))
+
+    print("")
+    print("files too small to judge (< %d substantive lines) (%d):"
+          % (smallest, len(too_small)))
+    for relpath, total, matched, ratio in too_small:
         print("  %s\tn=%d\tu=%d\t%.4f" % (relpath, total, matched, ratio))
 
     if args.tsv:
