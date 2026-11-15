@@ -10,11 +10,16 @@
 ;;;      an id on its page;
 ;;;   3. search-index.json and pytorch-map.json parse as JSON;
 ;;;   4. index.html carries the redirect script that makes /sonicboom reach the
-;;;      home page.
+;;;      home page;
+;;;   5. every page's <head> holds, directly, only meta, title, link and script
+;;;      elements and whitespace, and no page holds a <style> element
+;;;      (docs/site/check-html.py).
 ;;;
-;;; Needs pandoc; no native library and no network.
+;;; Needs pandoc and python3; no native library and no network.
 
 (use-modules (ice-9 format)
+             (ice-9 popen)
+             (ice-9 rdelim)
              (ice-9 textual-ports)
              (ice-9 ftw)
              (ice-9 regex)
@@ -242,6 +247,23 @@
             (error "link pattern matched the empty string"))
           (loop (match:end match 0)))))))
 
+;;; -------------------------------------------------------- html structure ---
+
+;; One line per problem; docs/site/check-html.py holds the rules.
+(define (check-page-structure page)
+  (let* ((port (open-input-pipe
+                (string-append "python3 "
+                               (string-append (repo-root) "/docs/site/check-html.py")
+                               " " page)))
+         (lines (let loop ((line (read-line port)) (acc '()))
+                  (if (eof-object? line)
+                      (reverse acc)
+                      (loop (read-line port) (cons line acc)))))
+         (status (close-pipe port)))
+    (if (and (not (zero? status)) (null? lines))
+        (list (format #f "~a: the HTML structure check failed" page))
+        lines)))
+
 ;;; ------------------------------------------------------------------ tests ---
 
 (test-begin "docs-site")
@@ -260,6 +282,16 @@
 
   (test-equal "every link is relative, internal and sound"
     0 (length problems))
+
+  (let ((structure-problems
+         (append-map check-page-structure (html-files site))))
+    (format (current-error-port) "html structure problems: ~a~%"
+            (length structure-problems))
+    (for-each (lambda (text)
+                (format (current-error-port) "  ~a~%" text))
+              structure-problems)
+    (test-equal "every page carries only linked styles"
+      0 (length structure-problems)))
 
   (for-each
    (lambda (name)

@@ -129,6 +129,26 @@
       (unless (zero? status)
         (error "pandoc failed on" input)))))
 
+;; The highlighting rules of the same style, as a stylesheet of their own. The
+;; page template links it, so the pages carry no inline style at all.
+(define (write-highlight-css site)
+  (let ((template (temporary-file ".html"))
+        (snippet (temporary-file ".md"))
+        (output (string-append site "/highlight.css")))
+    (write-file template "$highlighting-css$\n")
+    (write-file snippet "```c\nint main(void) { return 0; }\n```\n")
+    (let ((status
+           (system* "pandoc" "--from" "markdown" "--to" "html5"
+                    "--standalone"
+                    "--template" template
+                    "--highlight-style=tango"
+                    "--metadata" "title=SonicBoom"
+                    "--output" output snippet)))
+      (delete-file template)
+      (delete-file snippet)
+      (unless (zero? status)
+        (error "pandoc failed to write highlight.css")))))
+
 ;;; ------------------------------------------------------------ navigation ----
 
 (define (page-path slug)
@@ -619,10 +639,7 @@
     (json-object fields)))
 
 (define (pytorch-json-names)
-  (delete-duplicates
-   (append (map car (pytorch-name-links))
-           '("torch.Tensor.__getitem__" "torch.Tensor.__setitem__"))
-   string=?))
+  (delete-duplicates (map car (pytorch-name-links)) string=?))
 
 (define (write-pytorch-map site)
   (let ((names (sort (pytorch-json-names) string<?)))
@@ -743,6 +760,7 @@
          (entries (append (nav-entries) (concepts-tail-entries))))
     (ensure-directory (string-append site "/api"))
     (copy-assets site)
+    (write-highlight-css site)
     (for-each
      (lambda (entry)
        (let ((slug (caddr entry)) (nav-title (cadr entry)))
