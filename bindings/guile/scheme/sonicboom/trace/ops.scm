@@ -25,6 +25,21 @@
 
 ;; ATTRS is the S-Expr attr list: ((name (tag v ...)) ...).
 (define (attr-ref attrs name default)
+  "The value of attribute NAME in the attribute list ATTRS.
+
+Attribute values are tagged: (int n), (float x), (string s), (bool b), and
+the list forms (ints ...), (floats ...), (strings ...), (bools ...).
+
+Args:
+  attrs: an attribute list, ((name (tag value ...)) ...).
+  name: the attribute name to look up.
+  default: the value to return when the attribute is absent.
+Returns: the value without its tag, or DEFAULT.
+Example:
+  (use-modules (sonicboom trace ops))
+  (attr-ref '((shape (ints 2 3)) (k (int 5))) 'shape #f)
+  => (2 3)
+PyTorch: none"
   (let ((a (assq name attrs)))
     (if (not a)
         default
@@ -37,7 +52,19 @@
 ;;; --- shapes -------------------------------------------------------------------
 
 (define (broadcast-shapes . shapes)
-  "NumPy-style broadcast of SHAPES; error if incompatible."
+  "The result of broadcasting SHAPES against each other.
+
+Shapes align from the trailing axis; in each position the dimensions must be
+equal or 1.
+
+Args:
+  shapes: one or more shapes, each a list of non-negative exact integers.
+Returns: the broadcast shape.
+Example:
+  (use-modules (sonicboom trace ops))
+  (broadcast-shapes '(2 1) '(1 3))
+  => (2 3)
+PyTorch: torch.broadcast_shapes"
   (let* ((rank (apply max 0 (map length shapes)))
          (padded (map (lambda (s) (append (make-list (- rank (length s)) 1) s))
                       shapes)))
@@ -852,8 +879,19 @@ reference (core/src/training/clip_grad_norm.cpp) and the device kernel."
 (define (ints . xs) `(ints ,@xs))
 
 (define (sum-to-shape emit shape g target)
-  "Reduce G (broadcast result) to shape TARGET: sum the leading axes and the
-axes TARGET has as 1, then reshape."
+  "Reduce the gradient G to TARGET's shape.
+
+G has the shape of a broadcast result. The leading axes and the axes where
+TARGET has size 1 are summed, and the result is reshaped to TARGET; when the
+shapes already agree, G is returned unchanged.
+
+Args:
+  emit: a procedure (emit op args attrs) that builds one graph node.
+  shape: a procedure returning the shape of a value.
+  g: the gradient value.
+  target: the shape to reduce to.
+Returns: the reduced gradient, at TARGET's shape.
+PyTorch: none"
   (let* ((gs (shape g))
          (lead (- (length gs) (length target))))
     (if (equal? gs target)
@@ -1088,13 +1126,52 @@ axes TARGET has as 1, then reshape."
 ;; Ops whose kernel has an effect: always recorded while tracing and never
 ;; removed by DCE.
 (define %effectful-ops '(print))
-(define (op-effectful? op) (and (memq op %effectful-ops) #t))
+(define (op-effectful? op)
+  "Whether OP's kernel has an effect.
+
+An effectful operator is always recorded while tracing and is never removed
+as dead computation.
+
+Args:
+  op: a known operator name.
+Returns: #t for print, #f otherwise.
+Example:
+  (use-modules (sonicboom trace ops))
+  (op-effectful? 'print)
+  => #t
+PyTorch: none"
+  (and (memq op %effectful-ops) #t))
 
 (define (entry op)
   (or (assq-ref %ops op) (error "unsupported op" op)))
 
-(define (op-known? op) (and (assq op %ops) #t))
-(define (op-arity op) (car (entry op)))
+(define (op-known? op)
+  "Whether OP names an operator of the table.
+
+Args:
+  op: an operator name.
+Returns: #t or #f.
+Example:
+  (use-modules (sonicboom trace ops))
+  (op-known? 'add)
+  => #t
+PyTorch: none"
+  (and (assq op %ops) #t))
+(define (op-arity op)
+  "The number of inputs OP takes.
+
+The value is an exact integer, the symbol n for any number, or a list of the
+accepted counts.
+
+Args:
+  op: a known operator name.
+Returns: the arity.
+Example:
+  (use-modules (sonicboom trace ops))
+  (op-arity 'add)
+  => 2
+PyTorch: none"
+  (car (entry op)))
 
 (define (check-arity op n)
   (let ((want (op-arity op)))
@@ -1104,13 +1181,89 @@ axes TARGET has as 1, then reshape."
       (error "op: wrong number of inputs" op n))))
 
 (define (op-type op types attrs)
+  "The output type of OP for the input types TYPES.
+
+Each input type is a pair (dtype . shape). OP's type rule computes the output
+type and checks the inputs.
+
+Args:
+  op: a known operator name.
+  types: the list of input types.
+  attrs: the attribute list of the node.
+Returns: the output type, (dtype . shape).
+Example:
+  (use-modules (sonicboom trace ops))
+  (op-type 'add (list (cons 'float32 '(2)) (cons 'float32 '(2))) '())
+  => (float32 2)
+PyTorch: none"
   (check-arity op (length types))
   ((cadr (entry op)) types attrs))
 
 (define (op-kernel op tensors attrs)
+  "Run OP's reference kernel on concrete inputs.
+
+TENSORS are ctensors in the order of OP's inputs. Eager mode and the
+reference interpreter use the kernel; tracing uses op-type instead.
+
+Args:
+  op: a known operator name.
+  tensors: the input ctensors.
+  attrs: the attribute list of the node.
+Returns: the output ctensor.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace ops))
+  (ctensor->list (op-kernel 'add
+                            (list (list->ctensor '(1.0 2.0))
+                                  (list->ctensor '(3.0 4.0)))
+                            '()))
+  => (4.0 6.0)
+PyTorch: none"
   (check-arity op (length tensors))
   ((caddr (entry op)) tensors attrs))
 
-(define (op-aten-name op) (and (op-known? op) (list-ref (entry op) 3)))
-(define (op-gradient op) (and (op-known? op) (list-ref (entry op) 4)))
-(define (op-elementwise? op) (and (op-known? op) (list-ref (entry op) 5)))
+(define (op-aten-name op)
+  "The PyTorch ATen name recorded for OP.
+
+The table stores the corresponding Core ATen operator name, or #f when the
+operator has none.
+
+Args:
+  op: a known operator name.
+Returns: a string such as \"aten::add.Tensor\", or #f.
+Example:
+  (use-modules (sonicboom trace ops))
+  (op-aten-name 'add)
+  => \"aten::add.Tensor\"
+PyTorch: none"
+  (and (op-known? op) (list-ref (entry op) 3)))
+(define (op-gradient op)
+  "The gradient rule recorded for OP.
+
+A rule computes the input gradients of one node; #f means the generic
+backward walk does not differentiate the operator.
+
+Args:
+  op: a known operator name.
+Returns: a procedure, or #f.
+Example:
+  (use-modules (sonicboom trace ops))
+  (procedure? (op-gradient 'add))
+  => #t
+PyTorch: none"
+  (and (op-known? op) (list-ref (entry op) 4)))
+(define (op-elementwise? op)
+  "Whether OP's gradient is an elementwise rule.
+
+An elementwise rule returns input gradients at the output shape, which the
+backward walk reduces to the input shapes; any other rule returns
+input-shaped gradients directly.
+
+Args:
+  op: a known operator name.
+Returns: #t or #f.
+Example:
+  (use-modules (sonicboom trace ops))
+  (op-elementwise? 'add)
+  => #t
+PyTorch: none"
+  (and (op-known? op) (list-ref (entry op) 5)))

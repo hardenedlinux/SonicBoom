@@ -237,6 +237,20 @@ a small model answers in a predictable way so that the tests can check it.")
 
 ;; The reply for a prompt, as text (without the end-of-turn token).
 (define (mock-plan-text family prompt)
+  "The reply text the mock backend plans for PROMPT.
+
+The prompt is the rendered chat prompt of FAMILY, so the last user turn and the
+offered tools can be read out of it.
+
+Args:
+  family: gemma or qwen.
+  prompt: the rendered prompt.
+Returns: the reply text, without the end-of-turn token.
+Example:
+  (use-modules (sonicboom serve mock-backend))
+  (mock-plan-text 'gemma \"<|turn>user\\nhi<turn|>\")
+  => \"You said: hi\"
+PyTorch: none"
   (let* ((turn (or (substring-between prompt (user-turn-open family) (turn-close family))
                    ""))
          (line (last-line turn))
@@ -360,6 +374,24 @@ a small model answers in a predictable way so that the tests can check it.")
           (lambda (a b) (string<? (symbol->string (car a)) (symbol->string (car b)))))))
 
 (define (make-mock-backend)
+  "Create a deterministic backend for testing the service.
+
+It tokenizes one token per character and plans every reply from the prompt by
+fixed rules: a turn of tool results answers \"Tool result: ...\", a line naming
+an offered tool produces one tool call, and anything else answers \"You said:
+...\". Greedy decoding reproduces the plan exactly.
+
+Args:
+  none.
+Returns: a backend.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (backend-name (make-mock-backend))
+  => \"mock\"
+Note: load-model reads family, id, context-length, step-delay and
+prefill-delay. The delays are seconds per computed token and simulate device
+time.
+PyTorch: none"
   (make-backend #:name "mock"
                 #:load-model mock-load-model
                 #:model-info mock-model-info

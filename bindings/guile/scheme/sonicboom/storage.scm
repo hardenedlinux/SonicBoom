@@ -8,8 +8,8 @@
 ;;; its data in a <storage> record, so a second storage kind is added once
 ;;; rather than twice.
 ;;;
-;;; INTERNAL. This module is not part of the Scheme programming interface and no
-;;; public module re-exports it. Two kinds exist:
+;;; This is a low-level module: no other module re-exports it, and application
+;;; code normally builds tensors through (sonicboom tensor) instead. Two kinds:
 ;;;
 ;;;   'owned          a Guile bytevector the tensor owns (writable)
 ;;;   'borrowed-host  a Guile bytevector viewing native executable parameter
@@ -34,6 +34,17 @@
 
 ;; DATA is deliberately the first field: storage-data is inlined as a direct
 ;; struct slot so that element accessors keep one indirection, not two.
+
+;; The record holding a tensor's bytes.
+;;
+;; Both <tensor> and <ctensor> keep their data in a storage record, so a new
+;; storage kind is added once rather than twice. There are two kinds: an owned
+;; Guile bytevector, and a borrowed-host view of native executable parameter
+;; memory that the tensor API keeps read-only.
+;; PyTorch: none
+;; Note: PyTorch's storage is an untyped device buffer reached through tensor
+;; internals; this record is visible to Scheme code and is not part of the
+;; user-level API.
 (define-record-type <storage>
   (%make-storage data kind owner handle writable? generation)
   storage?
@@ -47,12 +58,35 @@
 ;; A record's struct slots are its declared fields, in order; DATA is slot 0.
 ;; Inlined on purpose (it is on the element-access path), so it is a call form,
 ;; not a first-class procedure.
+
+;; The bytevector stored in a storage record.
+;;
+;; Args:
+;;   s: a storage record.
+;; Returns: the backing bytevector.
+;; Example:
+;;   (use-modules (sonicboom storage) (rnrs bytevectors))
+;;   (let ((bv (make-bytevector 4 7)))
+;;     (eq? bv (storage-data (owned-storage bv))))
+;;   => #t
+;; PyTorch: none
+;; Note: The call never copies. A borrowed view's bytevector must not be written,
+;; even though Guile keeps it mutable.
 (define-inlinable (storage-data s) (struct-ref s 0))
 
 (define (owned-storage bv)
-  "A freshly owned storage over BV. It does not copy BV: the caller decides
-whether to hand over a private bytevector (constructors, *-copy) or to share its
-own (bytevector->tensor, bytevector->ctensor)."
+  "Storage over a bytevector, without copying it.
+
+The caller decides whether to hand over a private bytevector (constructors,
+copies) or to share its own (bytevector->tensor).
+Args:
+  bv: the bytevector to own.
+Returns: writable storage over bv.
+Example:
+  (use-modules (sonicboom storage) (rnrs bytevectors))
+  (bytevector-length (storage-data (owned-storage (make-bytevector 4))))
+  => 4
+PyTorch: none"
   (%make-storage bv 'owned #f #f #t 0))
 
 ;;; --- borrowed native parameter views -----------------------------------------
@@ -66,11 +100,20 @@ own (bytevector->tensor, bytevector->ctensor)."
 (define %view-guardian (make-guardian))
 
 (define (borrowed-host-storage data owner native-view)
-  "A read-only-through-the-tensor-API storage viewing native memory through DATA
-(a bytevector that aliases it, no copy). OWNER is kept alive for the caller's
-convenience; NATIVE-VIEW is the sb_storage handle that pins the memory itself.
-The aliasing bytevector is still mutable: tensor-set! is what enforces the
-read-only rule."
+  "Storage viewing native parameter memory through a bytevector.
+
+The bytevector aliases native memory without copying. The owner is kept alive
+for the caller's convenience; the native view is the sb_storage handle that
+pins the memory itself. The aliasing bytevector stays mutable because Guile
+bytevectors cannot be read-only; tensor-set! enforces the read-only rule.
+Args:
+  data: a bytevector aliasing the native memory.
+  owner: the object that must outlive the view, usually an executable.
+  native-view: the sb_storage handle pinning the memory.
+Returns: read-only-through-the-tensor-API storage.
+PyTorch: none
+Note: This requires an executable with native parameters and therefore has no
+example here."
   (let ((box (vector native-view #f)))
     (%view-guardian box)
     (%make-storage data 'borrowed-host owner box #f 0)))
@@ -89,9 +132,15 @@ this call released it."
             #t)))))
 
 (define (storage-release! s)
-  "Drop S's borrowed native view, if any. Idempotent; a no-op for owned storage.
-The bytes are not freed while any other view or the executable still pins them.
-After release S must not be read."
+  "Drop a storage's borrowed native view, if any.
+
+Idempotent; a no-op for owned storage. The bytes are not freed while another
+view or the executable still pins them, and the storage must not be read after
+it is released.
+Args:
+  s: a storage record.
+Returns: unspecified.
+PyTorch: none"
   (let ((box (%storage-handle s)))
     (when box
       (set-storage-handle! s #f)
@@ -100,8 +149,14 @@ After release S must not be read."
   *unspecified*)
 
 (define (reap-storage-views!)
-  "Release every borrowed view whose tensor was collected without an explicit
-storage-release!. Returns the number of views released."
+  "Release every borrowed view whose tensor was collected.
+
+Returns: the number of views released.
+Example:
+  (use-modules (sonicboom storage))
+  (reap-storage-views!)
+PyTorch: none
+Note: The count is zero in a fresh process; the example shows the call."
   (let loop ((n 0))
     (let ((box (%view-guardian)))
       (if (or (not box) (null? box))

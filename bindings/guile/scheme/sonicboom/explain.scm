@@ -43,8 +43,19 @@
       out)))
 
 (define (explain-table)
-  "The planner's decision registry for the current device, rendered as the
-same human-readable table tools/sb-explain prints. A string, newline-terminated."
+  "The planner's decision registry as a human-readable table.
+
+The table lists each automatic choice the runtime resolved for the current
+device, with its inputs, candidates, reason and costs. It reports what this
+process and its per-device cache have already decided; it does not tune
+anything.
+Args:
+Returns: a string, newline-terminated.
+Example:
+  (use-modules (sonicboom explain))
+  (string? (explain-table))
+  => #t
+PyTorch: none"
   (let ((out (explain-bytes (proc 'sb_explain_table) "explain-table")))
     (pointer->string (bytevector->pointer out))))
 
@@ -61,8 +72,17 @@ same human-readable table tools/sb-explain prints. A string, newline-terminated.
         (else node)))
 
 (define (explain-json)
-  "The same decision registry as a parsed Scheme value: an alist with the keys
-`version`, `device` and `decisions` (a list of decision alists)."
+  "The planner's decision registry as a parsed Scheme value.
+
+The value is an alist with the keys version, device and decisions; each
+decision is an alist with a name, a value, a reason and its declared costs.
+Args:
+Returns: the alist.
+Example:
+  (use-modules (sonicboom explain))
+  (assq-ref (explain-json) 'version)
+  => 1
+PyTorch: none"
   (let ((out (explain-bytes (proc 'sb_explain_json) "explain-json")))
     (normalize-json
      (with-input-from-string (pointer->string (bytevector->pointer out))

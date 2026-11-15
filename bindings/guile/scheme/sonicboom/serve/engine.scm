@@ -50,6 +50,19 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Requests and results
 
+;; A chat request: what to send to a model and how to sample the reply.
+;;
+;; The fields are model (a model id), messages, tools, tool-choice, max-tokens
+;; (#f: up to the context length), stop (a list of strings), temperature, top-p,
+;; top-k, seed, presence-penalty, frequency-penalty and constraint, with an
+;; accessor named after each. An omitted sampling parameter is neutral:
+;; temperature 0 (greedy), top-p 1, no top-k, seed 0 and no penalties.
+;;
+;; Example:
+;;   (use-modules (sonicboom serve engine))
+;;   (chat-request? (make-chat-request #:model "m" #:messages '()))
+;;   => #t
+;; PyTorch: none
 (define-record-type <chat-request>
   (%make-chat-request model messages tools tool-choice max-tokens stop
                       temperature top-p top-k seed presence-penalty
@@ -77,10 +90,58 @@
                             (top-p 1.0) (top-k 0) (seed 0)
                             (presence-penalty 0.0) (frequency-penalty 0.0)
                             (constraint #f))
+  "Create a chat request.
+
+Every keyword is optional except model and messages; the sampling parameters
+default to a greedy, reproducible request.
+
+Args:
+  model: keyword; the model id.
+  messages: keyword; the list of message alists with string keys.
+  tools: keyword; the tools offered to the model (default '()).
+  tool-choice: keyword; \"none\", \"auto\", \"required\" or a function name
+    (default \"auto\").
+  max-tokens: keyword; the reply limit, or #f for the context length
+    (default #f).
+  stop: keyword; strings that end the reply (default '()).
+  temperature: keyword; the sampling temperature, 0 for greedy (default 0.0).
+  top-p: keyword; the nucleus mass (default 1.0).
+  top-k: keyword; the candidate count, 0 for no limit (default 0).
+  seed: keyword; the sampling seed (default 0).
+  presence-penalty: keyword; the presence penalty (default 0.0).
+  frequency-penalty: keyword; the frequency penalty (default 0.0).
+  constraint: keyword; a constrained-decoding constraint or #f (default #f).
+Returns: a chat request.
+Example:
+  (use-modules (sonicboom serve engine))
+  (chat-request-temperature (make-chat-request #:model \"m\" #:messages '()))
+  => 0.0
+PyTorch: none"
   (%make-chat-request model messages tools tool-choice max-tokens stop
                       temperature top-p top-k seed presence-penalty
                       frequency-penalty constraint))
 
+;; The result of one request.
+;;
+;; finish-reason is "stop", "length", "tool_calls" or "cancelled"; content is the
+;; reply text; tool-calls the tool calls as (id name arguments-json); and
+;; prompt-tokens, completion-tokens and cached-tokens count the tokens of the
+;; request.
+;;
+;; Example:
+;;   (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+;;                (sonicboom serve engine))
+;;   (let* ((engine (make-engine
+;;                   (list (load-model (make-mock-backend) '((id . "m"))))))
+;;          (request (make-chat-request
+;;                    #:model "m"
+;;                    #:messages (list (list (cons "role" "user")
+;;                                           (cons "content" "hi"))))))
+;;     (result-finish-reason
+;;      (engine-run engine (engine-admit! engine) request
+;;                  (lambda (kind . args) #t))))
+;;   => "stop"
+;; PyTorch: none
 (define-record-type <result>
   (make-result finish-reason content tool-calls prompt-tokens
                completion-tokens cached-tokens)
@@ -95,6 +156,20 @@
 ;;; ---------------------------------------------------------------------------
 ;;; The engine
 
+;; An engine serves a set of models and runs one request at a time.
+;;
+;; engine-models is the alist id -> (model . pool); every model has its own
+;; session pool. engine-queue-limit is how many requests may wait for their turn.
+;; The engine is independent of HTTP: a caller hands it a chat request and gets
+;; events back.
+;;
+;; Example:
+;;   (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+;;                (sonicboom serve engine))
+;;   (engine-model-ids
+;;    (make-engine (list (load-model (make-mock-backend) '((id . "m"))))))
+;;   => ("m")
+;; PyTorch: none
 (define-record-type <engine>
   (%make-engine models queue-limit lock cv running queue stats counter)
   engine?
@@ -110,6 +185,23 @@
 ;; models: list of models (from load-model). Each gets its own session pool.
 (define* (make-engine models #:key (queue-limit 8) (max-sessions 4)
                       (token-budget 32768))
+  "Create an engine that serves MODELS.
+
+Every model gets its own session pool with the given limits.
+
+Args:
+  models: the list of models to serve.
+  queue-limit: keyword; how many requests may wait for their turn
+    (default 8).
+  max-sessions: keyword; the session pool size per model (default 4).
+  token-budget: keyword; the tokens the session pool may hold per model
+    (default 32768).
+Returns: an engine.
+Example:
+  (use-modules (sonicboom serve engine))
+  (engine? (make-engine '()))
+  => #t
+PyTorch: none"
   (%make-engine (map (lambda (m)
                        (cons (model-id m)
                              (cons m (make-session-pool m #:max-sessions max-sessions
@@ -118,18 +210,72 @@
                 queue-limit (make-mutex) (make-condition-variable) #f '()
                 (make-hash-table) 0))
 
-(define (engine-model-ids engine) (map car (engine-models engine)))
+(define (engine-model-ids engine)
+  "The ids of the models ENGINE serves, in serving order.
+
+Args:
+  engine: an engine.
+Returns: a list of strings.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+               (sonicboom serve engine))
+  (engine-model-ids
+   (make-engine (list (load-model (make-mock-backend) '((id . \"m\"))))))
+  => (\"m\")
+PyTorch: none"
+  (map car (engine-models engine)))
 
 (define (engine-model engine id)
+  "The model ENGINE serves as ID, or #f.
+
+Args:
+  engine: an engine.
+  id: a model id string.
+Returns: a model or #f.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+               (sonicboom serve engine))
+  (model-id (engine-model
+             (make-engine (list (load-model (make-mock-backend) '((id . \"m\")))))
+             \"m\"))
+  => \"m\"
+PyTorch: none"
   (match (assoc id (engine-models engine)) ((_ . (m . _)) m) (#f #f)))
 
 ;; (id . family) per served model, in serving order: the family each model
 ;; selected from its architecture, for /v1/models.
 (define (engine-model-families engine)
+  "The chat-template family of every model ENGINE serves.
+
+Args:
+  engine: an engine.
+Returns: an alist (id . family), in serving order.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+               (sonicboom serve engine))
+  (engine-model-families
+   (make-engine (list (load-model (make-mock-backend) '((id . \"m\"))))))
+  => ((\"m\" . gemma))
+PyTorch: none"
   (map (lambda (id) (cons id (model-family (engine-model engine id))))
        (engine-model-ids engine)))
 
 (define (engine-pool engine id)
+  "The session pool of the model ENGINE serves as ID, or #f.
+
+Args:
+  engine: an engine.
+  id: a model id string.
+Returns: a session pool or #f.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+               (sonicboom serve engine) (sonicboom serve sessions))
+  (session-pool? (engine-pool
+                  (make-engine
+                   (list (load-model (make-mock-backend) '((id . \"m\")))))
+                  \"m\"))
+  => #t
+PyTorch: none"
   (match (assoc id (engine-models engine)) ((_ . (_ . p)) p) (#f #f)))
 
 (define (bump! engine key n)
@@ -144,6 +290,20 @@
 ;;; The queue. A ticket is a fresh pair; only its identity matters.
 
 (define (engine-admit! engine)
+  "Put a request in ENGINE's queue and return its ticket.
+
+A request admitted but never run must be dropped with engine-drop!.
+
+Args:
+  engine: an engine.
+Returns: a ticket.
+Example:
+  (use-modules (sonicboom serve engine))
+  (pair? (engine-admit! (make-engine '())))
+  => #t
+PyTorch: none
+Note: when queue-limit requests are already waiting (the running one does not
+count), it raises (queue-full n) with the number of requests over the limit."
   (with-mutex (engine-lock engine)
     ;; Admitted = the running one + the queue; one of them runs, the others
     ;; wait.
@@ -172,6 +332,19 @@
 
 ;; Leave the queue: done running, or never run.
 (define (engine-drop! engine ticket)
+  "Leave the queue with TICKET, whether it ran or not.
+
+Args:
+  engine: an engine.
+  ticket: a ticket from engine-admit!.
+Returns: unspecified.
+Example:
+  (use-modules (sonicboom serve engine))
+  (let ((engine (make-engine '())))
+    (engine-drop! engine (engine-admit! engine))
+    #t)
+  => #t
+PyTorch: none"
   (with-mutex (engine-lock engine)
     (if (eq? (engine-running engine) ticket)
         (set-engine-running! engine #f)
@@ -209,9 +382,59 @@
 
 ;; Admit, run, and leave the queue.
 (define (engine-generate engine request on-event)
+  "Admit REQUEST, run it and return its result.
+
+This is engine-admit! followed by engine-run, for a caller that does not need
+the ticket.
+
+Args:
+  engine: an engine.
+  request: a chat request.
+  on-event: the event procedure (see engine-run).
+Returns: a result.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+               (sonicboom serve engine))
+  (let ((engine (make-engine
+                 (list (load-model (make-mock-backend) '((id . \"m\")))))))
+    (result-content
+     (engine-generate
+      engine
+      (make-chat-request #:model \"m\"
+                         #:messages (list (list (cons \"role\" \"user\")
+                                                (cons \"content\" \"hi\"))))
+      (lambda (kind . args) #t))))
+  => \"You said: hi\"
+PyTorch: none"
   (engine-run engine (engine-admit! engine) request on-event))
 
 (define (engine-run engine ticket request on-event)
+  "Wait for TICKET's turn, run REQUEST and return its result.
+
+The ticket is dropped from the queue however this returns.
+
+Args:
+  engine: an engine.
+  ticket: a ticket from engine-admit!.
+  request: a chat request.
+  on-event: a procedure called with each event: ('content text) or
+    ('tool-call index id name arguments-json); a #f result cancels the
+    generation.
+Returns: a result.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+               (sonicboom serve engine))
+  (let* ((engine (make-engine
+                  (list (load-model (make-mock-backend) '((id . \"m\"))))))
+         (request (make-chat-request
+                   #:model \"m\"
+                   #:messages (list (list (cons \"role\" \"user\")
+                                          (cons \"content\" \"hi\"))))))
+    (result-finish-reason
+     (engine-run engine (engine-admit! engine) request
+                 (lambda (kind . args) #t))))
+  => \"stop\"
+PyTorch: none"
   (dynamic-wind
     (lambda () #t)
     (lambda ()
@@ -391,6 +614,19 @@
           (pool-release! pool entry (append prompt-tokens (reverse generated))))))))
 
 (define (engine-stats engine)
+  "The counters of ENGINE as an alist.
+
+The alist holds queue-limit, waiting, running and the request and token
+counters.
+
+Args:
+  engine: an engine.
+Returns: an alist.
+Example:
+  (use-modules (sonicboom serve engine))
+  (assq-ref (engine-stats (make-engine '())) 'queue-limit)
+  => 8
+PyTorch: none"
   (with-mutex (engine-lock engine)
     `((queue-limit . ,(engine-queue-limit engine))
       (waiting . ,(length (engine-queue engine)))

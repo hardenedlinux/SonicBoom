@@ -106,6 +106,17 @@
       (call-with-runner (lambda () (run-producer producer port alive?)) #:timeout 0))))
 
 (define (sse-install!)
+  "Install the sonicboom-sse Ragnarok protocol.
+
+The protocol reads and opens connections like HTTP and writes responses with
+the SSE writer. Installing twice is harmless.
+
+Args:
+  none.
+Returns: unspecified.
+PyTorch: none
+Note: this relies on Artanis internals and must run before any route calls
+sse-response."
   (unless (lookup-protocol protocol-name)
     (let ((http (new-http-protocol)))
       (protocol-add! protocol-name
@@ -118,5 +129,17 @@
 ;; In a route handler: stream the events of producer. The handler returns
 ;; what this returns.
 (define (sse-response producer)
+  "Stream the events PRODUCER sends on the current connection.
+
+The connection switches to the sonicboom-sse protocol; the producer receives a
+send procedure, (send data) writes one server-sent event and returns #t, or #f
+once the client is gone.
+
+Args:
+  producer: a procedure of one argument (the send procedure).
+Returns: an empty response for Artanis' handler-render.
+PyTorch: none
+Note: use it as the body of a route handler, with the SSE protocol installed
+by sse-install!."
   (register-proto! (current-client) protocol-name producer)
   (response-emit "" #:headers '((content-type . (text/event-stream)))))

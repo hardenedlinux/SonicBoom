@@ -2,6 +2,12 @@
 ;;;
 ;;; SPDX-License-Identifier: GPL-3.0-or-later
 ;;; Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
+;;;
+;;; The backend that runs a real model: it loads a GGUF through the C ABI,
+;;; chooses the chat template from the model's architecture, keeps a KV-cache
+;;; session per conversation, installs a JSON-schema or GBNF constraint at
+;;; prefill, and samples on the device. The OpenAI-compatible server uses this
+;;; backend when it is started with a model file.
 
 (define-module (sonicboom serve real-backend)
   #:use-module (srfi srfi-1)
@@ -217,6 +223,20 @@
     produced))
 
 (define (make-real-backend)
+  "Create the backend that runs models with libsonicboom.
+
+The backend loads a GGUF file, tokenizes with the model's own tokenizer, applies
+the chat template its architecture selects (gemma4 to gemma, qwen2 to qwen), and
+decodes on the device. Sessions hold a KV cache; a grammar constraint is
+compiled and installed at prefill.
+
+Returns: a backend.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve real-backend))
+  (backend-name (make-real-backend))
+  => \"libsonicboom\"
+PyTorch: none
+Note: the libsonicboom shared library must be loadable by the process."
   (make-backend
    #:name "libsonicboom"
    #:load-model load-real-model

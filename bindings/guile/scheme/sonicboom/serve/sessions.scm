@@ -34,6 +34,13 @@
             pool-acquire! pool-release! pool-entry-session pool-entry-match
             pool-stats pool-clear!))
 
+;; One pooled session and the tokens it holds.
+;;
+;; pool-entry-session is the backend session; pool-entry-match is the length of
+;; the common prefix found when the entry was acquired. The rest of the entry
+;; (the mirror, the last-use clock and the busy flag) is internal to the pool.
+;;
+;; PyTorch: none
 (define-record-type <entry>
   (make-entry session tokens last-used busy? match)
   entry?
@@ -43,6 +50,19 @@
   (busy? entry-busy? set-entry-busy!)
   (match pool-entry-match set-entry-match!))   ; prefix length found at acquire
 
+;; A pool of backend sessions for one model.
+;;
+;; session-pool? recognizes it and pool-model returns the model. The pool keeps a
+;; mirror of the tokens each session holds, so a request can go to the idle
+;; session sharing the longest token prefix with its prompt. make-session-pool
+;; creates one; pool-acquire! and pool-release! lend and return entries.
+;;
+;; Example:
+;;   (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+;;                (sonicboom serve sessions))
+;;   (session-pool? (make-session-pool (load-model (make-mock-backend) '())))
+;;   => #t
+;; PyTorch: none
 (define-record-type <pool>
   (%make-pool model max-sessions token-budget entries clock lock stats)
   session-pool?
@@ -55,6 +75,20 @@
   (stats pool-stats-table))
 
 (define* (make-session-pool model #:key (max-sessions 4) (token-budget 32768))
+  "Create a session pool for MODEL.
+
+Args:
+  model: a model.
+  max-sessions: keyword; how many sessions the pool keeps (default 4).
+  token-budget: keyword; how many tokens the sessions may hold together
+    (default 32768).
+Returns: a session pool.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+               (sonicboom serve sessions))
+  (session-pool? (make-session-pool (load-model (make-mock-backend) '())))
+  => #t
+PyTorch: none"
   (%make-pool model max-sessions token-budget '() 0 (make-mutex) (make-hash-table)))
 
 (define (bump! pool key n)
@@ -82,6 +116,27 @@
     e))
 
 (define (pool-acquire! pool prompt-tokens)
+  "Lend the entry whose session shares the longest prefix with PROMPT-TOKENS.
+
+A prompt that extends everything a session holds reuses that session; a partial
+match copies the prefix into a new session when the pool has room and the
+backend can fork, so the matched session keeps its own continuation; otherwise
+a new session is created, or the best match is taken over when the pool is
+full. Ties go to the least recently used session. The entry is busy until
+pool-release!.
+
+Args:
+  pool: a session pool.
+  prompt-tokens: the prompt's token ids, a list or a vector.
+Returns: a pool entry.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+               (sonicboom serve sessions))
+  (let* ((model (load-model (make-mock-backend) '()))
+         (pool (make-session-pool model)))
+    (pool-entry-match (pool-acquire! pool '(104 105))))
+  => 0
+PyTorch: none"
   (let ((prompt (if (vector? prompt-tokens) prompt-tokens (list->vector prompt-tokens)))
         (model (pool-model pool)))
     (with-mutex (pool-lock pool)
@@ -139,6 +194,25 @@
   (fold + 0 (map (lambda (e) (vector-length (entry-tokens e))) (pool-entries pool))))
 
 (define (pool-release! pool entry tokens)
+  "Return ENTRY to the pool with the tokens its session now holds.
+
+The pool then enforces its limits: idle sessions are freed, least recently used
+first, until the session count and the token budget are satisfied.
+
+Args:
+  pool: a session pool.
+  entry: a pool entry.
+  tokens: the tokens the session holds (prompt plus generated).
+Returns: unspecified.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+               (sonicboom serve sessions))
+  (let* ((model (load-model (make-mock-backend) '()))
+         (pool (make-session-pool model)))
+    (pool-release! pool (pool-acquire! pool '(104 105)) '(104 105))
+    (assq-ref (pool-stats pool) 'held-tokens))
+  => 2
+PyTorch: none"
   (with-mutex (pool-lock pool)
     (set-entry-tokens! entry (if (vector? tokens) tokens (list->vector tokens)))
     (set-entry-busy! entry #f)
@@ -155,10 +229,43 @@
           (when victim (evict! pool victim) (lp)))))))
 
 (define (pool-clear! pool)
+  "Free every idle session of POOL.
+
+A session that is busy at the time is left alone.
+
+Args:
+  pool: a session pool.
+Returns: unspecified.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+               (sonicboom serve sessions))
+  (let* ((model (load-model (make-mock-backend) '()))
+         (pool (make-session-pool model)))
+    (pool-release! pool (pool-acquire! pool '(1)) '(1))
+    (pool-clear! pool)
+    (assq-ref (pool-stats pool) 'sessions))
+  => 0
+PyTorch: none"
   (with-mutex (pool-lock pool)
     (for-each (lambda (e) (evict! pool e)) (remove entry-busy? (pool-entries pool)))))
 
 (define (pool-stats pool)
+  "The counters of POOL as an alist.
+
+The alist holds sessions, busy, held-tokens, max-sessions, token-budget and the
+lookup, hit, fork, creation, takeover and eviction counters.
+
+Args:
+  pool: a session pool.
+Returns: an alist.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+               (sonicboom serve sessions))
+  (assq-ref (pool-stats
+             (make-session-pool (load-model (make-mock-backend) '())))
+            'sessions)
+  => 0
+PyTorch: none"
   (with-mutex (pool-lock pool)
     `((sessions . ,(length (pool-entries pool)))
       (busy . ,(count entry-busy? (pool-entries pool)))

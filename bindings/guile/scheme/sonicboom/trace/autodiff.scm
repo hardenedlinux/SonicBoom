@@ -58,9 +58,28 @@
         g masks))
 
 (define (grad loss wrt)
-  "Gradients of the rank-0 LOSS with respect to WRT (a symbolic tensor or a
-list of them), as symbolic tensors appended to the graph being traced.
-Returns one gradient, or a list in WRT's order."
+  "The gradients of a rank-0 LOSS with respect to WRT.
+
+Called inside a traced function on symbolic values, it walks the nodes
+recorded so far backwards from LOSS and appends the backward nodes to the
+same graph, using each operator's gradient rule. A tensor that does not
+affect LOSS gets a zero gradient.
+
+Args:
+  loss: the rank-0 symbolic loss.
+  wrt: a symbolic tensor, or a list of symbolic tensors.
+Returns: one gradient tensor, or a list of them in WRT's order.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace symbolic)
+               (sonicboom trace tracer) (sonicboom trace autodiff))
+  (define f (trace-function (lambda (x) (grad (sum (mul x x)) x))))
+  (ctensor->list (f (list->ctensor '(1.0 2.0))))
+  => (2.0 4.0)
+PyTorch: torch.autograd.grad
+Note: torch.autograd.grad runs over a graph a forward pass has already
+built; this call happens while the forward graph is being traced. The loss
+must have one element, and a value computed before a graph break cannot be
+differentiated across."
   (let ((rec (current-tracer))
         (single? (sym? wrt))
         (wrt (if (sym? wrt) (list wrt) wrt)))
@@ -160,9 +179,26 @@ break; differentiating across graph breaks is not supported" name)))
         (if single? (car result) result)))))
 
 (define (value-and-grad f)
-  "A traced function returning (loss gradient ...): the value of F on its
-arguments and its gradients with respect to every tensor argument. Inside
-another trace it is inlined."
+  "A traced function returning a loss together with its gradients.
+
+Calling the result with tensor arguments runs F and returns
+(loss gradient ...), one gradient per tensor argument; non-tensor arguments
+are passed through to F and are static. Called inside another trace, the
+function is inlined.
+
+Args:
+  f: a procedure from tensor arguments to a rank-0 loss.
+Returns: a traced procedure.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace symbolic)
+               (sonicboom trace tracer) (sonicboom trace autodiff))
+  (let* ((f (value-and-grad (lambda (x) (sum (mul x x)))))
+         (r (f (list->ctensor '(1.0 2.0)))))
+    (map ctensor->list r))
+  => ((5.0) (2.0 4.0))
+PyTorch: torch.func.grad_and_value
+Note: Returns the value before the gradients; grad_and_value returns the
+gradients first."
   (trace-function
    (lambda args
      (let ((loss (apply f args)))

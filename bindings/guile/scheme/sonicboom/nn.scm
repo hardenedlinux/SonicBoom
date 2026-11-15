@@ -70,6 +70,15 @@
 
 ;;; --- layers -----------------------------------------------------------------
 
+;; A layer: a kind, a name, its parameters and its two evaluation routes.
+;;
+;; `kind` is the layer class that drives the native forward pass, `name`
+;; distinguishes the layer's parameters inside a model, and `parameters` is an
+;; alist of key to tensor. Application code builds layers with `linear` and
+;; `relu` and composes them with `sequential`.
+;; PyTorch: none
+;; Note: The nearest PyTorch concept is torch.nn.Module, which also carries a
+;; forward method; here the routes are kept in the record instead.
 (define-record-type <layer>
   (%make-layer kind name parameters apply trace)
   layer?
@@ -80,6 +89,18 @@
   (trace      layer-trace))       ; (x params) -> symbolic value
 
 (define (layer-parameter-ref layer key)
+  "Look up one of a layer's parameters by key.
+
+Args:
+  layer: a layer.
+  key: the parameter key, weight or bias for a linear layer.
+Returns: the parameter tensor, or #f when the layer has no such key.
+Example:
+  (use-modules (sonicboom nn) (sonicboom tensor))
+  (tensor-shape (layer-parameter-ref (linear 2 3) 'bias))
+  => (3)
+PyTorch: torch.nn.Module.get_parameter
+Note: Looks a parameter up by its key in the layer."
   (assq-ref (layer-parameters layer) key))
 
 (define (initializer dims init)
@@ -123,8 +144,22 @@ axis ([in, out]). This is a constant layout change, not arithmetic in the graph.
 
 (define* (linear in-features out-features #:key (bias #t) (init 'randn)
                  (name #f))
-  "A dense (fully-connected) layer. Input [batch, in], output [batch, out].
-Lowered to native gemm(x, Wᵀ, b) with the bias broadcast along the trailing axis."
+  "A dense (fully-connected) layer.
+
+Input [batch, in], output [batch, out]. Lowered to native gemm(x, W-transpose,
+b) with the bias broadcast along the trailing axis.
+Args:
+  in-features: the size of the input's trailing dimension.
+  out-features: the size of the output's trailing dimension.
+  bias: whether to create a bias parameter; #t by default.
+  init: the weight initializer, zeros, ones or randn; randn by default.
+  name: the layer name used in parameter keys; a generated one by default.
+Returns: a layer.
+Example:
+  (use-modules (sonicboom nn) (sonicboom tensor))
+  (tensor-shape (layer-parameter-ref (linear 2 3) 'weight))
+  => (3 2)
+PyTorch: torch.nn.Linear"
   (let* ((lname (or name (default-layer-name 'linear)))
          (w (initializer (list out-features in-features) init))
          (b (and bias (zeros (list out-features))))
@@ -154,8 +189,17 @@ Lowered to native gemm(x, Wᵀ, b) with the bias broadcast along the trailing ax
            (if bb (tl:linear x wt bb) (sx:matmul x wt))))))))
 
 (define* (relu #:key (name #f))
-  "Rectified linear unit. Elementwise; preserves the input shape. Lowered to
-native relu."
+  "A rectified linear unit layer.
+
+Elementwise; preserves the input shape. Lowered to native relu.
+Args:
+  name: the layer name used in parameter keys; a generated one by default.
+Returns: a layer with no parameters.
+Example:
+  (use-modules (sonicboom nn))
+  (layer-kind (relu))
+  => relu
+PyTorch: torch.nn.functional.relu"
   (let ((lname (or name (default-layer-name 'relu))))
     (%make-layer
      'relu lname '()
@@ -177,6 +221,14 @@ native relu."
   (%make-compilation-pending)
   compilation-pending?)
 
+;; A model: an ordered list of layers and their merged parameters.
+;;
+;; The merged parameter keys are "<layer-name>.<key>", so a parameter stays
+;; identifiable in a model built from several layers. A model also keeps the
+;; executables it has compiled, one per input shape, as private state.
+;; PyTorch: torch.nn.Sequential
+;; Note: A PyTorch Sequential holds the modules and reaches their parameters
+;; through the module tree; this record stores the merged parameter alist.
 (define-record-type <model>
   (%make-model layers parameters executables lock compile-cond compilations)
   model?
@@ -197,7 +249,17 @@ native relu."
   (compilations model-compilations set-model-compilations!))
 
 (define (sequential . layers)
-  "Compose LAYERS into a model. Parameter names are made unique per layer."
+  "Compose layers into a model.
+
+Parameter names are made unique per layer, as \"<layer-name>.<key>\".
+Args:
+  layers: the layers in forward order.
+Returns: a model.
+Example:
+  (use-modules (sonicboom nn))
+  (map layer-kind (model-layers (sequential (linear 2 3) (relu))))
+  => (linear relu)
+PyTorch: torch.nn.Sequential"
   (let ((params (append-map
                  (lambda (layer)
                    (map (lambda (pair)
@@ -210,6 +272,19 @@ native relu."
     (%make-model layers params '() (make-mutex) (make-condition-variable) 0)))
 
 (define (model-parameter-ref model key)
+  "Look up one of a model's merged parameters by key.
+
+Args:
+  model: a model.
+  key: a symbol such as l1.weight.
+Returns: the parameter tensor, or #f when the key is not present.
+Example:
+  (use-modules (sonicboom nn) (sonicboom tensor))
+  (let ((m (sequential (linear 2 3 #:name 'l1))))
+    (tensor-shape (model-parameter-ref m 'l1.weight)))
+  => (3 2)
+PyTorch: torch.nn.Module.get_parameter
+Note: Looks a parameter up by its key in the merged model."
   (assq-ref (model-parameters model) key))
 
 ;; Internal (not exported): the single-flight counter and the executable
@@ -273,12 +348,24 @@ native relu."
                 (loop (cdr ls) out-name out-dims))))))))
 
 (define (model-graph-text model input-dims)
-  "Return the S-Expr v0.1 graph text for MODEL's forward pass (input named
-\"x\", float32, shape INPUT-DIMS). Parameters are declared (data :bound
-\"<name>\") with names matching model-parameters (\"<layer-name>.<key>\"):
-the text carries no weight bytes, and the same text for two models with the
-same structure is identical. Model-forward binds each model's own tensors by
-name; sb_export_model replaces them with the trained weights at export time."
+  "The S-Expr graph text of a model's forward pass.
+
+The input is named x and is float32 with the given shape. Parameters are
+declared as bound data with names matching model-parameters, so the text
+carries no weight bytes and two models with the same structure produce the
+same text.
+Args:
+  model: a model.
+  input-dims: the input shape as a list of integers.
+Returns: the graph text as a string.
+Example:
+  (use-modules (sonicboom nn))
+  (string-prefix? \"(sonicboom-s-expr\"
+                  (model-graph-text (sequential (linear 2 1)) '(1 2)))
+  => #t
+PyTorch: none
+Note: SonicBoom emits its own S-Expr graph format; there is no PyTorch
+equivalent string."
   (call-with-values
       (lambda () (build-graph "x" 'float32 input-dims (model-layers model)))
     (lambda (text out-dims params) text)))
@@ -295,10 +382,22 @@ name; sb_export_model replaces them with the trained weights at export time."
     (if (null? ls) v (loop (cdr ls) ((layer-trace (car ls)) v params)))))
 
 (define (model-trace model input-dims)
-  "Trace MODEL's forward pass over an input of shape INPUT-DIMS — a list of
-ints — and return the traced S-Expr v0.1 document datum. Lower it with
-`traced->s-expr` / run it with `run-traced` (both in (sonicboom trace lower));
-`linear` layers come out as the same `gemm` nodes model-forward emits."
+  "Trace a model's forward pass into an S-Expr document.
+
+The input has the given shape. The result can be lowered and executed with
+the procedures in (sonicboom trace lower); linear layers come out as the same
+gemm nodes model-forward emits.
+Args:
+  model: a model.
+  input-dims: the input shape as a list of integers.
+Returns: the traced S-Expr document as a datum.
+Example:
+  (use-modules (sonicboom nn))
+  (pair? (model-trace (sequential (linear 2 1)) '(1 2)))
+  => #t
+PyTorch: none
+Note: The PyTorch counterpart would be torch.jit.trace, which belongs to a
+part of PyTorch that SonicBoom does not mirror."
   (let* ((params (map (lambda (p) (cons (car p) (cdr p)))
                       (model-parameters model)))
          (x (ct:make-ctensor 'float32 input-dims
@@ -319,10 +418,24 @@ ints — and return the traced S-Expr v0.1 document datum. Lower it with
     (bytevector->tensor bv (ct:ctensor-shape ct) #:dtype 'float32)))
 
 (define (model-trace-forward model x)
-  "Run MODEL's forward pass on tensor X through the traced route: trace the
-layers, lower the graph onto the runtime vocabulary and execute it with
-libsonicboom.so. Returns the output tensor — the same value model-forward
-computes, reached through the tracer instead of emitted text."
+  "Run a forward pass through the traced route.
+
+The layers are traced, the graph is lowered onto the runtime vocabulary and
+executed by libsonicboom.so. The result equals what model-forward computes,
+reached through the tracer instead of emitted text.
+Args:
+  model: a model.
+  x: a float32 input tensor.
+Returns: the output tensor.
+Example:
+  (use-modules (sonicboom nn) (sonicboom tensor))
+  (tensor->list
+   (model-trace-forward
+    (sequential (linear 2 1 #:bias #f #:init 'ones))
+    (make-tensor '(1.0 2.0) '(1 2))))
+  => (3.0)
+PyTorch: none
+Note: Only float32 inputs are supported."
   (unless (eq? (tensor-dtype x) 'float32)
     (error "model-trace-forward: only float32 inputs are supported in v0"
            (tensor-dtype x)))
@@ -400,16 +513,27 @@ re-raised."
              exe)))))))
 
 (define (model-forward model x)
-  "Run a forward pass of MODEL on input tensor X through the native backend.
-Returns the output tensor. Only float32 is supported in v0.
+  "Run a forward pass of a model on an input tensor.
 
-The first forward for a given input shape compiles and binds one executable for
-that (model, shape) and reuses it afterwards. The parameters are bound from
-MODEL's tensors at that first forward, so later edits to those tensors are not
-observed (bind once, then run); with `executable-cache-enabled` off, every call
-recompiles and rebinds from the current tensors instead. Concurrent calls are
-safe: the first call for a shape compiles it once and the other callers wait for
-and share that executable, whose runs are serialized."
+The first forward for a given input shape compiles and binds one executable
+for that model and shape and reuses it afterwards. Parameters are bound from
+the model's tensors at that first forward, so later edits to those tensors are
+not observed (bind once, then run); with executable-cache-enabled off, every
+call recompiles and rebinds from the current tensors instead. Concurrent calls
+are safe: the first call for a shape compiles it once and the other callers
+wait for and share that executable, whose runs are serialized.
+Args:
+  model: a model.
+  x: a float32 input tensor.
+Returns: the output tensor.
+Example:
+  (use-modules (sonicboom nn) (sonicboom tensor))
+  (tensor->list
+   (model-forward (sequential (linear 2 1 #:bias #f #:init 'ones))
+                  (make-tensor '(1.0 2.0) '(1 2))))
+  => (3.0)
+PyTorch: torch.nn.Module.forward
+Note: Only float32 inputs are supported in v0."
   (unless (eq? (tensor-dtype x) 'float32)
     (error "model-forward: only float32 inputs are supported in v0"
            (tensor-dtype x)))

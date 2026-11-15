@@ -43,7 +43,19 @@
 ;;; process uses SONICBOOM_NUMERICS, then 'standard.
 
 (define (numerics-profile)
-  "The effective numerics profile: 'strict or 'standard."
+  "The numerics profile this process is using.
+
+The profile is the process-wide numeric contract: strict keeps every
+historical reduction order, standard allows the profile's substitutions.
+Args:
+Returns: 'strict or 'standard.
+Example:
+  (use-modules (sonicboom inference))
+  (memq (numerics-profile) '(strict standard))
+  => (standard)
+PyTorch: none
+Note: The profile is chosen before the first model or session exists; see
+set-numerics-profile!."
   (let ((err (make-slot))
         (out (make-bytevector (sizeof int) 0)))
     (sb-check! ((proc 'sb_get_numerics_profile) (bytevector->pointer out)
@@ -54,9 +66,19 @@
       (else 'standard))))
 
 (define (set-numerics-profile! profile)
-  "Request PROFILE ('strict or 'standard) for this process and return the
-effective profile. Signals a &sonicboom-error if the profile is already latched to
-the other value; setting the effective profile again is a no-op success."
+  "Request a numerics profile for this process.
+
+The first model or session latches the profile, so call this before either.
+Requesting the effective profile again is a no-op success; requesting the
+other one after latching signals a &sonicboom-error.
+Args:
+  profile: 'strict or 'standard.
+Returns: the effective profile after the request.
+Example:
+  (use-modules (sonicboom inference))
+  (let ((p (numerics-profile))) (eq? p (set-numerics-profile! p)))
+  => #t
+PyTorch: none"
   (let ((code (case profile
                 ((strict) 0)
                 ((standard) 1)
@@ -121,6 +143,30 @@ the other value; setting the effective profile again is a no-op success."
                            (repeat-last-n 64)
                            (presence-penalty 0.0)
                            (frequency-penalty 0.0))
+  "Build the native sampling-parameters structure for a decode call.
+
+Temperature 0 selects the greedy path; top-k 0, top-p 1, min-p 0,
+repeat-penalty 1 and the two penalties 0 are neutral (off). A positive
+temperature samples deterministically from seed.
+Args:
+  max-tokens: the maximum number of tokens to produce.
+  temperature: the sampling temperature.
+  top-k: keep the k most likely tokens; 0 disables.
+  top-p: nucleus threshold; 1 disables.
+  min-p: minimum relative probability; 0 disables.
+  seed: the sampling seed.
+  repeat-penalty: penalty for repeated tokens; 1 disables.
+  repeat-last-n: how many recent tokens the repeat penalty looks at.
+  presence-penalty: additive presence penalty; 0 disables.
+  frequency-penalty: additive frequency penalty; 0 disables.
+Returns: a bytevector holding the native structure.
+Example:
+  (use-modules (sonicboom inference))
+  (bytevector-length (make-sampling-bv 8))
+  => 56
+PyTorch: none
+Note: The bytevector is an internal representation; pass it through the
+generation procedures rather than decoding it."
   (let ((bv (make-bytevector 56 0)))
     (bytevector-u64-native-set! bv 0 56)
     (bytevector-ieee-single-native-set! bv 8 (exact->inexact temperature))
@@ -138,8 +184,14 @@ the other value; setting the effective profile again is a no-op success."
 ;;; --- model ------------------------------------------------------------------
 
 (define (load-model path)
-  "Load a GGUF (a model family SonicBoom supports) and return an opaque model
-handle."
+  "Load a model from a GGUF file.
+
+Args:
+  path: the path of the GGUF file.
+Returns: an opaque model handle.
+PyTorch: none
+Note: GGUF is SonicBoom's model-file format; PyTorch core has no GGUF
+loader."
   (let* ((model-slot (make-slot))
          (err-slot (make-slot))
          (st ((proc 'sb_llm_model_load) (string->pointer path)
@@ -148,12 +200,28 @@ handle."
     (slot-ref model-slot)))
 
 (define (free-model! model)
+  "Release a model handle.
+
+A session keeps the model it was created from alive, so freeing the handle
+does not invalidate a live session.
+Args:
+  model: a model handle from load-model.
+Returns: unspecified.
+PyTorch: none"
   ((proc 'sb_llm_model_free) model))
 
 ;; The model's architecture, as its GGUF declares it in general.architecture
 ;; ("gemma4", "qwen2", ...). Who formats the prompt reads this from the model
 ;; rather than guessing the family from the file name.
 (define (model-arch model)
+  "The model's architecture name, as recorded in its GGUF metadata.
+
+Args:
+  model: a model handle.
+Returns: a string such as \"gemma4\" or \"qwen2\".
+PyTorch: none
+Note: The name comes from the file rather than the model family being
+guessed from the path."
   (let* ((len-slot (make-bytevector 8 0))       ; size_t
          (err-slot (make-slot)))
     ;; Sizing call (cap 0): fills *len_out (the length, no NUL).
@@ -172,6 +240,13 @@ handle."
 ;; from its metadata: what generation has to stop on, per model rather than per
 ;; family.
 (define (model-eos model)
+  "The model's end-of-sequence token ids.
+
+Args:
+  model: a model handle.
+Returns: a list of token ids; empty when the file declares none.
+PyTorch: none
+Note: Generation stops on these ids, per model rather than per family."
   (let* ((n-slot (make-bytevector 8 0))        ; size_t
          (err-slot (make-slot)))
     ;; Sizing call (cap 0): fills *n_out (the count).
@@ -189,7 +264,15 @@ handle."
 ;;; --- session ----------------------------------------------------------------
 
 (define (make-session model n-ctx)
-  "Create a session (token history + context window) over MODEL."
+  "Create a session over a model.
+
+A session holds the token history and the context window of one
+conversation; it keeps the model alive.
+Args:
+  model: a model handle.
+  n-ctx: the context-window size in tokens.
+Returns: an opaque session handle.
+PyTorch: none"
   (let* ((session-slot (make-slot))
          (err-slot (make-slot))
          (st ((proc 'sb_llm_session_new) model n-ctx
@@ -198,6 +281,12 @@ handle."
     (slot-ref session-slot)))
 
 (define (free-session! session)
+  "Release a session handle.
+
+Args:
+  session: a session handle from make-session.
+Returns: unspecified.
+PyTorch: none"
   ((proc 'sb_llm_session_free) session))
 
 ;;; --- constrained decoding ---------------------------------------------------
@@ -208,27 +297,55 @@ handle."
 ;;; it before prefill! — that is what masks the turn's first token too.
 
 (define (set-grammar! session gbnf)
-  "Constrain SESSION's next turn to GBNF (a llama.cpp-dialect grammar)."
+  "Constrain a session's next turn to a grammar.
+
+The grammar restarts at every prefill!, so install it before prefill! to
+mask the turn's first token as well. Every sampled token must keep the
+generated text acceptable to the grammar, and the model's end-of-sequence
+ids end the output where the grammar can end.
+Args:
+  session: a session handle.
+  gbnf: a grammar in the GBNF dialect.
+Returns: unspecified.
+PyTorch: none
+Note: Constrained decoding is not part of PyTorch's generation loop."
   (let ((err-slot (make-slot)))
     (sb-check! ((proc 'sb_llm_session_set_grammar) session
                 (string->pointer gbnf) (slot-ptr err-slot))
                err-slot "set-grammar!")))
 
 (define (set-json-schema! session schema-json)
-  "Constrain SESSION's next turn to the JSON Schema SCHEMA-JSON. An unsupported
-keyword is rejected here by name, not silently ignored."
+  "Constrain a session's next turn to a JSON Schema.
+
+The schema is compiled to a grammar; an unsupported keyword is rejected
+here by name rather than ignored.
+Args:
+  session: a session handle.
+  schema-json: the schema as a JSON string.
+Returns: unspecified.
+PyTorch: none"
   (let ((err-slot (make-slot)))
     (sb-check! ((proc 'sb_llm_session_set_json_schema) session
                 (string->pointer schema-json) (slot-ptr err-slot))
                err-slot "set-json-schema!")))
 
 (define (clear-grammar! session)
-  "Remove SESSION's grammar: the next turn decodes unconstrained."
+  "Remove a session's grammar, so the next turn decodes unconstrained.
+
+Args:
+  session: a session handle.
+Returns: unspecified.
+PyTorch: none"
   ((proc 'sb_llm_session_clear_grammar) session))
 
 (define (constraint-state session)
-  "Two values: whether SESSION has a grammar installed, and whether the text
-sampled so far is already a complete value of it."
+  "The state of a session's constrained decoding.
+
+Args:
+  session: a session handle.
+Returns: two values: whether a grammar is installed, and whether the text
+sampled so far is already a complete value of it.
+PyTorch: none"
   (let* ((active (make-bytevector (sizeof int) 0))
          (complete (make-bytevector (sizeof int) 0))
          (err-slot (make-slot)))
@@ -240,9 +357,22 @@ sampled so far is already a complete value of it."
             (not (zero? (bytevector-s32-native-ref complete 0))))))
 
 (define* (json-schema->gbnf schema-json #:key (prefix "") (suffix ""))
-  "Compile SCHEMA-JSON to GBNF text. With PREFIX/SUFFIX, the schema value must
-appear between those literal texts — how the server builds a tool-call envelope
-around a function's arguments schema."
+  "Compile a JSON Schema to GBNF grammar text.
+
+Args:
+  schema-json: the schema as a JSON string.
+  prefix: literal text that must appear before the schema value; empty by
+          default.
+  suffix: literal text that must appear after the schema value; empty by
+          default.
+Returns: the grammar text.
+Example:
+  (use-modules (sonicboom inference))
+  (string? (json-schema->gbnf \"{\\\"type\\\": \\\"string\\\"}\"))
+  => #t
+PyTorch: none
+Note: The prefix and suffix are how a tool-call envelope is built around a
+function's arguments schema."
   (let* ((len-slot (make-bytevector 8 0))       ; size_t
          (err-slot (make-slot))
          (head (list (string->pointer schema-json)
@@ -296,25 +426,37 @@ around a function's arguments schema."
       (s32-bv->list out n))))
 
 (define* (tokenize model text #:key (special? #f))
-  "Encode TEXT (a UTF-8 string) into a list of token ids (<bos> prepended,
-  matching llama-tokenize).
+  "Encode text to a list of token ids.
 
-  With #:special? #t, control pieces of the model's vocabulary (e.g. <|turn>,
-  <turn|>) that occur verbatim in TEXT become their own token instead of being
-  BPE'd as text — what a chat template's turn markers need. It is off by
-  default: special parsing turns text into control structure, so it must only be
-  used on text the caller generated itself, never on a user's message."
+A beginning-of-sequence token is prepended, matching the command-line
+tokenizer. Special-token parsing is off by default: it turns text into
+control structure, so use it only on text the caller generated itself, never
+on a user's message.
+Args:
+  model: a model handle.
+  text: the UTF-8 text to encode.
+  special?: when true, control pieces of the vocabulary that occur verbatim
+            in text become single tokens.
+Returns: a list of token ids.
+PyTorch: none"
   (tokenize-flags model text
                   (logior sb-tokenize-add-special
                                (if special? sb-tokenize-parse-special 0))))
 
 (define (tokenize-segments model segments)
-  "Tokenize a rendered chat prompt given as SEGMENTS: a list of (kind . text)
-with kind 'text or 'special (see (sonicboom serve chat-template)). A 'special
-segment is tokenized with special parsing, so a turn marker spelled out in it
-becomes the vocabulary's one control token; a 'text segment is tokenized as
-plain text, so a marker that came from a user's message stays text. <bos> is
-added once, by the first segment's call."
+  "Encode a rendered chat prompt given as segments.
+
+Segments are (kind . text) pairs with kind 'text or 'special, as produced by
+a chat template. A 'special segment is tokenized with special parsing, so a
+turn marker spelled out in it becomes the vocabulary's control token; a
+'text segment is tokenized as plain text, so a marker that came from a user's
+message stays text. The beginning-of-sequence token is added once, by the
+first segment.
+Args:
+  model: a model handle.
+  segments: the prompt segments.
+Returns: a list of token ids.
+PyTorch: none"
   (let ((parts (if (null? segments) (list (cons 'text "")) segments)))
     (let lp ((rest parts) (first? #t) (out '()))
       (if (null? rest)
@@ -355,14 +497,27 @@ to hold back until the rest arrives."
           (bytevector-range out 0 m)))))
 
 (define (detokenize model tokens)
-  "Decode TOKENS (a list of token ids) back to a UTF-8 string."
+  "Decode a list of token ids back to text.
+
+Args:
+  model: a model handle.
+  tokens: a list of token ids.
+Returns: a UTF-8 string.
+PyTorch: none"
   (utf8->string (detokenize-bytes model tokens)))
 
 ;;; --- prefill / generate -----------------------------------------------------
 
 (define (prefill! session tokens)
-  "Set SESSION's prompt to TOKENS (a list of token ids). Returns the number of
-tokens reused from the previous prompt (informational)."
+  "Set a session's prompt to a list of token ids.
+
+Any tokens the session already holds that are a prefix of the new prompt
+are reused rather than recomputed.
+Args:
+  session: a session handle.
+  tokens: the prompt as a list of token ids.
+Returns: the number of tokens reused from the previous prompt.
+PyTorch: none"
   (let* ((bv (tokens->bv tokens))
          (n (length tokens))
          (reused-slot (make-bytevector 8 0))
@@ -383,13 +538,18 @@ tokens reused from the previous prompt (informational)."
                           (repeat-last-n 64)
                           (presence-penalty 0.0)
                           (frequency-penalty 0.0))
-  "Prefill PROMPT (a list of token ids) and decode up to MAX-TOKENS tokens.
-Returns the list of produced token ids. When PREFILL? is false, decode from the
-prompt already held by SESSION.
+  "Generate token ids from a prompt given as token ids.
 
-The sampling keywords are those of make-sampling-bv: temperature 0 (the
-default) is greedy and bit-identical to the historical path; temperature > 0
-samples deterministically from SEED (see sb_llm_sampling in capi.h)."
+Args:
+  session: a session handle.
+  prompt: the prompt as a list of token ids.
+  max-tokens: the maximum number of tokens to produce.
+  prefill?: when false, decode from the prompt the session already holds.
+  temperature, top-k, top-p, min-p, seed, repeat-penalty, repeat-last-n,
+  presence-penalty, frequency-penalty: sampling parameters, as in
+  make-sampling-bv; the default temperature 0 is greedy.
+Returns: the list of produced token ids.
+PyTorch: none"
   (when prefill? (prefill! session prompt))
   (let* ((tokens '())
          (cb (lambda (user token)
@@ -424,9 +584,20 @@ samples deterministically from SEED (see sb_llm_sampling in capi.h)."
                    (repeat-last-n 64)
                    (presence-penalty 0.0)
                    (frequency-penalty 0.0))
-  "Tokenize PROMPT (a UTF-8 string), prefill, decode up to MAX-TOKENS tokens,
-and detokenize. Returns the generated text. The sampling keywords are passed
-through to generate-tokens; the default temperature 0 is greedy."
+  "Generate text from a prompt.
+
+Tokenizes the prompt, prefills the session, decodes up to max-tokens tokens
+and detokenizes them.
+Args:
+  model: a model handle.
+  session: a session handle over that model.
+  prompt: the UTF-8 prompt text.
+  max-tokens: the maximum number of tokens to produce.
+  temperature, top-k, top-p, min-p, seed, repeat-penalty, repeat-last-n,
+  presence-penalty, frequency-penalty: sampling parameters, as in
+  make-sampling-bv; the default temperature 0 is greedy.
+Returns: the generated text.
+PyTorch: none"
   (detokenize model
               (generate-tokens session (tokenize model prompt) max-tokens #t
                                #:temperature temperature
@@ -497,19 +668,27 @@ boundary. Returns the new emitted length."
                           (repeat-last-n 64)
                           (presence-penalty 0.0)
                           (frequency-penalty 0.0))
-  "Prefill PROMPT (a list of token ids) and decode up to MAX-TOKENS tokens
-(greedy by default; the sampling keywords are those of generate-tokens),
-calling (PROC TOKEN CHUNK) once per produced token, in order. CHUNK is
-the text that became available with that token; it is empty when the token only
-completed a character started earlier. Chunks never split a UTF-8 sequence, and
-concatenated in order they are exactly the string `generate` returns for the same
-prompt. PROC runs on the calling thread; a final call with TOKEN #f flushes any
-bytes still held back at the end of the decode (normally none), so concatenating
-every CHUNK including that one is the whole text. Returns the list of produced
-token ids.
+  "Generate tokens while delivering the text as it becomes available.
 
-An exception raised by PROC stops the decode and is re-thrown here, rather than
-unwinding through the decoder's stack frame."
+Calls (proc token chunk) once per produced token, in order, on the calling
+thread. Chunk is the text that became available with that token and may be
+empty; chunks never split a UTF-8 character. A final call with token #f
+flushes any bytes held back at the end. Concatenating every chunk in order
+gives exactly the string generate returns for the same prompt.
+Args:
+  model: a model handle.
+  session: a session handle.
+  prompt: the prompt as a list of token ids.
+  max-tokens: the maximum number of tokens to produce.
+  proc: the per-token procedure (proc token chunk).
+  prefill?: when false, decode from the prompt the session already holds.
+  temperature, top-k, top-p, min-p, seed, repeat-penalty, repeat-last-n,
+  presence-penalty, frequency-penalty: sampling parameters, as in
+  make-sampling-bv.
+Returns: the list of produced token ids.
+PyTorch: none
+Note: An exception raised by proc stops the decode and is re-thrown by
+generate-stream."
   (when prefill? (prefill! session prompt))
   (let* ((tokens '())          ; reversed: as produced
          (emitted 0)           ; bytes of the running text already handed out

@@ -40,9 +40,15 @@
 ;;; --- model ------------------------------------------------------------------
 
 (define (load-image-model dir)
-  "Load a MOSS-Image model directory and return an opaque image-model handle.
-Signals a &sonicboom-error if the directory is not a model the pipeline
-accepts."
+  "Load an image-generation model directory.
+
+The directory is the model root, holding text_encoder/, transformer/, vae/
+and tokenizer/.
+Args:
+  dir: the model directory.
+Returns: an opaque image-model handle.
+PyTorch: none
+Note: Diffusion-model inference is not part of PyTorch's core library."
   (let* ((model-slot (make-slot))
          (err-slot (make-slot))
          (st ((proc 'sb_image_model_load) (string->pointer dir)
@@ -51,12 +57,23 @@ accepts."
     (slot-ref model-slot)))
 
 (define (free-image-model! model)
+  "Release an image-model handle.
+
+Args:
+  model: an image-model handle from load-image-model.
+Returns: unspecified.
+PyTorch: none"
   ((proc 'sb_image_model_free) model))
 
 ;; The architecture name, two-call sizing like the LLM surface's model-arch:
 ;; the sizing call fills the length (no NUL) and reports SB_ERR_BINDING.
 (define (image-model-arch model)
-  "The model's architecture name (\"moss-image\")."
+  "The image model's architecture name.
+
+Args:
+  model: an image-model handle.
+Returns: \"moss-image\" for the model family this binding supports.
+PyTorch: none"
   (let* ((len-slot (make-bytevector 8 0))       ; size_t
          (err-slot (make-slot)))
     (let ((st ((proc 'sb_image_model_arch) model %null-pointer 0
@@ -115,15 +132,26 @@ accepts."
                           (seed 0)
                           (batch 1)
                           (progress #f))
-  "Generate BATCH images for PROMPT from MODEL and return a list of
-(width height rgb-bytevector), one per image, RGB HWC, 8 bits per channel.
+  "Generate images from a prompt.
 
-WIDTH and HEIGHT are multiples of 16. NEGATIVE is the negative prompt used by
-classifier-free guidance (#f is the empty prompt). PROGRESS, when a procedure,
-is called as (image-index step total-steps) after each denoising step; returning
-#f cancels the generation, which signals a &sonicboom-error of kind 'cancelled
-(the C status is SB_ERR_CANCELLED). Image i starts from the same seeded noise as sb-moss's
-`sample --seed`, so the same request is reproducible."
+Args:
+  model: an image-model handle.
+  prompt: the text prompt.
+  negative: the negative prompt used by classifier-free guidance; #f uses
+            the empty prompt.
+  width, height: the image size, both multiples of 16; 512 by default.
+  steps: the number of denoising steps; 50 by default.
+  guidance: the classifier-free guidance scale; 3.0 by default.
+  seed: the noise seed; 0 by default. The same request is reproducible, and
+        image i of a batch starts from the same noise as a single image with
+        that seed would.
+  batch: the number of images to generate; 1 by default.
+  progress: a procedure (image-index step total-steps) called after each
+            denoising step; returning #f cancels the generation, which
+            signals a &sonicboom-error of kind 'cancelled.
+Returns: a list of (width height rgb-bytevector), one per image, RGB
+channels with 8 bits each.
+PyTorch: none"
   (let* ((prompt-ptr (string->pointer prompt))
          (negative-ptr (and negative (string->pointer negative)))
          (req (make-image-request-bv prompt-ptr negative-ptr width height steps
@@ -160,8 +188,23 @@ is called as (image-index step total-steps) after each denoising step; returning
 ;;; --- output -----------------------------------------------------------------
 
 (define (write-png path rgb width height)
-  "Write RGB (a width*height*3 bytevector, RGB HWC) to PATH as a PNG
-(8-bit RGB, stored deflate blocks) and return #t."
+  "Write an RGB image to a PNG file.
+
+The PNG is 8-bit RGB and uses stored deflate blocks; it needs no external
+library.
+Args:
+  path: the file to write, overwritten if it exists.
+  rgb: the pixels as a bytevector of width*height*3 bytes, RGB order.
+  width: the image width in pixels.
+  height: the image height in pixels.
+Returns: #t.
+Example:
+  (use-modules (sonicboom image) (rnrs bytevectors))
+  (write-png \"/tmp/sonicboom-docs-1x1.png\" (make-bytevector 3 255) 1 1)
+  => #t
+PyTorch: none
+Note: An rgb bytevector shorter than width*height*3 signals a
+&sonicboom-error."
   (unless (and (bytevector? rgb) (>= (bytevector-length rgb) (* width height 3)))
     (raise-sonicboom-error SB_ERR_BINDING 'binding
                            "write-png: rgb is shorter than width*height*3"))

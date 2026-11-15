@@ -67,7 +67,15 @@
     (error who (if (string-null? msg) "unknown C ABI error" msg))))
 
 (define (device-available?)
-  "True when the loaded libsonicboom.so has CUDA and can run a device graph."
+  "True when the loaded libsonicboom.so has CUDA and can run a device graph.
+
+Returns: a boolean.
+Example:
+  (use-modules (sonicboom trace device))
+  (boolean? (device-available?))
+  => #t
+PyTorch: none
+Note: a CPU-only build returns #f."
   (and (libsonicboom-available?)
        (let ((cuda (assq-ref (build-info) 'cuda)))
          (and cuda (eq? (assq-ref cuda 'enabled) #t)))))
@@ -185,7 +193,14 @@ observes the claimed flag and does nothing."
                  (loop))))))))
 
 (define (compiled-device-segments)
-  "How many distinct segment texts have been compiled for the GPU."
+  "How many distinct segment texts have been compiled for the GPU.
+
+Returns: a non-negative integer.
+Example:
+  (use-modules (sonicboom trace device))
+  (integer? (compiled-device-segments))
+  => #t
+PyTorch: none"
   (lock-mutex %segments-lock)
   (let ((n (length %segments)))
     (unlock-mutex %segments-lock)
@@ -394,27 +409,20 @@ SEGMENT's run lock (see run-device-executable)."
            outputs out-bvs))))
 
 (define (run-device-executable segment ins-alist)
-  "Run one compiled segment with INPUTS (alist name → ctensor); returns the
-output alist in the executable's output order.
+  "Run one compiled segment with INPUTS and return its outputs.
 
 The first call uploads the whole leaf state. After it, an input the graph
-updates in place (a parameter or optimizer moment) stays on the device: it is
-neither encoded nor uploaded, and the next value comes back as one of the
-outputs. Every other input — the batch — is encoded and uploaded on every
-call.
+updates in place is kept on the device and comes back as an output; every other
+input is uploaded on every call. A call on a different head state rebuilds the
+executable.
 
-A cached segment is shared by every call that emits the same text, including
-calls on a different head state (fresh parameter tensors of the same shape).
-The C ABI keeps a resident input in its device buffer and ignores the caller's
-bytes once it has been uploaded, so such a call is detected here by comparing
-the resident bytes with the state the device was left in, and the executable is
-rebuilt so the first run uploads the new head state.
-
-SEGMENT's run lock is held for the whole decision, native call and state update,
-so two callers never drive one set of device buffers at once. The stale path
-drops the lock before replacing the cache entry: the replacement is a different
-segment with its own lock, and evicting SEGMENT does not release it, so a
-concurrent holder keeps using the executable it already has."
+Args:
+  segment: a compiled segment.
+  ins-alist: an alist (input-name . ctensor).
+Returns: an alist (output-name . ctensor) in the executable's output order.
+PyTorch: none
+Note: runs of one segment are serialized; different segments may run in
+parallel."
   (unless (device-segment? segment)
     (error "sonicboom-device: bad segment record"))
   (let ((outcome
@@ -437,6 +445,17 @@ concurrent holder keeps using the executable it already has."
         outcome)))
 
 (define (device-executor)
-  "An executor (text inputs) → outputs for trace-function #:executor."
+  "An executor (text inputs) -> outputs for `trace-function` #:executor.
+
+Each distinct segment text is compiled once and cached, so later calls of a
+traced function reuse the same compiled graph.
+
+Returns: a procedure taking an S-Expr text and an alist (name . ctensor) and
+returning an alist (output-name . ctensor).
+Example:
+  (use-modules (sonicboom trace device))
+  (procedure? (device-executor))
+  => #t
+PyTorch: none"
   (lambda (text ins-alist)
     (run-device-executable (segment-for text) ins-alist)))

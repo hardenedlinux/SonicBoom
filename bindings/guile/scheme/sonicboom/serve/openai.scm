@@ -30,12 +30,44 @@
             new-completion-id))
 
 (define (raise-openai-error status type message . param)
+  "Raise an OpenAI error.
+
+The route catches (openai-error status type message param) and answers with
+openai-error-object and the status.
+
+Args:
+  status: the HTTP status.
+  type: the error type string.
+  message: the message string.
+  param: optional; the offending parameter name (default null).
+Returns: never returns normally.
+Example:
+  (use-modules (sonicboom serve openai))
+  (catch 'openai-error
+    (lambda () (raise-openai-error 400 \"invalid_request_error\" \"bad\"))
+    (lambda (key status type message param) (list status type)))
+  => (400 \"invalid_request_error\")
+PyTorch: none"
   (throw 'openai-error status type message (if (pair? param) (car param) 'null)))
 
 (define (invalid message param)
   (raise-openai-error 400 "invalid_request_error" message param))
 
 (define (openai-error-object type message param code)
+  "The OpenAI error body.
+
+Args:
+  type: the error type string.
+  message: the message string.
+  param: the offending parameter name, or null.
+  code: the error code, or #f.
+Returns: a JSON object alist.
+Example:
+  (use-modules (sonicboom serve openai))
+  (assoc-ref (assoc-ref (openai-error-object \"t\" \"m\" 'null #f) \"error\")
+             \"message\")
+  => \"m\"
+PyTorch: none"
   `(("error" . (("message" . ,message)
                 ("type" . ,type)
                 ("param" . ,param)
@@ -171,6 +203,28 @@
 ;; -> (values chat-request stream? include-usage?); include-usage? is
 ;; stream_options.include_usage, which only streaming replies look at.
 (define (parse-chat-request body)
+  "Check a chat-completions body and build the engine request.
+
+JSON values are the guile-json ones: objects are alists with string keys,
+arrays are vectors and null is the symbol null. An omitted temperature is 0
+(greedy), an omitted seed is 0, and only n=1 is supported.
+
+Args:
+  body: the decoded request object.
+Returns: three values: the chat request, whether the reply is streamed, and
+whether stream_options.include_usage is set.
+Example:
+  (use-modules (sonicboom serve engine) (sonicboom serve openai))
+  (call-with-values
+      (lambda ()
+        (parse-chat-request
+         '((\"model\" . \"m\")
+           (\"messages\" . #(((\"role\" . \"user\") (\"content\" . \"hi\")))))))
+    (lambda (request stream usage)
+      (list (chat-request-model request) stream usage)))
+  => (\"m\" #f #f)
+PyTorch: none
+Note: a bad body raises (openai-error status type message param)."
   (unless (object? body)
     (invalid "the request body must be a JSON object" 'null))
   (let* ((model (ref body "model"))
@@ -239,6 +293,21 @@
 ;; defaults, so "absent" is still visible here. Call it after
 ;; parse-chat-request: that is what vets the parameter types.
 (define (check-greedy-body body)
+  "Reject an explicit sampling request for a backend that decodes greedily.
+
+A parameter that is absent means the backend's default, so a client that leaves
+the sampling parameters alone is accepted; one that asks for sampling is told
+why it cannot have it. Call this after parse-chat-request, which checks the
+parameter types.
+
+Args:
+  body: the raw decoded request object, before the parsing defaults.
+Returns: unspecified.
+Example:
+  (use-modules (sonicboom serve openai))
+  (begin (check-greedy-body '((\"temperature\" . 0))) #t)
+  => #t
+PyTorch: none"
   (let ((t (ref body "temperature"))
         (p (ref body "top_p"))
         (k (ref body "top_k")))
@@ -275,6 +344,21 @@
 ;; no such fields, but a reproducible request needs them). response_format is
 ;; b64_json only: the reference server has no storage to hand out URLs from.
 (define (parse-image-request body)
+  "Turn an images-generations body into an alist.
+
+The alist has string keys prompt, negative_prompt, n, width, height, steps,
+guidance_scale and seed. prompt is required; size defaults to 512x512 and both
+sides must be multiples of 16. steps, guidance_scale, seed and
+negative_prompt are extensions of the OpenAI schema.
+
+Args:
+  body: the decoded request object.
+Returns: an alist with string keys.
+Example:
+  (use-modules (sonicboom serve openai))
+  (assoc-ref (parse-image-request '((\"prompt\" . \"cat\"))) \"width\")
+  => 512
+PyTorch: none"
   (unless (object? body)
     (invalid "the request body must be a JSON object" 'null))
   (let ((prompt (ref body "prompt")))
@@ -318,6 +402,19 @@
 
 ;; {"created": ..., "data": [{"b64_json": ...}, ...]}
 (define (images-object created b64s)
+  "The images response object.
+
+The data entries hold one base64 PNG each.
+
+Args:
+  created: the creation time.
+  b64s: the base64 image strings.
+Returns: a JSON object alist.
+Example:
+  (use-modules (sonicboom serve openai))
+  (vector-length (assoc-ref (images-object 1 '(\"abc\")) \"data\"))
+  => 1
+PyTorch: none"
   `(("created" . ,created)
     ("data" . ,(list->vector
                 (map (lambda (b64) `(("b64_json" . ,b64))) b64s)))))
@@ -328,6 +425,16 @@
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
 
 (define (base64-encode-bytevector bv)
+  "The base64 text of BV, with padding (RFC 4648).
+
+Args:
+  bv: a bytevector.
+Returns: a string.
+Example:
+  (use-modules (sonicboom serve openai) (rnrs bytevectors))
+  (base64-encode-bytevector (string->utf8 \"hi\"))
+  => \"aGk=\"
+PyTorch: none"
   (let* ((n (bytevector-length bv))
          (out (make-string (* 4 (quotient (+ n 2) 3)) #\=)))
     (let loop ((i 0) (o 0))
@@ -355,10 +462,41 @@
 ;;; Responses
 
 (define (new-completion-id)
+  "A fresh completion id, starting with chatcmpl-.
+
+Returns: a string.
+Example:
+  (use-modules (sonicboom serve openai) (srfi srfi-13))
+  (string-prefix? \"chatcmpl-\" (new-completion-id))
+  => #t
+PyTorch: none"
   (string-append "chatcmpl-"
                  (number->string (random (expt 2 64) (random-state-from-platform)) 36)))
 
 (define (usage-object result)
+  "The usage counts of RESULT.
+
+It holds prompt_tokens, completion_tokens, total_tokens and the cached prompt
+tokens.
+
+Args:
+  result: a result.
+Returns: a JSON object alist.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+               (sonicboom serve engine) (sonicboom serve openai))
+  (let* ((engine (make-engine
+                  (list (load-model (make-mock-backend) '((id . \"m\"))))))
+         (result
+          (engine-generate
+           engine
+           (make-chat-request #:model \"m\"
+                              #:messages (list (list (cons \"role\" \"user\")
+                                                     (cons \"content\" \"hi\"))))
+           (lambda (kind . args) #t))))
+    (positive? (assoc-ref (usage-object result) \"total_tokens\")))
+  => #t
+PyTorch: none"
   `(("prompt_tokens" . ,(result-prompt-tokens result))
     ("completion_tokens" . ,(result-completion-tokens result))
     ("total_tokens" . ,(+ (result-prompt-tokens result) (result-completion-tokens result)))
@@ -372,6 +510,35 @@
        ("function" . (("name" . ,name) ("arguments" . ,args)))))))
 
 (define (completion-object id created model result)
+  "The chat-completion object for RESULT.
+
+A reply that consists only of tool calls has a null content, as the OpenAI
+schema expects.
+
+Args:
+  id: the completion id.
+  created: the creation time.
+  model: the model id.
+  result: a result.
+Returns: a JSON object alist.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+               (sonicboom serve engine) (sonicboom serve openai))
+  (let* ((engine (make-engine
+                  (list (load-model (make-mock-backend) '((id . \"m\"))))))
+         (result
+          (engine-generate
+           engine
+           (make-chat-request #:model \"m\"
+                              #:messages (list (list (cons \"role\" \"user\")
+                                                     (cons \"content\" \"hi\"))))
+           (lambda (kind . args) #t)))
+         (choice (car (vector->list
+                       (assoc-ref (completion-object \"id\" 0 \"m\" result)
+                                  \"choices\")))))
+    (assoc-ref choice \"finish_reason\"))
+  => \"stop\"
+PyTorch: none"
   (let ((calls (result-tool-calls result))
         (content (result-content result)))
     `(("id" . ,id)
@@ -391,6 +558,21 @@
       ("usage" . ,(usage-object result)))))
 
 (define* (chunk-object id created model delta #:optional (finish-reason 'null))
+  "One streaming chat-completion chunk.
+
+Args:
+  id: the completion id.
+  created: the creation time.
+  model: the model id.
+  delta: the delta alist.
+  finish-reason: optional; the finish reason, null while streaming is under
+    way (default null).
+Returns: a JSON object alist.
+Example:
+  (use-modules (sonicboom serve openai))
+  (assoc-ref (chunk-object \"id\" 0 \"m\" (content-delta \"hi\")) \"object\")
+  => \"chat.completion.chunk\"
+PyTorch: none"
   `(("id" . ,id)
     ("object" . "chat.completion.chunk")
     ("created" . ,created)
@@ -402,6 +584,32 @@
 
 ;; The last chunk when stream_options.include_usage is set: no choices.
 (define (usage-chunk-object id created model result)
+  "The last streaming chunk, carrying the usage counts.
+
+It has no choices, as the OpenAI schema specifies for this chunk.
+
+Args:
+  id: the completion id.
+  created: the creation time.
+  model: the model id.
+  result: a result.
+Returns: a JSON object alist.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+               (sonicboom serve engine) (sonicboom serve openai))
+  (let* ((engine (make-engine
+                  (list (load-model (make-mock-backend) '((id . \"m\"))))))
+         (result
+          (engine-generate
+           engine
+           (make-chat-request #:model \"m\"
+                              #:messages (list (list (cons \"role\" \"user\")
+                                                     (cons \"content\" \"hi\"))))
+           (lambda (kind . args) #t))))
+    (vector-length (assoc-ref (usage-chunk-object \"id\" 0 \"m\" result)
+                              \"choices\")))
+  => 0
+PyTorch: none"
   `(("id" . ,id)
     ("object" . "chat.completion.chunk")
     ("created" . ,created)
@@ -409,13 +617,59 @@
     ("choices" . #())
     ("usage" . ,(usage-object result))))
 
-(define (role-delta) '(("role" . "assistant") ("content" . "")))
-(define (content-delta text) `(("content" . ,text)))
-(define (finish-delta) '())
+(define (role-delta)
+  "The first streaming delta: the assistant role.
+
+Returns: a delta alist.
+Example:
+  (use-modules (sonicboom serve openai))
+  (role-delta)
+  => ((\"role\" . \"assistant\") (\"content\" . \"\"))
+PyTorch: none"
+  '(("role" . "assistant") ("content" . "")))
+(define (content-delta text)
+  "A streaming delta that carries reply text.
+
+Args:
+  text: the text.
+Returns: a delta alist.
+Example:
+  (use-modules (sonicboom serve openai))
+  (content-delta \"x\")
+  => ((\"content\" . \"x\"))
+PyTorch: none"
+  `(("content" . ,text)))
+(define (finish-delta)
+  "The final streaming delta: it carries nothing.
+
+Returns: the empty alist.
+Example:
+  (use-modules (sonicboom serve openai))
+  (finish-delta)
+  => ()
+PyTorch: none"
+  '())
 
 ;; One tool call as stream deltas: the header (id, type, name, empty
 ;; arguments), then the arguments in pieces of at most `piece' characters.
 (define* (tool-call-deltas index id name args #:key (piece 8))
+  "The streaming deltas of one tool call.
+
+The first delta carries the call's header (index, id, type and name); then the
+arguments JSON follows in pieces of at most PIECE characters.
+
+Args:
+  index: the call's index in the reply.
+  id: the call id.
+  name: the function name.
+  args: the arguments, as JSON text.
+  piece: keyword; the maximum piece length (default 8).
+Returns: a list of delta alists.
+Example:
+  (use-modules (sonicboom serve openai))
+  (length (tool-call-deltas 0 \"id\" \"f\" \"{}\" #:piece 3))
+  => 2
+PyTorch: none"
   (cons
    `(("tool_calls" . #((("index" . ,index)
                          ("id" . ,id)
@@ -435,11 +689,38 @@
 ;; which prompt format and which stop tokens this model expects instead of
 ;; leaving it to infer the family from the file name.
 (define (model-object id family created)
+  "One entry of the model list.
+
+Besides the OpenAI fields it carries family, the chat-template family the
+loaded model selected, so a client knows which prompt format and stop tokens
+the model expects.
+
+Args:
+  id: the model id.
+  family: the model's family symbol.
+  created: the creation time.
+Returns: a JSON object alist.
+Example:
+  (use-modules (sonicboom serve openai))
+  (assoc-ref (model-object \"m\" 'gemma 0) \"family\")
+  => \"gemma\"
+PyTorch: none"
   `(("id" . ,id) ("object" . "model") ("created" . ,created)
     ("owned_by" . "sonicboom") ("family" . ,(symbol->string family))))
 
 ;; `models` is an (id . family) alist, in serving order.
 (define (models-object models created)
+  "The model-list response.
+
+Args:
+  models: an alist (id . family), in serving order.
+  created: the creation time.
+Returns: a JSON object alist.
+Example:
+  (use-modules (sonicboom serve openai))
+  (vector-length (assoc-ref (models-object '((\"m\" . gemma)) 0) \"data\"))
+  => 1
+PyTorch: none"
   `(("object" . "list")
     ("data" . ,(list->vector
                 (map (lambda (m) (model-object (car m) (cdr m) created)) models)))))

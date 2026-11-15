@@ -31,13 +31,24 @@
             clip-grad-norm!))
 
 (define* (fused-clip-grad-norm grads #:key (max-norm 1.0))
-  "Global-norm gradient clipping over GRADS, a list of gradient tensors.
-Returns one clipped tensor per gradient, in order. The global L2 norm is
-accumulated in double over every element of every gradient; when it does not
-exceed MAX-NORM the results are copies of the inputs (their values unchanged),
-otherwise each is scaled by MAX-NORM / (norm + 1e-6). One clip_grad_norm node:
-the device executor runs it as one accumulation pass plus one scale kernel per
-gradient."
+  "The gradients GRADS scaled so that their global L2 norm does not exceed MAX-NORM.
+
+The norm is accumulated in double over every element of every gradient. When it
+does not exceed MAX-NORM the results are copies of the inputs; otherwise each
+gradient is scaled by MAX-NORM / (norm + 1e-6).
+
+Args:
+  grads: a list of gradient tensors.
+  max-norm: keyword; the norm limit (default 1.0).
+Returns: one clipped tensor per gradient, in order.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace fused))
+  (map ctensor->list
+       (fused-clip-grad-norm (list (list->ctensor '(3.0 4.0))) #:max-norm 1.0))
+  => ((0.5999999046325684 0.7999998331069946))
+PyTorch: torch.nn.utils.clip_grad_norm_
+Note: torch.nn.utils.clip_grad_norm_ scales the .grad of parameters in place;
+this returns new tensors."
   (unless (and (real? max-norm) (>= max-norm 0))
     (error "fused-clip-grad-norm: max-norm must be a non-negative number"
            max-norm))
@@ -46,13 +57,26 @@ gradient."
                   (map tensor-type grads)))
 
 (define* (clip-grad-norm! params #:optional (max-norm 1.0))
-  "Clip the accumulated .grad of every leaf in PARAMS (a leaf or a list) by the
-global L2 norm of all their gradients, in place. PARAMS is what `backward!`
-filled in; after this call each leaf's .grad is the clipped gradient, so the
-next `adamw-step!` sees it. Leaves without an accumulated gradient are skipped.
-Returns the list of clipped gradient values. Inside a traced step this emits
-one clip_grad_norm node (the fused CUDA kernel); in eager mode it runs the
-reference kernel."
+  "Clip the stored gradients of PARAMS by their global L2 norm, in place.
+
+PARAMS is a leaf or a list of leaves, typically the ones `backward!` filled in.
+After the call each leaf's .grad is the clipped gradient. Leaves without an
+accumulated gradient are skipped.
+
+Args:
+  params: a leaf or a list of leaves.
+  max-norm: optional; the norm limit (default 1.0).
+Returns: the list of clipped gradient values.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace fused))
+  (let ((leaf (make-leaf (list->ctensor '(1.0 1.0)))))
+    (set-leaf-grad! leaf (list->ctensor '(3.0 4.0)))
+    (clip-grad-norm! leaf)
+    (ctensor->list (leaf-grad leaf)))
+  => (0.5999999046325684 0.7999998331069946)
+PyTorch: torch.nn.utils.clip_grad_norm_
+Note: operates on the .grad slot of leaf tensors; torch.nn.utils.clip_grad_norm_
+operates on the .grad of parameters."
   (let* ((ps (if (leaf? params) (list params) params))
          (leaves (filter (lambda (p) (leaf-grad p)) ps)))
     (when (null? leaves)
@@ -63,17 +87,63 @@ reference kernel."
       clipped)))
 
 (define (fused-softmax x)
-  "Numerically stable softmax over the last axis."
+  "A numerically stable softmax over the last axis.
+
+Each element becomes exp(x - max) / sum(exp(x - max)), with the max taken over
+the last axis so large values do not overflow.
+
+Args:
+  x: a tensor.
+Returns: a tensor with X's shape whose last axis sums to 1.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace fused))
+  (ctensor->list (fused-softmax (list->ctensor '(1.0 2.0))))
+  => (0.2689414322376251 0.7310585975646973)
+PyTorch: torch.nn.functional.softmax
+Note: the axis is always the last one; torch.nn.functional.softmax takes a dim."
   (apply-op 'softmax (list x) '()))
 
 (define* (fused-rms-norm x w #:key (eps 1e-6))
-  "x / sqrt(mean(x^2) + EPS) * W over the last axis."
+  "Root-mean-square normalisation over the last axis.
+
+Computes x / sqrt(mean(x^2) + EPS) * W.
+
+Args:
+  x: a tensor.
+  w: the weight, shaped as the last axis.
+  eps: keyword; added under the root (default 1e-6).
+Returns: a tensor with X's shape.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace fused))
+  (ctensor->list (fused-rms-norm (list->ctensor '(3.0 4.0))
+                                 (list->ctensor '(1.0 1.0))))
+  => (0.8485280871391296 1.1313707828521729)
+PyTorch: torch.nn.functional.rms_norm
+Note: only the last axis is normalised; torch.nn.functional.rms_norm takes a
+normalised shape."
   (apply-op 'rms_norm (list x w) `((eps (float ,eps)))))
 
 (define* (fused-rope x #:key head-dim (theta-base 10000.0) (freq-scale 1.0)
                      (pos0 0))
-  "Rotary position embedding on the last axis, HEAD-DIM values per head; the
-row index selects the position. Shape [rows, heads * head_dim]."
+  "Rotary position embedding on the last axis.
+
+Row i is rotated at position POS0 + i, with HEAD-DIM values per head.
+
+Args:
+  x: a tensor [rows, heads * head-dim].
+  head-dim: keyword; the number of rotated values per head (required).
+  theta-base: keyword; the frequency base (default 10000.0).
+  freq-scale: keyword; the frequency scale (default 1.0).
+  pos0: keyword; the position of the first row (default 0).
+Returns: a tensor with X's shape.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace fused))
+  (ctensor->nested (fused-rope (list->ctensor '((1.0 2.0) (1.0 0.0)))
+                               #:head-dim 2))
+  => ((1.0 2.0) (0.5403022766113281 0.8414709568023682))
+PyTorch: none
+Note: PyTorch has no rotary embedding function; the rotation convention differs
+between implementations."
   (apply-op 'rope (list x)
             `((head_dim (int ,head-dim))
               (theta_base (float ,theta-base))
@@ -81,13 +151,41 @@ row index selects the position. Shape [rows, heads * head_dim]."
               (pos0 (int ,pos0)))))
 
 (define (fused-silu-mul gate up)
-  "SwiGLU activation: silu(GATE) * UP."
+  "The SwiGLU activation silu(GATE) * UP.
+
+Args:
+  gate: the gate tensor.
+  up: the up-projection tensor, same shape as GATE.
+Returns: a tensor with GATE's shape.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace fused))
+  (ctensor->list (fused-silu-mul (list->ctensor '(0.0 1.0))
+                                 (list->ctensor '(1.0 1.0))))
+  => (0.0 0.7310585975646973)
+PyTorch: none
+Note: PyTorch has no fused SwiGLU; it is written
+torch.nn.functional.silu(gate) * up."
   (apply-op 'silu_mul (list gate up) '()))
 
 (define (fused-cross-entropy logits targets)
-  "Mean negative log-likelihood of 1-D TARGETS (class indices) under LOGITS
-[rows, classes]. Returns a rank-0 mean loss (unlike the composite version,
-which also keeps the per-row values in the graph)."
+  "The mean cross-entropy of class indices TARGETS under LOGITS.
+
+Computes log_softmax over the class axis, gathers the target column of each row
+and returns the mean negative log-likelihood as a rank-0 tensor.
+
+Args:
+  logits: a float tensor [rows, classes].
+  targets: an int64 tensor [rows] of class indices.
+Returns: a rank-0 tensor.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace fused))
+  (ctensor-item (fused-cross-entropy (list->ctensor '((0.0 1.0) (2.0 0.0)))
+                                     (make-ctensor 'int64 '(2) '(1 0))))
+  => 0.22009484469890594
+PyTorch: torch.nn.functional.cross_entropy
+Note: the reduction is always the mean and TARGETS are always class indices;
+torch.nn.functional.cross_entropy also accepts class probabilities and other
+reductions."
   (apply-op 'cross_entropy (list logits targets) '()))
 
 (define (tensor-type x)
@@ -98,14 +196,35 @@ which also keeps the per-row values in the graph)."
 (define* (adamw-step! param grad m1 m2 step
                       #:key (lr 1e-3) (beta1 0.9) (beta2 0.999)
                       (eps 1e-8) (weight-decay 0.01))
-  "One fused AdamW update of PARAM from GRAD, with first/second moment state
-M1/M2 and the 1-based int32 STEP tensor. When PARAM/M1/M2 are leaves their
-value is replaced by the updated tensor, which the tracer syncs back to the
-caller's leaf after the segment runs. Returns (new-param new-m1 new-m2).
+  "One AdamW update of PARAM from GRAD.
 
-LR is either a number or a tensor. A number rides on the node as an attribute,
-so every distinct rate is a distinct graph; a tensor (a leaf, or a symbolic
-argument while tracing) is a sixth input, and one graph serves any schedule."
+M1 and M2 are the first and the second moment tensors and STEP is the 1-based
+step counter tensor. When PARAM, M1 or M2 is a leaf, its value is replaced by
+the updated tensor.
+
+Args:
+  param: the parameter tensor.
+  grad: its gradient, same shape.
+  m1: the first moment.
+  m2: the second moment.
+  step: the step counter, a rank-0 integer tensor.
+  lr: keyword; the learning rate, a number (default 1e-3).
+  beta1: keyword; the first moment decay (default 0.9).
+  beta2: keyword; the second moment decay (default 0.999).
+  eps: keyword; added under the root (default 1e-8).
+  weight-decay: keyword; the decoupled weight decay (default 0.01).
+Returns: the list (new-param new-m1 new-m2).
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace fused))
+  (ctensor->list
+   (car (adamw-step! (list->ctensor '(1.0 2.0)) (list->ctensor '(0.5 0.5))
+                     (list->ctensor '(0.0 0.0)) (list->ctensor '(0.0 0.0))
+                     (make-ctensor 'int32 '() '(1)) #:lr 0.1)))
+  => (0.8989999890327454 1.8980000019073486)
+PyTorch: torch.optim.AdamW
+Note: LR may also be a tensor (a leaf or a symbolic argument), in which case it
+is an input of the update rather than an attribute; torch.optim.AdamW reads the
+rate from the optimizer."
   (let* ((lr-tensor? (not (number? lr)))
          (args (if lr-tensor?
                    (list param grad m1 m2 step lr)

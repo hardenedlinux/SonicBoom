@@ -36,6 +36,16 @@
             loader-batch-size
             loader-close!))
 
+;; A streaming token packer over a text or JSONL file.
+;;
+;; A loader keeps the file path, the tokenizer, the window and batch sizes and
+;; the token ids read ahead. Lines are read on demand and never all at once, so
+;; the file may be larger than memory. loader-seq-len and loader-batch-size
+;; return the two sizes, loader-epoch the number of completed passes, and
+;; loader-next-batch! produces the batches.
+;; PyTorch: none
+;; Note: The nearest PyTorch concept is a torch.utils.data.IterableDataset, which
+;; leaves the packing to the user.
 (define-record-type <loader>
   (%make-loader path key tokenizer seq-len batch-size eos port pending
                 epoch started?)
@@ -67,20 +77,77 @@
                 (%open path) '() 0 #f))
 
 (define (text-file-loader path tokenizer seq-len batch-size)
-  "A loader over a plain text file, one document per line."
+  "A loader over a plain text file, one document per line.
+
+Lines are tokenized with the given tokenizer and separated by its <eos> token.
+Args:
+  path: the file path, reopened at the start of every epoch.
+  tokenizer: a tokenizer from (sonicboom tokenizer bpe).
+  seq-len: the number of input tokens per window, a positive integer.
+  batch-size: the number of windows per batch, a positive integer.
+Returns: a loader.
+Example:
+  (use-modules (sonicboom data loader) (sonicboom tokenizer bpe))
+  (let ((path \"/tmp/sonicboom-docs-loader.txt\"))
+    (call-with-output-file path
+      (lambda (p) (display \"hello world\\n\" p)))
+    (let* ((tok (bpe-train (open-input-string \"hello world\") 259))
+           (l (text-file-loader path tok 2 1)))
+      (loader-close! l)))
+  => #f
+PyTorch: none
+Note: The DataLoader batches samples; this loader packs a token stream into
+fixed next-token windows."
   (check-params "text-file-loader" seq-len batch-size)
   (%make-from path #f tokenizer seq-len batch-size))
 
 (define (jsonl-loader path text-key tokenizer seq-len batch-size)
-  "A loader over a JSONL file, taking each line's TEXT-KEY string as the
-document."
+  "A loader over a JSONL file, taking one string field per line.
+
+Each line must be a JSON object with a string under text-key; blank lines are
+skipped. Documents are packed exactly as with text-file-loader.
+Args:
+  path: the file path, reopened at the start of every epoch.
+  text-key: the JSON field holding the document text.
+  tokenizer: a tokenizer from (sonicboom tokenizer bpe).
+  seq-len: the number of input tokens per window, a positive integer.
+  batch-size: the number of windows per batch, a positive integer.
+Returns: a loader.
+Example:
+  (use-modules (sonicboom data loader) (sonicboom tokenizer bpe))
+  (let ((path \"/tmp/sonicboom-docs-loader.jsonl\"))
+    (call-with-output-file path
+      (lambda (p) (display \"{\\\"text\\\": \\\"hello world\\\"}\\n\" p)))
+    (let* ((tok (bpe-train (open-input-string \"hello world\") 259))
+           (l (jsonl-loader path \"text\" tok 2 1)))
+      (loader-close! l)))
+  => #f
+PyTorch: none
+Note: The IterableDataset supplies samples; this loader supplies packed
+next-token batches."
   (unless (string? text-key)
     (error "jsonl-loader: text-key must be a string" text-key))
   (check-params "jsonl-loader" seq-len batch-size)
   (%make-from path text-key tokenizer seq-len batch-size))
 
 (define (loader-close! loader)
-  "Close the loader's input port (a following loader-next-batch! reopens it)."
+  "Close the loader's input port.
+
+A later loader-next-batch! reopens the file; loader-close! is therefore only
+a way to release the port between uses.
+Args:
+  loader: a loader.
+Returns: #f.
+Example:
+  (use-modules (sonicboom data loader) (sonicboom tokenizer bpe))
+  (let ((path \"/tmp/sonicboom-docs-loader-close.txt\"))
+    (call-with-output-file path
+      (lambda (p) (display \"hello world\\n\" p)))
+    (let* ((tok (bpe-train (open-input-string \"hello world\") 259))
+           (l (text-file-loader path tok 2 1)))
+      (loader-close! l)))
+  => #f
+PyTorch: none"
   (let ((port (loader-port loader)))
     (when (and port (not (port-closed? port)))
       (close-port port))
@@ -162,8 +229,29 @@ input and a target vector, each of length BATCH-SIZE * SEQ-LEN."
     (values inp tgt)))
 
 (define (loader-next-batch! loader)
-  "The next batch as (values input target): two int32 ctensors of shape
-[BATCH-SIZE SEQ-LEN], where target is input shifted by one token."
+  "The next packed batch from the loader.
+
+A batch is batch-size consecutive windows of seq-len + 1 tokens: the window's
+first seq-len tokens are the input and the same tokens shifted by one are the
+target. No batch mixes two epochs, and every batch is full.
+Args:
+  loader: a loader.
+Returns: two values, the int32 input and target ctensors, each of shape
+[batch-size seq-len].
+Example:
+  (use-modules (sonicboom data loader) (sonicboom tokenizer bpe)
+               (sonicboom trace tensor))
+  (let ((path \"/tmp/sonicboom-docs-loader-batch.txt\"))
+    (call-with-output-file path
+      (lambda (p) (display \"abc\\n\" p)))
+    (let* ((tok (bpe-train (open-input-string \"abc\") 259))
+           (l (text-file-loader path tok 2 1)))
+      (call-with-values (lambda () (loader-next-batch! l))
+        (lambda (inp tgt) (ctensor->list inp)))))
+  => (97 98)
+PyTorch: none
+Note: A byte-level tokenizer maps each byte to its own id. The target of the
+example is (98 99)."
   (let* ((seq-len (loader-seq-len loader))
          (batch-size (loader-batch-size loader))
          (need (* batch-size (+ seq-len 1))))

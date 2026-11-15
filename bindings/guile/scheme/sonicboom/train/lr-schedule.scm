@@ -25,13 +25,33 @@
     (error who name "must be a non-negative integer" x)))
 
 (define (make-constant-schedule lr)
-  "A schedule that always returns LR."
+  "A schedule whose value never changes.
+
+Args:
+  lr: the learning rate, a non-negative real.
+Returns: a procedure of one argument, the step number, returning lr.
+Example:
+  (use-modules (sonicboom train lr-schedule))
+  ((make-constant-schedule 0.01) 42)
+  => 0.01
+PyTorch: none"
   (check-lr "make-constant-schedule" "lr" lr)
   (lambda (step) (exact->inexact lr)))
 
 (define (make-linear-warmup-schedule base-lr warmup-steps)
-  "Linear warmup from 0 at step 0 to BASE-LR at step WARMUP-STEPS, constant
-from then on."
+  "A schedule that rises linearly from zero and then holds.
+
+The value is zero at step 0, base-lr at warmup-steps, and base-lr afterwards.
+A negative step returns zero.
+Args:
+  base-lr: the rate reached at the end of warmup, a non-negative real.
+  warmup-steps: the number of steps in the warmup, a non-negative integer.
+Returns: a procedure of one argument, the step number, returning the rate.
+Example:
+  (use-modules (sonicboom train lr-schedule))
+  ((make-linear-warmup-schedule 1.0 10) 5)
+  => 0.5
+PyTorch: none"
   (check-lr "make-linear-warmup-schedule" "base-lr" base-lr)
   (check-steps "make-linear-warmup-schedule" "warmup-steps" warmup-steps)
   (lambda (step)
@@ -41,8 +61,22 @@ from then on."
           (else (exact->inexact base-lr)))))
 
 (define (make-cosine-schedule base-lr min-lr warmup-steps total-steps)
-  "Linear warmup from 0 to BASE-LR over WARMUP-STEPS, then a half-cosine decay
-from BASE-LR to MIN-LR at TOTAL-STEPS, then MIN-LR."
+  "A warmup followed by a half-cosine decay.
+
+The rate rises linearly from zero to base-lr over warmup-steps, follows a
+half-cosine from base-lr to min-lr until total-steps, and stays at min-lr
+afterwards. With no warmup the decay starts at base-lr.
+Args:
+  base-lr: the peak rate, a non-negative real.
+  min-lr: the final rate, a non-negative real no greater than base-lr.
+  warmup-steps: the number of warmup steps, no greater than total-steps.
+  total-steps: the step at which the decay reaches min-lr.
+Returns: a procedure of one argument, the step number, returning the rate.
+Example:
+  (use-modules (sonicboom train lr-schedule))
+  ((make-cosine-schedule 1.0 0.0 0 2) 1)
+  => 0.5
+PyTorch: none"
   (check-lr "make-cosine-schedule" "base-lr" base-lr)
   (check-lr "make-cosine-schedule" "min-lr" min-lr)
   (when (> min-lr base-lr)

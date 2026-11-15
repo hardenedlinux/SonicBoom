@@ -101,7 +101,28 @@
 ;;; --- the validator ---------------------------------------------------------------------
 
 (define* (validate-sexpr doc #:key (require-aten? #t) (path-prefix ""))
-  "Errors (list of strings) of document datum DOC; '() if it is valid."
+  "The errors of document datum DOC; the empty list when it is valid.
+
+Checks the structure, the types, the order of definitions, the nodes against
+the operator table (arity, attributes, and the output type re-derived from the
+inputs), the ATen attributes, and the body of every `loop` node. Every message
+carries a location: line and column when the reader recorded one, and a
+document path such as nodes[12].
+
+Args:
+  doc: an S-Expr document datum.
+  require-aten?: keyword; require the (aten (string ...)) attribute where the
+    operator table has an entry (default #t).
+  path-prefix: keyword; a prefix for every location in the messages (default
+    \"\").
+Returns: a list of strings.
+Example:
+  (use-modules (sonicboom trace validate))
+  (validate-sexpr '(sonicboom-s-expr (version 0 1)
+                                     (graph (name \"g\") (inputs) (outputs)
+                                            (parameters) (nodes))))
+  => ()
+PyTorch: none"
   (let ((errors '())
         (types (make-table)))           ; value name -> (dtype . shape)
     (define (err! datum path . msg)
@@ -345,7 +366,20 @@
 (define (type->datum t) `(tensor ,(car t) (shape ,@(cdr t))))
 
 (define* (validate-sexpr-text text #:key (require-aten? #t))
-  "Parse TEXT and validate it. Returns a list of error strings ('() if valid)."
+  "Parse TEXT and validate it.
+
+TEXT must contain exactly one top-level form.
+
+Args:
+  text: the document text.
+  require-aten?: keyword; as in `validate-sexpr` (default #t).
+Returns: a list of error strings, the empty list when the document is valid.
+Example:
+  (use-modules (sonicboom trace graph) (sonicboom trace validate))
+  (let ((text (sexpr->text (graph->sexpr \"g\" '() '() '() '()))))
+    (validate-sexpr-text text))
+  => ()
+PyTorch: none"
   (let ((doc #f) (errs '()))
     (call-with-error-message
      (lambda ()
@@ -359,4 +393,16 @@
         errs)))
 
 (define* (valid-sexpr-text? text #:key (require-aten? #t))
+  "True when TEXT parses and validates without errors.
+
+Args:
+  text: the document text.
+  require-aten?: keyword; as in `validate-sexpr` (default #t).
+Returns: a boolean.
+Example:
+  (use-modules (sonicboom trace graph) (sonicboom trace validate))
+  (let ((text (sexpr->text (graph->sexpr \"g\" '() '() '() '()))))
+    (valid-sexpr-text? text))
+  => #t
+PyTorch: none"
   (null? (validate-sexpr-text text #:require-aten? require-aten?)))

@@ -15,9 +15,27 @@
   #:export (eliminate-dead-nodes))
 
 (define (eliminate-dead-nodes nodes params outputs)
-  "NODES in topological order, PARAMS a list of gparams, OUTPUTS the value
-names that must survive. Returns (values live-nodes live-params), both in
-their original order."
+  "Remove the nodes and parameters that do not reach OUTPUTS.
+
+A node is live when it is effectful or when one of its outputs is live; a
+parameter is live when a live node or a graph output references it.
+
+Args:
+  nodes: the segment's nodes in topological order.
+  params: a list of gparams.
+  outputs: the value names that must survive.
+Returns: two values, the live nodes and the live parameters, both in their
+original order.
+Example:
+  (use-modules (sonicboom trace graph) (sonicboom trace dce))
+  (let ((a (make-gnode 'relu '(\"x\") '((\"a\" float32 (2))) '()))
+        (b (make-gnode 'relu '(\"x\") '((\"b\" float32 (2))) '())))
+    (call-with-values
+        (lambda () (eliminate-dead-nodes (list a b) '() '(\"b\")))
+      (lambda (nodes params)
+        (map gnode-output-names nodes))))
+  => ((\"b\"))
+PyTorch: none"
   (let ((live (make-table)))
     (for-each (lambda (o) (table-set! live o #t)) outputs)
     (let ((kept

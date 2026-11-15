@@ -48,19 +48,60 @@
             format-tool-call parse-tool-call json-normalize
             message-ref message-text))
 
+;; The marker that opens a tool-call envelope.
+;;
+;; A tool call is emitted as this marker, the call object as one JSON line, and
+;; tool-call-close.
+;;
+;; Example:
+;;   (use-modules (sonicboom serve chat-template))
+;;   (string=? tool-call-open "<tool_call>")
+;;   => #t
+;; PyTorch: none
 (define tool-call-open "<tool_call>")
+;; The marker that closes a tool-call envelope.
+;;
+;; Example:
+;;   (use-modules (sonicboom serve chat-template))
+;;   (string=? tool-call-close "</tool_call>")
+;;   => #t
+;; PyTorch: none
 (define tool-call-close "</tool_call>")
 
 ;; --- segments ---------------------------------------------------------------
 
 (define (seg kind text) (cons kind text))
-(define (segments->string segments) (string-concatenate (map cdr segments)))
+(define (segments->string segments)
+  "Concatenate the texts of SEGMENTS into one string.
+
+Args:
+  segments: a list of (kind . text) segments.
+Returns: a string.
+Example:
+  (use-modules (sonicboom serve chat-template))
+  (segments->string (list (cons 'special \"<bos>\") (cons 'text \"hi\")))
+  => \"<bos>hi\"
+PyTorch: none"
+  (string-concatenate (map cdr segments)))
 
 ;; Special pieces of each family (the tokenizer keeps them whole when it parses
 ;; them), and the ones that end an assistant turn. A family's eos string must
 ;; be one of its special pieces — the end-of-turn marker is the model's own
 ;; control token, and only special parsing turns it into that one id.
 (define (template-special-tokens family)
+  "The token strings FAMILY's template writes as control tokens.
+
+These are the pieces the tokenizer keeps whole, so each becomes one vocabulary
+entry; they include the tool-call markers.
+
+Args:
+  family: gemma or qwen.
+Returns: a list of strings.
+Example:
+  (use-modules (sonicboom serve chat-template))
+  (template-special-tokens 'qwen)
+  => (\"<|endoftext|>\" \"<|im_start|>\" \"<|im_end|>\" \"<tool_call>\" \"</tool_call>\")
+PyTorch: none"
   (append
    (case family
      ((gemma) '("<bos>" "<eos>" "<|turn>" "<turn|>"))
@@ -69,6 +110,19 @@
    (list tool-call-open tool-call-close)))
 
 (define (template-eos-strings family)
+  "The strings that end an assistant turn in FAMILY's template.
+
+Each is one of the family's special tokens, so the decoder stops on a single
+control token.
+
+Args:
+  family: gemma or qwen.
+Returns: a list of strings.
+Example:
+  (use-modules (sonicboom serve chat-template))
+  (template-eos-strings 'gemma)
+  => (\"<turn|>\" \"<eos>\")
+PyTorch: none"
   (case family
     ((gemma) '("<turn|>" "<eos>"))
     ((qwen) '("<|im_end|>" "<|endoftext|>"))
@@ -80,12 +134,38 @@
 ;; json->scm gives object members in reverse order; restore the source order
 ;; (tool schemas are shown to the model as JSON, in the order they came).
 (define (json-normalize x)
+  "Restore the source member order of a decoded JSON value.
+
+The JSON reader yields object members in reverse order; this reverses every
+object in X, recursively.
+
+Args:
+  x: a decoded JSON value.
+Returns: the same value with object members in their source order.
+Example:
+  (use-modules (sonicboom serve chat-template))
+  (json-normalize '((\"b\" . 2) (\"a\" . 1)))
+  => ((\"a\" . 1) (\"b\" . 2))
+PyTorch: none"
   (cond ((and (pair? x) (every pair? x))
          (reverse (map (lambda (p) (cons (car p) (json-normalize (cdr p)))) x)))
         ((vector? x) (list->vector (map json-normalize (vector->list x))))
         (else x)))
 
 (define (message-ref msg key)
+  "The value of KEY in the message alist MSG, or #f.
+
+A JSON null value reads as #f.
+
+Args:
+  msg: a message alist with string keys.
+  key: a string key.
+Returns: the value, or #f.
+Example:
+  (use-modules (sonicboom serve chat-template))
+  (message-ref '((\"role\" . \"user\") (\"content\" . \"hi\")) \"role\")
+  => \"user\"
+PyTorch: none"
   (match (assoc key msg)
     ((_ . 'null) #f)
     ((_ . v) v)
@@ -93,6 +173,19 @@
 
 ;; content is a string, null, or an array of parts; only text parts count.
 (define (message-text msg)
+  "The text of a message's content.
+
+The content may be a string, null or an array of parts; only the parts of type
+text contribute.
+
+Args:
+  msg: a message alist with string keys.
+Returns: a string.
+Example:
+  (use-modules (sonicboom serve chat-template))
+  (message-text '((\"content\" . \"hi\")))
+  => \"hi\"
+PyTorch: none"
   (match (message-ref msg "content")
     (#f "")
     ((? string? s) s)
@@ -112,12 +205,40 @@
 ;; The text of one call, as the model emits it and as an assistant message
 ;; replays it. arguments is the JSON text of the arguments object.
 (define (format-tool-call name arguments)
+  "The text of one tool call.
+
+The result is the open marker, a line holding {\"name\": NAME, \"arguments\":
+ARGUMENTS}, and the close marker.
+
+Args:
+  name: the function name.
+  arguments: the arguments object, as JSON text.
+Returns: a string.
+Example:
+  (use-modules (sonicboom serve chat-template))
+  (string=? (format-tool-call \"f\" \"{}\")
+            (string-append \"<tool_call>\\n{\\\"name\\\": \\\"f\\\", \\\"arguments\\\": {}}\\n\"
+                           \"</tool_call>\"))
+  => #t
+PyTorch: none"
   (string-append tool-call-open "\n{\"name\": " (scm->json-string name)
                  ", \"arguments\": " arguments "}\n" tool-call-close))
 
 ;; The inside of <tool_call>...</tool_call> -> (name . arguments-json-text),
 ;; or #f when it isn't a call object.
 (define (parse-tool-call text)
+  "Parse the inside of a tool-call envelope.
+
+TEXT is the text between the open and close markers.
+
+Args:
+  text: a string.
+Returns: (name . arguments-json-text), or #f when TEXT is not a call object.
+Example:
+  (use-modules (sonicboom serve chat-template))
+  (parse-tool-call \"{\\\"name\\\": \\\"f\\\", \\\"arguments\\\": \\\"{}\\\"}\")
+  => (\"f\" . \"{}\")
+PyTorch: none"
   (catch #t
     (lambda ()
       (let* ((obj (json-string->scm (string-trim-both text)))
@@ -254,6 +375,27 @@
 (define* (render-chat-template-segments family messages #:key (tools '())
                                         (tool-choice "auto")
                                         (add-generation-prompt? #t))
+  "Render MESSAGES with FAMILY's chat template.
+
+The result is a segment list: special for the template's own turn markers and
+text for everything that came from a message, so the markers can be tokenized
+as control tokens while the message text cannot forge one.
+
+Args:
+  family: gemma or qwen.
+  messages: a list of message alists with string keys.
+  tools: keyword; the tools offered to the model (default '()).
+  tool-choice: keyword; \"none\", \"auto\", \"required\" or a function name; with
+    \"none\" the tools are not shown at all (default \"auto\").
+  add-generation-prompt?: keyword; append the opening of an assistant turn
+    (default #t).
+Returns: a list of (kind . text) segments.
+Example:
+  (use-modules (sonicboom serve chat-template))
+  (length (render-chat-template-segments
+           'gemma (list (list (cons \"role\" \"user\") (cons \"content\" \"hi\")))))
+  => 8
+PyTorch: none"
   (let ((tools (if (equal? tool-choice "none") '() tools)))
     (case family
       ((gemma) (render-gemma messages tools tool-choice add-generation-prompt?))
@@ -264,6 +406,23 @@
 (define* (render-chat-template family messages #:key (tools '())
                                (tool-choice "auto")
                                (add-generation-prompt? #t))
+  "Render MESSAGES with FAMILY's chat template as one string.
+
+Args:
+  family: gemma or qwen.
+  messages: a list of message alists with string keys.
+  tools: keyword; the tools offered to the model (default '()).
+  tool-choice: keyword; \"none\", \"auto\", \"required\" or a function name
+    (default \"auto\").
+  add-generation-prompt?: keyword; append the opening of an assistant turn
+    (default #t).
+Returns: a string.
+Example:
+  (use-modules (sonicboom serve chat-template))
+  (render-chat-template
+   'gemma (list (list (cons \"role\" \"user\") (cons \"content\" \"hi\"))))
+  => \"<bos><|turn>user\\nhi<turn|>\\n<|turn>model\\n\"
+PyTorch: none"
   (segments->string
    (render-chat-template-segments family messages #:tools tools
                                   #:tool-choice tool-choice

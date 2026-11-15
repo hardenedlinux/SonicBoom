@@ -248,14 +248,45 @@ dtype and cadr is the shape list; `(length (cadr t))` is the rank."
 ;;; --- public API ---------------------------------------------------------------
 
 (define (trace-graph proc . args)
-  "Trace PROC on ARGS (which must not graph-break) and return the parsed
-S-Expr v0.1 document datum — the graph `traced->s-expr` and `run-traced` take."
+  "Trace PROC on ARGS and return the parsed S-Expr v0.1 document datum.
+
+ARGS must not cause a graph break; PROC is written against the symbolic ops.
+
+Args:
+  proc: the procedure to trace.
+  args: its arguments; tensors become graph inputs named \"arg0\", \"arg1\", ...
+Returns: the document datum that `traced->s-expr` and `run-traced` take.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace symbolic)
+               (sonicboom trace lower))
+  (car (trace-graph (lambda (x) (relu (add x x)))
+                    (list->ctensor '(1.0 -2.0))))
+  => sonicboom-s-expr
+PyTorch: none
+Note: torch.export.export returns an ExportedProgram; this returns the S-Expr
+datum of one segment."
   (call-with-input-string (apply trace->sexpr proc args) read))
 
 (define (traced->s-expr graph)
-  "Lower the traced document datum GRAPH onto the S-Expr v0.1 runtime
-vocabulary and return the document text. Raises an error naming the op for any
-node with no lowering."
+  "Lower a traced document onto the S-Expr v0.1 runtime vocabulary and return the text.
+
+A matmul followed only by a rank-1 add becomes one gemm node; reshape, relu and
+reduce_mean lower directly. A reduction that drops the rank becomes a
+keepdims reduce_mean plus a reshape.
+
+Args:
+  graph: a traced document datum, as `trace-graph` returns.
+Returns: the document text.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace symbolic)
+               (sonicboom trace lower))
+  (let ((graph (trace-graph (lambda (x) (relu (add x x)))
+                            (list->ctensor '(1.0 -2.0)))))
+    (string? (traced->s-expr graph)))
+  => #t
+PyTorch: none
+Note: a node whose operator has no lowering raises an error naming the
+operator."
   (let* ((g (graph-of graph))
          (types (value-types g))
          (nodes (field g 'nodes))
@@ -297,9 +328,27 @@ node with no lowering."
           (if hit (decl-type (cadr hit)) (loop (cdr ns)))))))
 
 (define (run-traced graph inputs)
-  "Lower GRAPH, run it through libsonicboom.so (`run-s-expr`) on INPUTS — an
-alist (value-name . ctensor) as `interpret-sexpr` takes — and return the output
-ctensor. The S-Expr C ABI binds exactly one input and returns one output."
+  "Lower GRAPH and run it on INPUTS, returning the output tensor.
+
+INPUTS is an alist (value-name . ctensor), with the graph's single input name
+(typically \"arg0\"). The S-Expr runtime binds exactly one input and returns one
+output.
+
+Args:
+  graph: a traced document datum, as `trace-graph` returns.
+  inputs: an alist (value-name . ctensor).
+Returns: the output ctensor.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace symbolic)
+               (sonicboom trace lower))
+  (ctensor->list
+   (run-traced (trace-graph (lambda (x) (relu (add x x)))
+                            (list->ctensor '(1.0 -2.0)))
+               (list (cons \"arg0\" (list->ctensor '(1.0 -2.0))))))
+  => (2.0 0.0)
+PyTorch: none
+Note: requires libsonicboom.so; the graph must have exactly one input and one
+output."
   (let* ((g (graph-of graph))
          (in-names (map cadr (field g 'inputs)))
          (out-names (map cadr (field g 'outputs))))

@@ -171,9 +171,23 @@ FALLBACK, which resolves the condition with `bool` (a graph break)."
 ;;; --- %branch: if / when / unless / cond / do ------------------------------------------
 
 (define (%branch site test then-thunk else-thunk . statement)
-  "Run time of a rewritten conditional. A non-empty STATEMENT marks forms used
-for effect (one-armed if, when, unless): on a symbolic test both arms are
-traced and the result is unspecified."
+  "The run-time hook of a rewritten conditional.
+
+The walker turns if, when, unless, cond and do tests into %branch. A
+non-symbolic test selects an arm immediately. A symbolic test traces both
+arms and joins their results with where; a form used for effect records no
+join. A test whose truth an enclosing condition has already established takes
+the known arm.
+
+Args:
+  site: the source location of the form, for error messages.
+  test: the condition.
+  then-thunk: a thunk for the true arm.
+  else-thunk: a thunk for the false arm.
+  statement: optional; non-empty for a form used for effect.
+Returns: the value of the selected arm, or an unspecified value for an
+  effect form.
+PyTorch: none"
   (cond
    ((sym? test)
     (let* ((rec (require-condition site test))
@@ -222,12 +236,36 @@ traced and the result is unspecified."
          short))))
 
 (define (%and site first rest-thunk)
+  "The run-time hook of a rewritten and.
+
+A non-symbolic first value short-circuits as in Scheme. A symbolic condition
+traces the rest of the form under the assumption that it is reached and
+combines the results with the tensor and operator.
+
+Args:
+  site: the source location of the form.
+  first: the value of the first form.
+  rest-thunk: a thunk for the remaining forms.
+Returns: the first false value, or the value of the last form.
+PyTorch: none"
   (cond ((sym? first) (symbolic-logic site 'and first rest-thunk))
         ((ctensor? first) (if (bool first) (rest-thunk) first))
         (first (rest-thunk))
         (else first)))
 
 (define (%or site first rest-thunk)
+  "The run-time hook of a rewritten or.
+
+A non-symbolic first value short-circuits as in Scheme. A symbolic condition
+traces the rest of the form under the assumption that it is reached and
+combines the results with the tensor or operator.
+
+Args:
+  site: the source location of the form.
+  first: the value of the first form.
+  rest-thunk: a thunk for the remaining forms.
+Returns: the first true value, or the value of the last form.
+PyTorch: none"
   (cond ((sym? first) (symbolic-logic site 'or first rest-thunk))
         ((ctensor? first) (if (bool first) first (rest-thunk)))
         (first first)
@@ -236,9 +274,20 @@ traced and the result is unspecified."
 ;;; --- %case ----------------------------------------------------------------------------------
 
 (define (%case site key clauses else-proc)
-  "CLAUSES is a list of (datums . proc), ELSE-PROC a proc or #f; procs take
-the key (for =>). A ctensor key is compared numerically by its single
-element; a symbolic key becomes a chain of %branch on `equal` tests."
+  "The run-time hook of a rewritten case.
+
+CLAUSES is a list of (datums . proc) pairs and ELSE-PROC a procedure of the
+key, or #f. A concrete key selects a clause immediately. A symbolic key
+becomes a chain of equal tests joined by %branch; a one-element tensor key is
+compared by its element.
+
+Args:
+  site: the source location of the form.
+  key: the case key.
+  clauses: the clause list.
+  else-proc: the else procedure, or #f.
+Returns: the value of the selected clause.
+PyTorch: none"
   (define (match? k datums)
     (if (ctensor? key)
         (any (lambda (d) (if (and (number? k) (number? d)) (= k d) (eqv? k d))) datums)
@@ -264,7 +313,17 @@ element; a symbolic key becomes a chain of %branch on `equal` tests."
 
 ;;; --- strict mode: %call / %covered -------------------------------------------------------
 
-(define (%covered proc) (covered-procedure! proc))
+(define (%covered proc)
+  "Mark PROC as covered by the macro walker.
+
+A covered procedure may receive symbolic tensors in strict mode without a
+warning. traced-lambda and define-traced mark their procedures this way.
+
+Args:
+  proc: a procedure.
+Returns: the same procedure, marked covered.
+PyTorch: none"
+  (covered-procedure! proc))
 
 (for-each covered-procedure! (list shape-of dtype-of))
 
@@ -299,8 +358,17 @@ element; a symbolic key becomes a chain of %branch on `equal` tests."
       (trace-warn (string-append "sonicboom-trace: strict: " note)))))
 
 (define (%call f . args)
-  "A procedure call from a traced body. In strict mode, report a symbolic
-tensor reaching a procedure the walker did not cover."
+  "A procedure call from a traced body.
+
+The walker rewrites calls to %call. In strict mode a symbolic tensor reaching
+a procedure the walker did not cover is reported as a warning; the call still
+runs.
+
+Args:
+  f: the procedure.
+  args: the arguments.
+Returns: whatever F returns.
+PyTorch: none"
   (let ((rec (current-tracer)))
     (when (and rec (strict? rec)
                (any (lambda (a) (carries-symbolic? a 2)) args))
@@ -556,6 +624,20 @@ tensor reaching a procedure the walker did not cover."
 
 ;;; --- entry points ----------------------------------------------------------------------------
 
+;; Leave FORM exactly as written.
+;;
+;; Inside a traced body the walker rewrites control forms and marks calls; a
+;; form wrapped in trace-opaque is not walked. It is an escape hatch for a form
+;; the walker cannot rewrite.
+;;
+;; Args:
+;;   form: the form to keep.
+;; Returns: FORM unchanged.
+;; Example:
+;;   (use-modules (sonicboom trace macro))
+;;   (trace-opaque (list 1 2))
+;;   => (1 2)
+;; PyTorch: none
 (define-syntax trace-opaque
   ;; (trace-opaque form): FORM is left exactly as written by the walker.
   (syntax-rules ()
@@ -568,21 +650,90 @@ tensor reaching a procedure the walker did not cover."
                      #:guards (%free-variable-guards formals body ...)
                      opt ...))))
 
+;; A traced procedure with tracing options.
+;;
+;; Like traced-lambda, with an option list first. The options are those of
+;; trace-function: #:max-unroll, #:multi-resume?, #:max-side-nodes,
+;; #:max-depth, #:executor, #:retrace-on-miss? and #:strict?.
+;;
+;; Args:
+;;   options: a list of trace-function keyword options.
+;;   formals: the parameter list.
+;;   body: one or more body forms.
+;; Returns: a traced procedure.
+;; Example:
+;;   (use-modules (sonicboom trace tensor) (sonicboom trace macro))
+;;   (define double (traced-lambda* (#:max-unroll 8) (x) (mul x 2.0)))
+;;   (ctensor->list (double (list->ctensor '(1.0 2.0))))
+;;   => (2.0 4.0)
+;; PyTorch: none
 (define-syntax traced-lambda*
   ;; (traced-lambda* (option ...) formals body ...), options as trace-function
   (syntax-rules ()
     ((_ (opt ...) formals body ...)
      (%walk-list (body ...) (%k-traced formals (opt ...) (body ...))))))
 
+;; A traced procedure: (traced-lambda FORMALS BODY ...).
+;;
+;; The body is first rewritten by the macro walker, so a condition on a symbolic
+;; tensor is resolved inside the graph instead of being taken as a Scheme truth
+;; value. if, when, unless, cond, case, and, or, do and named let are handled;
+;; every procedure the body calls is marked covered for strict mode. The body's
+;; free variables at definition time are guards: changing one retraces.
+;;
+;; Args:
+;;   formals: the parameter list.
+;;   body: one or more body forms.
+;; Returns: a traced procedure.
+;; Example:
+;;   (use-modules (sonicboom trace tensor) (sonicboom trace macro))
+;;   (define double (traced-lambda (x) (mul x 2.0)))
+;;   (ctensor->list (double (list->ctensor '(1.0 2.0))))
+;;   => (2.0 4.0)
+;; PyTorch: none
+;; Note: PyTorch has no tracing construct with this contract; torch.jit and
+;; torch.compile are outside the cross-reference.
 (define-syntax traced-lambda
   (syntax-rules ()
     ((_ formals body ...) (traced-lambda* () formals body ...))))
 
+;; Define NAME as a traced procedure with tracing options.
+;;
+;; Like define-traced, with an option list first (see traced-lambda*).
+;;
+;; Args:
+;;   options: a list of trace-function keyword options.
+;;   name: the procedure name.
+;;   formals: the parameter list.
+;;   body: one or more body forms.
+;; Returns: an unspecified value.
+;; Example:
+;;   (use-modules (sonicboom trace tensor) (sonicboom trace macro))
+;;   (define-traced* (#:max-unroll 8) (quad x) (mul x 4.0))
+;;   (ctensor->list (quad (list->ctensor '(1.0 2.0))))
+;;   => (4.0 8.0)
+;; PyTorch: none
 (define-syntax define-traced*
   (syntax-rules ()
     ((_ (opt ...) (name . formals) body ...)
      (define name (traced-lambda* (opt ...) formals body ...)))))
 
+;; Define NAME as a traced procedure.
+;;
+;; (define-traced (NAME . FORMALS) BODY ...) binds NAME to (traced-lambda
+;; FORMALS BODY ...).
+;;
+;; Args:
+;;   name: the procedure name.
+;;   formals: the parameter list.
+;;   body: one or more body forms.
+;; Returns: an unspecified value.
+;; Example:
+;;   (use-modules (sonicboom trace tensor) (sonicboom trace macro))
+;;   (define-traced (triple x) (mul x 3.0))
+;;   (ctensor->list (triple (list->ctensor '(1.0 2.0))))
+;;   => (3.0 6.0)
+;; PyTorch: none
 (define-syntax define-traced
   (syntax-rules ()
     ((_ (name . formals) body ...)

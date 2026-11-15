@@ -76,6 +76,17 @@
 ;;; ---------------------------------------------------------------------------
 ;;; The backend record
 
+;; A backend is the service's view of a model runtime.
+;;
+;; It is a name plus a record of procedures. Every procedure receives the
+;; backend's own handles (a model handle, a session handle), so the mock backend
+;; and the libsonicboom backend are interchangeable to the code above this module.
+;;
+;; Example:
+;;   (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+;;   (backend? (make-mock-backend))
+;;   => #t
+;; PyTorch: none
 (define-record-type <backend>
   (%make-backend name load-model model-info tokenize detokenize render-chat
                  tokenize-chat
@@ -149,6 +160,53 @@
                        (generate #f)
                        (stats (lambda (model) '()))
                        (sampling? #f))
+  "Create a backend from procedures.
+
+load-model, model-info, tokenize, detokenize, render-chat, create-session,
+free-session, prefill and step are required; the other keywords have defaults.
+A backend that supplies generate produces a whole reply in one call; one that
+does not is driven token by token through step.
+
+Args:
+  name: keyword; the backend's name (default \"backend\").
+  load-model: keyword; (config) -> a model handle.
+  model-info: keyword; (handle) -> an info alist (see the model record).
+  tokenize: keyword; (handle string) -> a list of token ids.
+  detokenize: keyword; (handle token-ids) -> a string.
+  render-chat: keyword; (handle messages tools tool-choice) -> prompt segments.
+  tokenize-chat: keyword; (handle segments) -> token ids, or #f to concatenate
+    the segments and call tokenize (default #f).
+  create-session: keyword; (handle) -> a session handle.
+  free-session: keyword; (session-handle) -> unspecified.
+  fork-session: keyword; (session-handle n) -> a new handle holding the first n
+    tokens, or #f when the backend cannot copy a KV prefix (default #f).
+  prefill: keyword; (session-handle token-ids constraint) -> the number of
+    tokens kept from the previous contents.
+  step: keyword; (session-handle sampler constraint) -> a token id, or #f when
+    the constraint has closed the reply.
+  generate: keyword; (session-handle sampler constraint max-tokens on-token) ->
+    the number of tokens produced; on-token returns #t to continue and #f to
+    stop (default #f).
+  stats: keyword; (handle) -> an alist (default: one returning the empty list).
+  sampling?: keyword; whether step honours the sampler's parameters (default
+    #f).
+Returns: a backend.
+Example:
+  (use-modules (sonicboom serve backend))
+  (backend-name
+   (make-backend #:name \"demo\"
+                 #:load-model (lambda (config) 'handle)
+                 #:model-info (lambda (h) '((id . \"m\") (family . gemma)
+                                            (context-length . 8) (eos-tokens . ())))
+                 #:tokenize (lambda (model text) '())
+                 #:detokenize (lambda (model tokens) \"\")
+                 #:render-chat (lambda (model messages tools choice) '())
+                 #:create-session (lambda (model) 'session)
+                 #:free-session (lambda (session) #f)
+                 #:prefill (lambda (session tokens constraint) 0)
+                 #:step (lambda (session sampler constraint) 0)))
+  => \"demo\"
+PyTorch: none"
   (%make-backend name load-model model-info tokenize detokenize render-chat
                  tokenize-chat
                  create-session free-session fork-session prefill step
@@ -157,6 +215,18 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Models and sessions
 
+;; A loaded model: the backend that loaded it, the backend's handle and its info alist.
+;;
+;; The info alist has at least id (string), family (symbol: gemma or qwen),
+;; context-length (integer) and eos-tokens (list of token ids that end a reply).
+;; model-id, model-family, model-context-length and model-eos-tokens read those
+;; entries.
+;;
+;; Example:
+;;   (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+;;   (model-id (load-model (make-mock-backend) '((family . gemma))))
+;;   => "mock-gemma"
+;; PyTorch: none
 (define-record-type <model>
   (%make-model backend handle info)
   model?
@@ -171,23 +241,117 @@
     ((_ . v) v)
     (#f (error "model info lacks" key))))
 
-(define (model-id model) (info-ref model 'id))
-(define (model-family model) (info-ref model 'family))
-(define (model-context-length model) (info-ref model 'context-length))
-(define (model-eos-tokens model) (info-ref model 'eos-tokens))
+(define (model-id model)
+  "The id string of MODEL.
+
+Args:
+  model: a model.
+Returns: a string.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (model-id (load-model (make-mock-backend) '()))
+  => \"mock-gemma\"
+PyTorch: none"
+  (info-ref model 'id))
+(define (model-family model)
+  "The chat-template family of MODEL, as a symbol.
+
+Args:
+  model: a model.
+Returns: gemma or qwen.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (model-family (load-model (make-mock-backend) '()))
+  => gemma
+PyTorch: none"
+  (info-ref model 'family))
+(define (model-context-length model)
+  "The maximum number of tokens MODEL holds.
+
+Args:
+  model: a model.
+Returns: a positive integer.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (model-context-length
+   (load-model (make-mock-backend) '((context-length . 4096))))
+  => 4096
+PyTorch: none"
+  (info-ref model 'context-length))
+(define (model-eos-tokens model)
+  "The token ids that end a reply from MODEL.
+
+Args:
+  model: a model.
+Returns: a list of token ids.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (model-eos-tokens (load-model (make-mock-backend) '()))
+  => (3 1)
+Note: the mock backend derives them from its template's end-of-turn strings.
+PyTorch: none"
+  (info-ref model 'eos-tokens))
 
 ;; Whether this model's backend can sample (see make-backend's sampling?).
 (define (model-sampling? model)
+  "True when MODEL's backend honours the sampler's parameters.
+
+Args:
+  model: a model.
+Returns: a boolean.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (model-sampling? (load-model (make-mock-backend) '()))
+  => #t
+PyTorch: none"
   (backend-sampling? (model-backend model)))
 
 (define (load-model backend config)
+  "Load a model with BACKEND from a config alist.
+
+The config keys are backend specific; the mock backend reads family, id,
+context-length, step-delay and prefill-delay.
+
+Args:
+  backend: a backend.
+  config: an alist.
+Returns: a model.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (model-id (load-model (make-mock-backend) '((id . \"demo-model\"))))
+  => \"demo-model\"
+PyTorch: none"
   (let ((handle ((%backend-load-model backend) config)))
     (%make-model backend handle ((%backend-model-info backend) handle))))
 
 (define (tokenize model text)
+  "Tokenize TEXT with MODEL's tokenizer.
+
+Special markers are matched as whole tokens.
+
+Args:
+  model: a model.
+  text: a string.
+Returns: a list of token ids.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (tokenize (load-model (make-mock-backend) '()) \"hi\")
+  => (360 361)
+PyTorch: none"
   ((%backend-tokenize (model-backend model)) (model-handle model) text))
 
 (define (detokenize model tokens)
+  "The text of TOKENS under MODEL's tokenizer.
+
+Args:
+  model: a model.
+  tokens: a list of token ids.
+Returns: a string.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (detokenize (load-model (make-mock-backend) '()) '(360 361))
+  => \"hi\"
+PyTorch: none"
   ((%backend-detokenize (model-backend model)) (model-handle model) tokens))
 
 ;; messages: list of message alists in the OpenAI shape, already decoded from
@@ -197,11 +361,46 @@
 ;; the template's own turn markers and 'text for everything that came from a
 ;; message (see (sonicboom serve chat-template)).
 (define* (render-chat-segments model messages #:key (tools '()) (tool-choice "auto"))
+  "The prompt for MESSAGES as a segment list.
+
+Each segment is (kind . text): special for the template's own turn markers and
+text for everything that came from a message. Messages are alists with string
+keys in the OpenAI shape.
+
+Args:
+  model: a model.
+  messages: the list of messages.
+  tools: keyword; the tools offered to the model (default '()).
+  tool-choice: keyword; \"none\", \"auto\", \"required\" or a function name
+    (default \"auto\").
+Returns: a list of segments.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (length (render-chat-segments
+           (load-model (make-mock-backend) '())
+           (list (list (cons \"role\" \"user\") (cons \"content\" \"hi\")))))
+  => 8
+PyTorch: none"
   ((%backend-render-chat (model-backend model))
    (model-handle model) messages tools tool-choice))
 
 ;; The same rendered prompt as one string (for logs and tests).
 (define* (render-chat model messages #:key (tools '()) (tool-choice "auto"))
+  "The prompt for MESSAGES as one string.
+
+Args:
+  model: a model.
+  messages: the list of messages.
+  tools: keyword; the tools offered to the model (default '()).
+  tool-choice: keyword; \"none\", \"auto\", \"required\" or a function name
+    (default \"auto\").
+Returns: a string.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (render-chat (load-model (make-mock-backend) '())
+               (list (list (cons \"role\" \"user\") (cons \"content\" \"hi\"))))
+  => \"<bos><|turn>user\\nhi<turn|>\\n<|turn>model\\n\"
+PyTorch: none"
   (segments->string
    (render-chat-segments model messages #:tools tools #:tool-choice tool-choice)))
 
@@ -211,11 +410,39 @@
 ;; user's message stays text. Without one, the segments are concatenated and
 ;; tokenized as plain text, which is what every prompt used to be.
 (define (tokenize-chat model segments)
+  "The token ids of a rendered prompt.
+
+The template's special segments are tokenized with special parsing, so each
+becomes the vocabulary's control token; the text segments are tokenized as
+plain text.
+
+Args:
+  model: a model.
+  segments: a list of prompt segments.
+Returns: a list of token ids.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (tokenize-chat (load-model (make-mock-backend) '())
+                 (list (cons 'special \"<bos>\")))
+  => (0)
+PyTorch: none"
   (let ((proc (%backend-tokenize-chat (model-backend model))))
     (if proc
         (proc (model-handle model) segments)
         (tokenize model (segments->string segments)))))
 
+;; A session is one model's KV cache: it holds a token sequence.
+;;
+;; create-session makes an empty one and free-session releases it. prefill makes
+;; it hold a given sequence, keeping the longest common prefix of what it held;
+;; step samples the next token and appends it. A session belongs to the model in
+;; session-model and carries the backend's handle in session-handle.
+;;
+;; Example:
+;;   (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+;;   (session? (create-session (load-model (make-mock-backend) '())))
+;;   => #t
+;; PyTorch: none
 (define-record-type <session>
   (%make-session model handle)
   session?
@@ -223,43 +450,183 @@
   (handle session-handle))
 
 (define (create-session model)
+  "Create an empty session for MODEL.
+
+Args:
+  model: a model.
+Returns: a session.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (session? (create-session (load-model (make-mock-backend) '())))
+  => #t
+PyTorch: none"
   (%make-session model
                  ((%backend-create-session (model-backend model))
                   (model-handle model))))
 
 (define (free-session session)
+  "Release SESSION and its held tokens.
+
+Args:
+  session: a session.
+Returns: unspecified.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (begin (free-session
+          (create-session (load-model (make-mock-backend) '())))
+         #t)
+  => #t
+PyTorch: none"
   ((%backend-free-session (model-backend (session-model session)))
    (session-handle session)))
 
 (define (can-fork? model)
+  "True when MODEL's backend can copy a session's tokens into a new session.
+
+Args:
+  model: a model.
+Returns: a boolean.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (can-fork? (load-model (make-mock-backend) '()))
+  => #t
+PyTorch: none"
   (and (%backend-fork-session (model-backend model)) #t))
 
 ;; A new session holding the first n tokens of session, without recomputing
 ;; them (a KV-cache copy on the device).
 (define (fork-session session n)
+  "A new session holding the first N tokens of SESSION.
+
+The tokens are copied, not recomputed.
+
+Args:
+  session: a session.
+  n: how many tokens to keep.
+Returns: a session.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (let ((model (load-model (make-mock-backend) '())))
+    (session? (fork-session (create-session model) 0)))
+  => #t
+PyTorch: none"
   (let ((model (session-model session)))
     (%make-session model
                    ((%backend-fork-session (model-backend model))
                     (session-handle session) n))))
 
 (define* (prefill session tokens #:optional (constraint #f))
+  "Make SESSION hold TOKENS, computing only what it does not already hold.
+
+The longest common prefix of the session's current tokens and TOKENS is kept;
+the rest is computed. With a constraint the grammar is installed before the
+first token after the prompt is sampled.
+
+Args:
+  session: a session.
+  tokens: a list of token ids.
+  constraint: optional; a constrained-decoding constraint or #f.
+Returns: the number of tokens kept.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (let* ((model (load-model (make-mock-backend) '()))
+         (session (create-session model)))
+    (prefill session '(104 105))
+    (prefill session '(104 105)))
+  => 2
+PyTorch: none"
   ((%backend-prefill (model-backend (session-model session)))
    (session-handle session) tokens constraint))
 
 (define* (step session sampler #:optional (constraint #f))
+  "Sample the next token after the sequence SESSION holds, then append it.
+
+The token is sampled from the sampler's parameters; a constraint may restrict
+the candidates. The next step continues from the token.
+
+Args:
+  session: a session.
+  sampler: a sampler.
+  constraint: optional; a constrained-decoding constraint or #f.
+Returns: a token id, or #f when the constraint has closed the reply.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (let* ((model (load-model (make-mock-backend) '()))
+         (session (create-session model)))
+    (prefill session (tokenize model \"hi\"))
+    (detokenize model
+                (list (step session (make-sampler #:temperature 0)))))
+  => \"Y\"
+Note: the mock backend plans the reply \"You said: \" for a prompt with no user
+turn, so its first token is the \"Y\" of that text.
+PyTorch: none"
   ((%backend-step (model-backend (session-model session)))
    (session-handle session) sampler constraint))
 
 ;; Whether this model's backend can produce a reply in one call. A backend
 ;; without generate is driven token by token through step.
 (define (can-generate? model)
+  "True when MODEL's backend can produce a reply in one call.
+
+Args:
+  model: a model.
+Returns: a boolean.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (can-generate? (load-model (make-mock-backend) '()))
+  => #f
+PyTorch: none"
   (and (%backend-generate (model-backend model)) #t))
 
 (define (generate session sampler constraint max-tokens on-token)
+  "Produce a reply of at most MAX-TOKENS tokens in one backend call.
+
+Each produced token is passed to ON-TOKEN, which returns #t to continue and #f
+to stop the decode.
+
+Args:
+  session: a session.
+  sampler: a sampler.
+  constraint: a constrained-decoding constraint or #f.
+  max-tokens: the maximum number of tokens to produce.
+  on-token: a procedure of one token id.
+Returns: the number of tokens produced.
+Example:
+  (use-modules (sonicboom serve backend))
+  (let ((backend
+         (make-backend #:name \"demo\"
+                       #:load-model (lambda (config) 'handle)
+                       #:model-info (lambda (h) '((id . \"m\") (family . gemma)
+                                                  (context-length . 8)
+                                                  (eos-tokens . ())))
+                       #:tokenize (lambda (model text) '())
+                       #:detokenize (lambda (model tokens) \"\")
+                       #:render-chat (lambda (model messages tools choice) '())
+                       #:create-session (lambda (model) 'session)
+                       #:free-session (lambda (session) #f)
+                       #:prefill (lambda (session tokens constraint) 0)
+                       #:step (lambda (session sampler constraint) 0)
+                       #:generate (lambda (session sampler constraint max-tokens
+                                          on-token)
+                                    (on-token 1) (on-token 2) 2))))
+    (generate (create-session (load-model backend '())) (make-sampler) #f 4
+              (lambda (token) #t)))
+  => 2
+PyTorch: none"
   ((%backend-generate (model-backend (session-model session)))
    (session-handle session) sampler constraint max-tokens on-token))
 
 (define (backend-stats model)
+  "The backend's counters for MODEL as an alist.
+
+Args:
+  model: a model.
+Returns: an alist.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (backend-stats (load-model (make-mock-backend) '()))
+  => ()
+PyTorch: none"
   ((%backend-stats (model-backend model)) (model-handle model)))
 
 ;;; ---------------------------------------------------------------------------
@@ -273,6 +640,18 @@
 ;;; filter is #f for every grammar constraint: only the tokenizer's vocabulary
 ;;; can turn a grammar into a candidate list.
 
+;; A constrained-decoding grammar.
+;;
+;; kind is one of json-schema, tool-call or gbnf; text is the schema or the
+;; grammar source. filter is a host-side token filter, or #f for a grammar: turning
+;; a grammar into a token mask needs the model's vocabulary. Build one with
+;; make-json-schema-constraint, make-tool-call-constraint or make-gbnf-constraint.
+;;
+;; Example:
+;;   (use-modules (sonicboom serve backend))
+;;   (constraint-kind (make-gbnf-constraint "root ::= x"))
+;;   => gbnf
+;; PyTorch: none
 (define-record-type <constraint>
   (%make-constraint kind text filter)
   constraint?
@@ -281,21 +660,61 @@
   (filter constraint-filter))
 
 (define (make-json-schema-constraint schema-json)
-  "The reply must be one JSON value of SCHEMA-JSON."
+  "A constraint that the reply is one JSON value of SCHEMA-JSON.
+
+Args:
+  schema-json: a JSON Schema, as JSON text.
+Returns: a constraint.
+Example:
+  (use-modules (sonicboom serve backend))
+  (constraint-kind (make-json-schema-constraint \"{}\"))
+  => json-schema
+PyTorch: none"
   (%make-constraint 'json-schema schema-json #f))
 
 (define (make-tool-call-constraint call-schema-json)
-  "The reply must be one <tool_call> envelope whose object is a value of
-CALL-SCHEMA-JSON."
+  "A constraint that the reply is one tool-call envelope.
+
+The envelope's object must be a value of CALL-SCHEMA-JSON, a JSON Schema of
+{name, arguments}.
+
+Args:
+  call-schema-json: the call object's schema, as JSON text.
+Returns: a constraint.
+Example:
+  (use-modules (sonicboom serve backend))
+  (constraint-kind (make-tool-call-constraint \"{}\"))
+  => tool-call
+PyTorch: none"
   (%make-constraint 'tool-call call-schema-json #f))
 
 (define (make-gbnf-constraint gbnf)
-  "The reply must be text the GBNF grammar accepts."
+  "A constraint that the reply is text the GBNF grammar GBNF accepts.
+
+Args:
+  gbnf: the grammar, as GBNF text.
+Returns: a constraint.
+Example:
+  (use-modules (sonicboom serve backend))
+  (constraint-kind (make-gbnf-constraint \"root ::= x\"))
+  => gbnf
+PyTorch: none"
   (%make-constraint 'gbnf gbnf #f))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Sampler: the parameters of one request, plus its random state
 
+;; One request's sampling parameters and its random state.
+;;
+;; The fields are temperature, top-p, top-k, seed, greedy?, random-state,
+;; presence-penalty and frequency-penalty, with an accessor named after each.
+;; make-sampler creates one; sample-from-logits draws with it.
+;;
+;; Example:
+;;   (use-modules (sonicboom serve backend))
+;;   (sampler-greedy? (make-sampler #:temperature 0))
+;;   => #t
+;; PyTorch: none
 (define-record-type <sampler>
   (%make-sampler temperature top-p top-k seed greedy? random-state
                  presence-penalty frequency-penalty)
@@ -314,6 +733,25 @@ CALL-SCHEMA-JSON."
 (define* (make-sampler #:key (temperature 1.0) (top-p 1.0) (top-k 0)
                        (seed #f) (greedy? #f)
                        (presence-penalty 0.0) (frequency-penalty 0.0))
+  "Create a sampler.
+
+A temperature of 0 means greedy, as in the OpenAI API; top-k 0 means no top-k
+limit. Without a seed the random state is seeded from the clock.
+
+Args:
+  temperature: keyword; the sampling temperature (default 1.0).
+  top-p: keyword; the nucleus mass to keep (default 1.0).
+  top-k: keyword; how many candidates to keep, 0 for all (default 0).
+  seed: keyword; the random seed, or #f for one from the clock (default #f).
+  greedy?: keyword; force greedy decoding (default #f).
+  presence-penalty: keyword; the presence penalty (default 0.0).
+  frequency-penalty: keyword; the frequency penalty (default 0.0).
+Returns: a sampler.
+Example:
+  (use-modules (sonicboom serve backend))
+  (sampler-greedy? (make-sampler #:temperature 0))
+  => #t
+PyTorch: none"
   (%make-sampler temperature top-p top-k seed
                  (or greedy? (<= temperature 0))
                  (seed->random-state
@@ -325,6 +763,24 @@ CALL-SCHEMA-JSON."
 ;; logits: list of (token . logit). constraint: #f or a token filter.
 ;; Order: constraint, then greedy, else temperature, top-k, top-p, draw.
 (define (sample-from-logits sampler logits constraint)
+  "Draw one token from LOGITS with SAMPLER.
+
+LOGITS is a list of (token . logit). The constraint is applied first, then a
+greedy sampler takes the highest logit; otherwise the candidates are ordered by
+logit, limited by top-k, reweighted by temperature and cut to the top-p mass
+before one is drawn from the random state.
+
+Args:
+  sampler: a sampler.
+  logits: a list of (token . logit).
+  constraint: #f, a constraint, or a procedure (token-ids) -> the allowed ids.
+Returns: a token id.
+Example:
+  (use-modules (sonicboom serve backend))
+  (sample-from-logits (make-sampler #:temperature 0)
+                      '((1 . 0.5) (2 . 2.0)) #f)
+  => 2
+PyTorch: none"
   ;; A grammar constraint carries no host filter: a backend that cannot apply
   ;; grammars samples unconstrained rather than rejecting every token.
   (let ((keep (if (constraint? constraint)
@@ -368,6 +824,17 @@ CALL-SCHEMA-JSON."
 
 ;; Length of the longest common prefix of two token vectors.
 (define (common-prefix-length a b)
+  "The length of the longest common prefix of the token vectors A and B.
+
+Args:
+  a: a token vector.
+  b: a token vector.
+Returns: a non-negative integer.
+Example:
+  (use-modules (sonicboom serve backend))
+  (common-prefix-length '#(1 2 3) '#(1 2 4))
+  => 2
+PyTorch: none"
   (let ((n (min (vector-length a) (vector-length b))))
     (let lp ((i 0))
       (if (and (< i n) (eqv? (vector-ref a i) (vector-ref b i)))
