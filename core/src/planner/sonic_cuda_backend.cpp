@@ -3071,12 +3071,43 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       dump_->write(out_td->name, host.data(), out_bytes, out_td->dtype);
   }
 
+  // One written buffer per node output, in node order: the first is `out`,
+  // then the fused region's second result, then a merged gemv's members. The
+  // planner declares a task output only for a result read outside the task (or
+  // a graph output); a demand-pruned graph — an interior prefill segment, kept
+  // for its cache writes — can leave a multi-result node's extra result with
+  // no reader, and the kernel still writes it. Return only the declared
+  // results, in the task's order, and hand the unread buffers back to the
+  // pool.
+  std::vector<std::pair<uint64_t, uint64_t>> written;
+  written.emplace_back(out_handle, alloc_bytes);
+  if (extra_handle) written.emplace_back(extra_handle, extra_alloc);
+  for (const auto& e : sibling_outs) written.push_back(e);
+
   std::vector<TensorValue> res;
-  res.push_back(TensorValue::from_device(out_handle, out_bytes));
-  if (extra_handle)
-    res.push_back(TensorValue::from_device(extra_handle, extra_bytes));
-  for (const auto& e : sibling_outs)
-    res.push_back(TensorValue::from_device(e.first, e.second));
+  for (std::size_t k = 0; k < written.size(); ++k) {
+    const bool declared =
+        k < node->outputs.size() &&
+        std::find(task.outputs.begin(), task.outputs.end(), node->outputs[k]) !=
+            task.outputs.end();
+    if (declared) {
+      const uint64_t logical = k == 0                    ? out_bytes
+                               : k == 1 && extra_handle ? extra_bytes
+                                                        : written[k].second;
+      res.push_back(
+          TensorValue::from_device(written[k].first, logical));
+      continue;
+    }
+    if (k == 0) {
+      // The first buffer is borrowed from a dying input under an in-place
+      // mark; that input's value still owns it.
+      if (!borrowed) device::release(out_handle, alloc_bytes);
+    } else if (k == 1 && extra_handle) {
+      device::release(extra_handle, extra_alloc);
+    } else {
+      device::release(written[k].first, written[k].second);
+    }
+  }
   return res;
 }
 
