@@ -45,7 +45,9 @@ constexpr uint64_t kSplitRowsPerModelRead = 64;
 // keeps the pre-round plan.
 enum class SplitLastMode : uint8_t { Auto, On, Off };
 
-constexpr SplitLastMode kPrefillSplitDefault = SplitLastMode::Auto;
+// Opt-in: the split changes the last prompt position's arithmetic, and on a
+// greedy run that change reaches the token stream (round 9, part B3).
+constexpr SplitLastMode kPrefillSplitDefault = SplitLastMode::Off;
 
 // Trailing blocks whose mixer owns neither a cache nor a state, counted from
 // the end of the stack. A block that writes neither contributes nothing a later

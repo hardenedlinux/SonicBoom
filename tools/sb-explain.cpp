@@ -90,7 +90,7 @@ constexpr Knob kKnobs[] = {
     {"SONICBOOM_ASYNC_PREFETCH", "off", "prefill prefetch markers"},
     {"SONICBOOM_PREFILL_EFFECTS", "on",
      "non-final prefill segments plan for their cache writes only: 0 off"},
-    {"SONICBOOM_PREFILL_SPLIT_LAST", "auto",
+    {"SONICBOOM_PREFILL_SPLIT_LAST", "off",
      "the last prompt row runs as its own segment where whole blocks are "
      "dead: auto|on|off"},
 };
