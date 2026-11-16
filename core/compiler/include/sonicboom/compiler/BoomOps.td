@@ -98,7 +98,7 @@ def Boom_GraphOp : Op<Boom_Dialect, "graph",
     // size; it never exceeds it.
     I64Attr:$dynamic_extent,
 
-    // What reads the graph's single output, while that is still a declaration
+    // What reads the graph's output(s), while that is still a declaration
     // rather than nodes (BoomDemand.h, docs/boom-ir.md "Consumers"). Present on
     // a graph as its emitter wrote it; the consumer resolution replaces it with
     // the nodes it implies, so a graph that reaches the lowering carries
@@ -107,7 +107,11 @@ def Boom_GraphOp : Op<Boom_Dialect, "graph",
     //   "precap_logits" the same, the consumer applying the trailing monotone
     //                   map (the logit softcap) itself;
     //   "argmax"        the index of the largest element, reduced in the graph;
-    //   "sample_select" the best candidates, selected in the graph.
+    //   "sample_select" the best candidates, selected in the graph;
+    //   "effects"       nothing reads an output: the graph runs for what it
+    //                   writes (its KV appends and state scans). It may have
+    //                   any number of outputs, including none, and takes no
+    //                   consumer_list.
     OptionalAttr<StrAttr>:$consumer,
     // The consumer reads only a runtime list of at most this many indices
     // along the output's innermost dimension (a grammar's allowed set).

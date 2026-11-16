@@ -91,7 +91,7 @@ bool isBoomTypedAttrName(llvm::StringRef name) {
 
 bool isBoomConsumerName(llvm::StringRef name) {
   return name == "logits" || name == "precap_logits" || name == "argmax" ||
-         name == "sample_select";
+         name == "sample_select" || name == "effects";
 }
 
 llvm::SmallVector<NamedAttribute> typedNodeAttributes(Operation *op) {
@@ -300,7 +300,9 @@ mlir::LogicalResult GraphOp::verify() {
     if (!isBoomConsumerName(*consumer))
       return emitOpError() << "graph '" << graphName << "': consumer '"
                            << *consumer << "' is not a known consumer kind";
-    if (getOutputs().size() != 1)
+    // An effects-only graph has no reader at all, so it may keep any number of
+    // outputs (including none). Every other consumer reads exactly one.
+    if (*consumer != "effects" && getOutputs().size() != 1)
       return emitOpError() << "graph '" << graphName
                            << "': a consumer reads exactly one output, the "
                               "graph has "

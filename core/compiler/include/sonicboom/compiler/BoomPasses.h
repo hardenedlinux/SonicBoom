@@ -82,6 +82,12 @@ bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase,
 // alone, so every caller may run it. False, with a diagnostic, on failure.
 bool resolveConsumer(mlir::ModuleOp module);
 
+// Declare `consumer` on the module's one boom.graph op, for a caller that
+// knows the reader. Fails, with a diagnostic, when the graph already declares
+// a consumer or the module does not hold exactly one boom.graph. Nothing else
+// changes: the declaration is resolved by resolveConsumer like any other.
+bool declareGraphConsumer(mlir::ModuleOp module, llvm::StringRef consumer);
+
 // The second half, after the phase's passes: append the candidate selection of
 // a "sample_select" consumer to the finished graph and drop the declaration.
 // The selection reads the logits buffer the passes laid out; it is added last

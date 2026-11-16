@@ -3738,6 +3738,33 @@ llvm::SmallVector<mlir::Operation *> collectUnits(mlir::ModuleOp module) {
 
 } // namespace
 
+bool declareGraphConsumer(mlir::ModuleOp module, llvm::StringRef consumer) {
+  boom::GraphOp graph;
+  for (boom::GraphOp candidate : module.getOps<boom::GraphOp>()) {
+    if (graph) {
+      module.emitError() << "the module holds more than one boom.graph op";
+      return false;
+    }
+    graph = candidate;
+  }
+  if (!graph) {
+    module.emitError() << "the module holds no boom.graph op";
+    return false;
+  }
+  if (!boom::isBoomConsumerName(consumer)) {
+    graph.emitOpError() << "consumer '" << consumer
+                        << "' is not a known consumer kind";
+    return false;
+  }
+  if (auto declared = graph.getConsumer()) {
+    graph.emitOpError() << "already declares the consumer '" << *declared
+                        << "'";
+    return false;
+  }
+  graph.setConsumerAttr(mlir::StringAttr::get(module.getContext(), consumer));
+  return true;
+}
+
 bool resolveConsumer(mlir::ModuleOp module) {
   DisabledPasses off;
   if (!parseDisabledPasses(off)) off = DisabledPasses{};
@@ -3769,6 +3796,21 @@ bool resolveConsumer(mlir::ModuleOp module) {
     }
     resolved = true;
 
+    // An effects-only graph is run for what it writes, not for what it
+    // returns. Its outputs are cleared before the demand analysis, so the only
+    // observers left are the nodes their effects keep (KV appends, state
+    // scans, markers); whatever nothing reads is then pruned below.
+    const bool effects = consumer == "effects";
+    if (effects) {
+      GraphEditor view(u);
+      const llvm::SmallVector<int64_t> outputs(view.unit().outputs().begin(),
+                                               view.unit().outputs().end());
+      for (int64_t id : outputs)
+        view.setTensorOutput(id, false);
+      view.unit().setOutputs({});
+      view.commitTable();
+    }
+
     const DemandFacts facts = analyzeDemand(op);
     if (!facts.ok) {
       op->emitOpError() << "the demand analysis did not converge";
@@ -3795,7 +3837,11 @@ bool resolveConsumer(mlir::ModuleOp module) {
     }
 
     if (auto graph = llvm::dyn_cast<boom::GraphOp>(op)) {
-      if (consumer == "argmax") {
+      if (effects) {
+        // Nothing is appended for a graph run for its effects: the writes the
+        // demand analysis found are the graph.
+        clearConsumer(graph);
+      } else if (consumer == "argmax") {
         if (!appendConsumerNode(u, planner::OpKind::Argmax, "argmax", listed))
           return false;
         clearConsumer(graph);
