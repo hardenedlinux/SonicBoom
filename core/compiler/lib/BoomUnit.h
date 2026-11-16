@@ -43,6 +43,7 @@
 #include "mlir/IR/Location.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 namespace sonicboom::compiler::unit {
 
@@ -51,6 +52,24 @@ inline bool isNode(mlir::Operation *op) {
   return op->getName().getDialectNamespace() == "boom" &&
          op->getAttrOfType<mlir::IntegerAttr>("node_id") &&
          op->getAttrOfType<mlir::DenseI64ArrayAttr>("result_ids");
+}
+
+// Whether a node whose results nothing reads may be removed: it has no effect
+// other than reads. A node with no effect at all qualifies. So does one that
+// declares only `MemoryEffects::Read` (a flash attention reads the cache it
+// attends over). A node that implements no effect interface at all does not:
+// its effects are unknown, and an unknown effect is an observer's.
+inline bool removableWhenUnread(mlir::Operation *op) {
+  if (mlir::isMemoryEffectFree(op))
+    return true;
+  auto iface = llvm::dyn_cast<mlir::MemoryEffectOpInterface>(op);
+  if (!iface)
+    return false;
+  llvm::SmallVector<mlir::MemoryEffects::EffectInstance> effects;
+  iface.getEffects(effects);
+  return llvm::all_of(effects, [](const mlir::MemoryEffects::EffectInstance &e) {
+    return llvm::isa<mlir::MemoryEffects::Read>(e.getEffect());
+  });
 }
 
 // The tensor table of a unit op; null for any other op.

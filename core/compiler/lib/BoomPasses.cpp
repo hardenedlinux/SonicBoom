@@ -3566,7 +3566,7 @@ unsigned pruneByDemand(GraphEditor &view, const DemandFacts &facts) {
     nodes.push_back(&node);
   const llvm::ArrayRef<int64_t> outputs = view.unit().outputs();
   for (mlir::Operation *node : llvm::reverse(nodes)) {
-    if (!mlir::isMemoryEffectFree(node) || !node->use_empty())
+    if (!unit::removableWhenUnread(node) || !node->use_empty())
       continue;
     bool dead = node->getNumResults() > 0;
     for (mlir::Value result : node->getResults())

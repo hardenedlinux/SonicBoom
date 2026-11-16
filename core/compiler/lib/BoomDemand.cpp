@@ -386,8 +386,10 @@ private:
     // A node that does not declare itself effect-free (a KV append, a
     // recurrent state scan, a prefetch marker, an optimizer step) is kept
     // whatever reads its results, and reads all of every value operand; a
-    // handle operand names state, not a tensor, and has no demand.
-    if (!mlir::isMemoryEffectFree(node)) {
+    // handle operand names state, not a tensor, and has no demand. One that
+    // only reads state is not an observer: when nothing reads its results it
+    // goes, and its operands are not demanded.
+    if (!unit::removableWhenUnread(node)) {
       for (auto [index, operand] : llvm::enumerate(operands))
         if (!boom::isBoomHandleType(node->getOperand(index).getType()))
           demandWhole(operand);
@@ -456,6 +458,26 @@ private:
         demand(operand,
                Demand::whole(rankOf(node->getOperand(unsigned(index))),
                              Observation::Order));
+      return;
+    }
+
+    if (single && name == "boom.flash_attention") {
+      // Operand 0 (q) is read on the result's rows; k, v and the start
+      // position are read whole. The trailing operand is the cache handle
+      // (Boom_KvRead), which names state, not a tensor, and has no demand.
+      for (auto [index, operand] : llvm::enumerate(operands)) {
+        mlir::Type type = node->getOperand(unsigned(index)).getType();
+        if (boom::isBoomHandleType(type))
+          continue;
+        const unsigned rank = rankOf(type);
+        if (index == 0 && rank >= 1) {
+          Demand in = Demand::whole(rank);
+          in.dims[0] = dimAt(out, 0);
+          demand(operand, in);
+        } else {
+          demandWhole(operand);
+        }
+      }
       return;
     }
 

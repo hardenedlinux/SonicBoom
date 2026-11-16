@@ -449,7 +449,7 @@ def Boom_RmsNormOp : Boom_Op<"rms_norm",
     "RMS normalization",
     [NoMemoryEffect, Boom_RowIndependent]>;
 def Boom_RmsNormHeadsOp : Boom_Op<"rms_norm_heads",
-    "per-head RMS normalization, in place">;
+    "per-head RMS normalization, in place", [NoMemoryEffect]>;
 def Boom_GeluFp16Op : Boom_Op<"gelu_fp16",
     "fp16 GELU activation",
     [NoMemoryEffect, Boom_Elementwise, Boom_RowIndependent]>;
@@ -473,7 +473,7 @@ def Boom_MoeRouteOp : Boom_Op<"moe_route",
 // (slot/slot_up/slot_down), experts, used and activation ride on node_attrs.
 // The weights it reads are chosen by the ids operand.
 def Boom_MoeExpertsOp : Boom_Op<"moe_experts",
-    "routed mixture-of-experts feed-forward">;
+    "routed mixture-of-experts feed-forward", [NoMemoryEffect]>;
 def Boom_RopeOp : Boom_Op<"rope",
     "multi-head NEOX RoPE",
     [NoMemoryEffect, Boom_RowIndependent]>;
@@ -532,7 +532,7 @@ def Boom_SampleSelectOp : Boom_Op<"sample_select",
     "select the best candidate (id, z) pairs from the logits, on the device",
     [NoMemoryEffect]>;
 def Boom_SliceOp : Boom_Op<"slice",
-    "sub-span copy (attrs offset, length, optional stride)">;
+    "sub-span copy (attrs offset, length, optional stride)", [NoMemoryEffect]>;
 def Boom_FlashAttentionOp : Boom_Op<"flash_attention",
     "chunked flash attention over the prior cache plus the current batch",
     [Boom_KvRead]>;
