@@ -144,6 +144,11 @@ LLAMA_BIN=/path/to/llama.cpp/build/bin tools/bench.sh models/qwen2.5-7b-instruct
 LLAMA_BIN=/path/to/llama.cpp/build/bin tools/bench.sh models/qwen2.5-7b-instruct-1m-q4_k_m.gguf --runs 3 --long
 ```
 
+Both `llama-bench` and `llama-server` come from `LLAMA_BIN`; add `--no-llama`
+to measure SonicBoom alone, in which case every llama.cpp cell reads
+`skipped`. The script prints its own command line, the llama.cpp version and
+commit, and the SM clock sampled inside each measurement window.
+
 The first command prints the code-editing rows, and the second the decode and
 prefill rows, for your GPU. The protocol is described in
 [docs/benchmark.md](docs/benchmark.md#code-editing). Post your run in the

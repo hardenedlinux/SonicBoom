@@ -251,9 +251,10 @@ tests).
 ## Reproduce
 
 ```sh
-# canonical table for one model (SonicBoom; set LLAMA_BENCH to add the
-# llama.cpp column and the ratios)
-LLAMA_BENCH=$LLAMA_ROOT/build-cuda/bin/llama-bench \
+# canonical table for one model (SonicBoom; set LLAMA_BIN to add the
+# llama.cpp column and the ratios — llama-bench and llama-server are taken
+# from that directory; --no-llama measures SonicBoom alone)
+LLAMA_BIN=$LLAMA_ROOT/build-cuda/bin \
   tools/bench.sh models/gemma-4-E4B-it-Q5_K_M.gguf
 
 # one metric by hand, e.g. decode at depth 512 (model from SONICBOOM_GEMMA_GGUF)
@@ -265,7 +266,7 @@ $LLAMA_ROOT/build-cuda/bin/llama-bench \
   -m models/gemma-4-E4B-it-Q5_K_M.gguf -p 512 -n 64 -ngl 99 -r 1
 
 # extended-context tiers: decode at depth 4K/8K/16K/32K and prefill 4K–32K
-LLAMA_BENCH=$LLAMA_ROOT/build-cuda/bin/llama-bench \
+LLAMA_BIN=$LLAMA_ROOT/build-cuda/bin \
   tools/bench.sh models/gemma-4-E4B-it-Q5_K_M.gguf --long
 
 # correctness
@@ -292,12 +293,22 @@ LLAMA_BIN="$LLAMA" tools/bench.sh "$MODEL" --runs 3 --spec
 LLAMA_BIN="$LLAMA" tools/bench.sh "$MODEL" --runs 3 --long
 ```
 
+`LLAMA_BIN` names the llama.cpp build directory; `tools/bench.sh` takes both
+`llama-bench` and `llama-server` from it (`LLAMA_BENCH` and `LLAMA_SERVER`
+name the programs individually, and an explicit value wins). Without
+`--no-llama` a missing program stops the run before anything is measured,
+because a comparison table without its reference is not a result. The run
+prints the command line, the environment it started with, the two paths and
+their `--version` lines; when the commit is not `43fe9c642` — the one the
+published ratios are measured against — it warns that the ratios are not
+comparable with the README.
+
 The optional export/import pair checks cross-machine identity of the code-edit
 token streams:
 
 ```sh
-tools/bench.sh "$MODEL" --spec --tune-export qwen7b-tune.tar
-tools/bench.sh "$MODEL" --runs 1 --spec --tune-import qwen7b-tune.tar
+tools/bench.sh "$MODEL" --no-llama --spec --tune-export qwen7b-tune.tar
+tools/bench.sh "$MODEL" --runs 1 --no-llama --spec --tune-import qwen7b-tune.tar
 ```
 
 ## Community runs
@@ -320,9 +331,14 @@ A community submission follows the same protocol as the published numbers:
 - both runtimes on the same GGUF, on the same machine, in the same session;
 - medians of 3 independent process runs (`--runs 3`);
 - one GPU at a time, idle, with no other measurement running;
-- the SM clock either pinned or reported as min/median/max;
+- the SM clock either pinned or reported as min/median/max — `tools/bench.sh`
+  samples it only inside each item's measurement window and prints min, median,
+  max and the sample count per item, plus one summary over all the windows;
 - the hardware, driver, SonicBoom build and llama.cpp commit included with the
-  numbers.
+  numbers — the harness prints the llama.cpp `--version` lines and commit. The
+  published ratios are against commit `43fe9c642`; a run against another commit
+  says so on its own output, and its ratios are not comparable with the
+  README's.
 
 A submission that omits the conditions is reported as a regression check, not
 as a published ratio.
