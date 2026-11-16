@@ -1293,9 +1293,11 @@ static bool plan_cache_enabled() {
   return runtime::feature_enabled(runtime::Feature::PlanCache);
 }
 
-// Cache cap. A symbolic plan serves its whole shape class, so a session needs
-// at most two entries per model (the full-chunk class and the one-token class)
-// no matter how many distinct segment lengths it visits. The cap still bounds
+// Cache cap. A symbolic plan serves its whole shape class, and a class has two
+// variants (the final segment's, whose output is read, and an interior
+// segment's, which runs for its cache writes), so a session needs at most four
+// entries per model (the full-chunk and one-token classes in both variants) no
+// matter how many distinct segment lengths it visits. The cap still bounds
 // entries across models and planner environments; the entry holds the plan and
 // the segment backends, whose device activations come from the global device
 // pool, so the cap bounds host-side planning state rather than VRAM.
@@ -1320,6 +1322,11 @@ struct GreedyProgramDesc {
   // (boom.sample's stochastic attribute).
   bool stochastic = false;
   std::string prefill_graph;
+  // Whether the loop reads the prefill call's result (boom.prefill's result
+  // count). The emitter's prefill call has no results today, so this is always
+  // false: nothing in the loop reads a prefill segment's output, and the
+  // segment loop itself reads only the final segment's last hidden row.
+  bool prefill_has_results = false;
   std::string verify_graph;    // the graph the verify node deals over rows
   int64_t max_rows = 0;        // its row budget (max_drafts + 1)
   std::string draft_strategy;  // "ngram"
@@ -1367,8 +1374,9 @@ struct DecodeRuntime {
   // (decode_steps_spine_cuda does; B3's reference).
   std::shared_ptr<void> prog_cache;
   GreedyProgramDesc program;                          // the lowered loop (§10)
-  // Prefill segments by shape-class sizing extent, most-recently used first,
-  // capped at kMaxCachedSegments.
+  // Prefill segments by shape-class sizing extent and variant
+  // (`extent << 1 | interior`), most-recently used first, capped at
+  // kMaxCachedSegments.
   std::list<std::pair<uint64_t, std::unique_ptr<PrefillSegment>>> prefills;
   // The planner environment `prefills` was built under; a change clears it.
   PlannerEnv prefill_env{};
@@ -1415,6 +1423,19 @@ static bool repro_prefill_enabled() {
   static const bool v = [] {
     const char* e = std::getenv("SONICBOOM_REPRO_PREFILL");
     return e && std::string_view(e) == "decode";
+  }();
+  return v;
+}
+
+// SONICBOOM_PREFILL_EFFECTS=0 plans every prefill segment as a segment whose
+// output is read: each one ends at the residual stream and the final row is
+// taken from whichever segment ran last. Default (unset, any other value): a
+// segment whose output nobody reads declares the "effects" consumer and is
+// planned for its cache writes alone (compiler/BoomPasses.h).
+static bool prefill_effects_enabled() {
+  static const bool v = [] {
+    const char* e = std::getenv("SONICBOOM_PREFILL_EFFECTS");
+    return !(e && std::string_view(e) == "0");
   }();
   return v;
 }
@@ -1476,6 +1497,7 @@ static GreedyProgramDesc read_program(mlir::ModuleOp module) {
     if (auto p = llvm::dyn_cast<boom::PrefillOp>(op)) {
       ++prefills;
       desc.prefill_graph = p.getGraphName().str();
+      desc.prefill_has_results = p->getNumResults() > 0;
     } else if (llvm::isa<boom::StepOp>(op)) {
       ++steps;
     } else if (auto s = llvm::dyn_cast<boom::SampleOp>(op)) {
@@ -6138,6 +6160,16 @@ static uint64_t prefill_decode_cuda_impl(
     // segment; the final (possibly shorter) segment runs uncaptured so its
     // hidden column reaches the host through the executor's output path.
     //
+    // A segment has two variants per shape class. The final one ends at the
+    // residual stream, whose output is read. An interior (non-final) segment's
+    // output is read by nobody — the loop reads the final segment's last
+    // hidden row — so it declares the "effects" consumer and the compiler
+    // keeps only what its cache writes (and recurrent state scans) need. The
+    // two are different graphs, so both the segment cache and the per-call
+    // segment map key on the class extent with the variant in the low bit.
+    const bool effects_segments =
+        prefill_effects_enabled() && !rt->program.prefill_has_results;
+    //
     // The segment build (graph + rewrites + plan + backends) is a pure function
     // of (model, n_ctx, shape class, planner environment) and costs ~115 ms of
     // planning per 512-token Gemma segment, so it is cached across calls in the
@@ -6178,12 +6210,17 @@ static uint64_t prefill_decode_cuda_impl(
     // it outlives the call with the segment that recorded it.
     std::map<uint64_t, std::unique_ptr<PrefillSegment>> call_segments;
     std::map<uint64_t, hal::StepProgram*> progs;
-    auto segment_for = [&](uint64_t nseg) -> PrefillSegment* {
+    // The extent and the variant, in one key: `extent << 1 | interior`.
+    auto segment_key = [](uint64_t extent, bool interior) {
+      return (extent << 1) | (interior ? 1u : 0u);
+    };
+    auto segment_for = [&](uint64_t nseg, bool interior) -> PrefillSegment* {
       const uint64_t extent = plan_extent_for(nseg);
+      const uint64_t key = segment_key(extent, interior);
       if (cache_segments) {
         auto it = std::find_if(
             rt->prefills.begin(), rt->prefills.end(),
-            [extent](const auto& e) { return e.first == extent; });
+            [key](const auto& e) { return e.first == key; });
         if (it != rt->prefills.end()) {
           Phase _h("prefill:segment_cache_hit", phase_timing);
           PrefillSegment* hit = it->second.get();
@@ -6204,6 +6241,15 @@ static uint64_t prefill_decode_cuda_impl(
         Phase _b("prefill:segment_build_graph", phase_timing);
         GraphIr seg_ir = emit_prefill_ir(recipe_for(m), extent,
                                          /*dynamic_extent=*/symbolic_plans);
+        // The interior variant's output is read by nothing: the declaration
+        // lets the compiler keep only the writes (KV appends, state scans).
+        if (interior && (!seg_ir.module ||
+                         !compiler::declareGraphConsumer(*seg_ir.module,
+                                                         "effects"))) {
+          std::cerr << "[prefill-cuda] n=" << nseg
+                    << " graph lowering failed\n";
+          return nullptr;
+        }
         // C.4: fold the mmq activation quantize into the norm/gelu kernels when
         // the mmq tensor-core path is active for this segment (same conditions
         // the batched matmul uses, so fused and unfused positions never disagree
@@ -6261,12 +6307,12 @@ static uint64_t prefill_decode_cuda_impl(
       route_host_tasks(*seg->exec, seg->plan, *seg->cpu);
       PrefillSegment* raw = seg.get();
       if (cache_segments) {
-        rt->prefills.emplace_front(extent, std::move(seg));
+        rt->prefills.emplace_front(key, std::move(seg));
         while (rt->prefills.size() > kMaxCachedSegments) rt->prefills.pop_back();
       } else {
         // Uncached: keep it alive for the rest of the call (a later segment of
         // the same class must reuse it, not rebuild it).
-        call_segments.emplace(extent, std::move(seg));
+        call_segments.emplace(key, std::move(seg));
       }
       return raw;
     };
@@ -6299,7 +6345,11 @@ static uint64_t prefill_decode_cuda_impl(
                           !model_has_recurrent_state(m);
     if (use_graphs && n > chunk && start_pos == 0) {
       Phase _cap("prefill:capture_graph", phase_timing);
-      PrefillSegment* full = segment_for(chunk);
+      // The captured graph is replayed only for non-final segments, which read
+      // no output: it is the interior variant whenever that treatment is on
+      // (and the output-bearing one under SONICBOOM_PREFILL_EFFECTS=0, which
+      // keeps the pre-round plan).
+      PrefillSegment* full = segment_for(chunk, /*interior=*/effects_segments);
       if (full) {
         const std::shared_ptr<void> cache_id = full->cuda->cache_identity();
         if (capture_reuse_enabled() && full->chunk_prog &&
@@ -6380,7 +6430,10 @@ static uint64_t prefill_decode_cuda_impl(
       if (rem != 0 && chunk - rem < nseg)
         nseg = chunk - rem;
       const bool is_final = (off + nseg == n);
-      PrefillSegment* seg = segment_for(nseg);
+      // Nothing reads a non-final segment's output; the effects treatment
+      // plans it for its cache writes. The final segment always produces the
+      // hidden row the lm_head tail reads.
+      PrefillSegment* seg = segment_for(nseg, effects_segments && !is_final);
       if (!seg)
         return 0;
 
@@ -6422,13 +6475,13 @@ static uint64_t prefill_decode_cuda_impl(
                   << res.error().message << "\n";
         return 0;
       }
-      if (res->outputs.empty()) {
-        std::cerr << "[prefill-cuda] segment off=" << off << " no outputs\n";
-        return 0;
-      }
-
       if (is_final) {
         // Final segment: its last hidden column is the prompt's final state.
+        // Only this variant has an output to read.
+        if (res->outputs.empty()) {
+          std::cerr << "[prefill-cuda] segment off=" << off << " no outputs\n";
+          return 0;
+        }
         const sx::Bytes& hidden_b = res->outputs[0];
         if (hidden_b.size() < uint64_t(d) * nseg * sizeof(float)) {
           std::cerr << "[prefill-cuda] n=" << n << " hidden too small: "
