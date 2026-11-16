@@ -37,6 +37,7 @@
 #include <sonicboom/sx/exec.h>
 
 #include "emit.h"  // the recipe emitters
+#include "prefill_split.h"  // the final-segment split policy
 #include "../planner/autotune.h"        // B7 draft-length cost cache
 #include "../planner/decision_registry.h"  // the plan-cache decision fingerprint
 #include "../planner/device_pool.h"      // the sampled state's device logits buffer
@@ -1436,6 +1437,21 @@ static bool prefill_effects_enabled() {
   static const bool v = [] {
     const char* e = std::getenv("SONICBOOM_PREFILL_EFFECTS");
     return !(e && std::string_view(e) == "0");
+  }();
+  return v;
+}
+
+// SONICBOOM_PREFILL_SPLIT_LAST = auto | on | off (see prefill_split.h for the
+// policy). `auto` applies the static rule, `on` always splits a final segment
+// of two or more rows and `off` keeps the pre-round plan.
+static detail::SplitLastMode prefill_split_last_mode() {
+  static const detail::SplitLastMode v = [] {
+    const char* e = std::getenv("SONICBOOM_PREFILL_SPLIT_LAST");
+    if (!e) return detail::kPrefillSplitDefault;
+    const std::string_view s(e);
+    if (s == "on") return detail::SplitLastMode::On;
+    if (s == "off") return detail::SplitLastMode::Off;
+    return detail::kPrefillSplitDefault;  // "auto", or an unrecognized value
   }();
   return v;
 }
@@ -6429,6 +6445,15 @@ static uint64_t prefill_decode_cuda_impl(
       const uint64_t rem = pos % chunk;
       if (rem != 0 && chunk - rem < nseg)
         nseg = chunk - rem;
+      // A split final segment runs its `nseg - 1` interior rows now; the next
+      // iteration runs the one row whose hidden state reaches lm_head. The
+      // rows made interior pay off by planning away the trailing blocks that
+      // own no cache or state (split_last_row); the split is only taken while
+      // the effects treatment is on.
+      if (off + nseg == n && effects_segments && nseg > 1 &&
+          detail::split_last_row(recipe_for(m), nseg,
+                                 prefill_split_last_mode()))
+        nseg -= 1;
       const bool is_final = (off + nseg == n);
       // Nothing reads a non-final segment's output; the effects treatment
       // plans it for its cache writes. The final segment always produces the
