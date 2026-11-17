@@ -14,6 +14,7 @@
 ;;; Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
 
 (use-modules (ice-9 textual-ports)
+             (ice-9 binary-ports)
              (ice-9 format)
              (ice-9 regex)
              (ice-9 ftw)
@@ -58,6 +59,14 @@
 
 (define (copy-file source target)
   (write-file target (read-file source)))
+
+;; Images go byte for byte: read as text, they would be decoded and re-encoded
+;; in the locale's encoding.
+(define (copy-binary-file source target)
+  (let ((bytes (call-with-input-file source get-bytevector-all #:binary #t)))
+    (call-with-output-file target
+      (lambda (port) (put-bytevector port bytes))
+      #:binary #t)))
 
 (define temp-file-counter 0)
 
@@ -750,7 +759,11 @@
               (let ((source (string-append tools-directory "/" name)))
                 (when (file-exists? source)
                   (copy-file source (string-append site "/" name)))))
-            '("search.js" "pytorch.js")))
+            '("search.js" "pytorch.js"))
+  (for-each (lambda (name)
+              (copy-binary-file (string-append tools-directory "/" name)
+                                (string-append site "/" name)))
+            '("favicon.ico" "favicon.svg" "apple-touch-icon.png")))
 
 (define (build-site out)
   (ensure-directory out)
