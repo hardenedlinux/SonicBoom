@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
+#
+# community-bench.sh — the community run in one command, one log.
+#
+# A community submission is the four steps in README, "Reproduce the table":
+# the hardware/build record, the llama.cpp commit, the code-editing comparison
+# and the extended-context tiers. Run by hand they leave four separate terminal
+# outputs; this script runs the same commands in order, writes every line of
+# stdout and stderr to one log as it goes, and shows it on the terminal too.
+#
+# It does no measurement of its own: each step is the command from the README,
+# unchanged, and any failure stops the run with a non-zero status.
+#
+# Usage: tools/community-bench.sh <model.gguf> <llama.cpp/build/bin>
+#                                 [--runs N] [--no-llama] [--out FILE]
+#        <llama.cpp/build/bin> may be omitted with --no-llama.
+#        --runs N   independent process runs per metric (default 3).
+#        --no-llama measure SonicBoom alone: skip the llama.cpp commit and pass
+#                   --no-llama to bench.sh (every llama.cpp cell reads skipped).
+#        --out FILE write the log here (default sonicboom-bench-<datetime>.log).
+# Env:   CUDA_VISIBLE_DEVICES defaults to 0, as in the README block.
+#
+# The server streaming rows the README quotes have no reproducible command in
+# this tree, so there is no --serve step; a run that needs those numbers has to
+# record its own server command alongside them.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RUNS=3
+NO_LLAMA=0
+GGUF=""
+LLAMA=""
+OUT=""
+
+usage() {
+  sed -n '/^# Usage:/,/^#$/p' "$0" | sed 's/^# \{0,1\}//'
+  exit 2
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --runs) RUNS="${2:-}"; shift 2 ;;
+    --no-llama) NO_LLAMA=1; shift ;;
+    --out) OUT="${2:-}"; shift 2 ;;
+    --serve)
+      echo "community-bench: --serve is not available: the README's server" >&2
+      echo "  streaming rows have no reproducible command in this tree." >&2
+      exit 2 ;;
+    -h|--help) usage ;;
+    -*) echo "community-bench: unknown option $1" >&2; usage ;;
+    *)
+      if [ -z "$GGUF" ]; then GGUF="$1"
+      elif [ -z "$LLAMA" ]; then LLAMA="$1"
+      else echo "community-bench: unexpected argument $1" >&2; usage
+      fi
+      shift ;;
+  esac
+done
+
+case "$RUNS" in
+  ''|*[!0-9]*) echo "community-bench: --runs must be a positive integer" >&2
+               exit 2 ;;
+esac
+[ "$RUNS" -ge 1 ] || { echo "community-bench: --runs must be >= 1" >&2; exit 2; }
+[ -n "$GGUF" ] || usage
+[ -f "$GGUF" ] || { echo "community-bench: model not found: $GGUF" >&2; exit 2; }
+GGUF="$(readlink -f "$GGUF")"
+
+# Fail before any measurement: a run with llama.cpp needs a build directory
+# with the two programs bench.sh calls.
+if [ "$NO_LLAMA" = 0 ]; then
+  [ -n "$LLAMA" ] || usage
+  [ -d "$LLAMA" ] || { echo "community-bench: not a directory: $LLAMA" >&2; exit 2; }
+  LLAMA="$(readlink -f "$LLAMA")"
+  for prog in llama-bench llama-server; do
+    [ -x "$LLAMA/$prog" ] ||
+      { echo "community-bench: $LLAMA/$prog is missing or not executable" >&2
+        exit 2; }
+  done
+elif [ -n "$LLAMA" ]; then
+  [ -d "$LLAMA" ] ||
+    { echo "community-bench: not a directory: $LLAMA" >&2; exit 2; }
+fi
+
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES
+
+if [ -z "$OUT" ]; then
+  OUT="sonicboom-bench-$(date +%Y%m%d-%H%M%S).log"
+fi
+case "$OUT" in
+  /*) ;;
+  *) OUT="$PWD/$OUT" ;;
+esac
+
+# One log, in order, on the terminal at the same time.
+exec > >(tee "$OUT") 2>&1
+
+step() { # TITLE
+  echo
+  echo "== $1"
+  echo
+}
+
+step "1/4 hardware and build record"
+echo "model:  $GGUF"
+echo "runs:   $RUNS"
+echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+if ! "$ROOT/tools/sb-report.sh" --model "$GGUF" --no-bench; then
+  echo
+  echo "community-bench: step 1 failed; the log is $OUT" >&2
+  exit 1
+fi
+
+if [ "$NO_LLAMA" = 0 ]; then
+  step "2/4 llama.cpp commit"
+  COMMIT="$(git -C "$LLAMA" rev-parse --short HEAD 2>/dev/null || true)"
+  echo "llama.cpp: $LLAMA"
+  echo "commit:    ${COMMIT:-unknown}"
+else
+  step "2/4 llama.cpp commit (skipped: --no-llama)"
+fi
+
+LLAMA_ARGS=()
+[ "$NO_LLAMA" = 1 ] && LLAMA_ARGS+=(--no-llama)
+
+step "3/4 code-editing comparison"
+if ! LLAMA_BIN="$LLAMA" "$ROOT/tools/bench.sh" "$GGUF" --runs "$RUNS" --spec \
+     "${LLAMA_ARGS[@]}"; then
+  echo
+  echo "community-bench: step 3 failed; the log is $OUT" >&2
+  exit 1
+fi
+
+step "4/4 extended-context tiers"
+if ! LLAMA_BIN="$LLAMA" "$ROOT/tools/bench.sh" "$GGUF" --runs "$RUNS" --long \
+     "${LLAMA_ARGS[@]}"; then
+  echo
+  echo "community-bench: step 4 failed; the log is $OUT" >&2
+  exit 1
+fi
+
+echo
+echo "== done"
+echo
+echo "log: $OUT"
+echo
+echo "Paste this file into the community benchmark issue."

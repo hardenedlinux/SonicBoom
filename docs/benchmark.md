@@ -319,6 +319,17 @@ standard run — hardware/build record, canonical bench, extended-context tiers,
 clock pinning and what to send — is
 [README: Reproduce the table](../README.md#reproduce-the-table).
 
+One command runs those four steps in order and writes every line of their
+output to one log:
+
+```sh
+tools/community-bench.sh <model.gguf> <llama.cpp/build/bin> [--runs N] [--no-llama]
+```
+
+It calls the existing scripts unchanged and does no measurement of its own; a
+step that fails stops the run. The manual steps are listed in the README
+section above, and its log is what a submission is made from.
+
 Earlier per-release results threads:
 
 - 0.0.3: [#1](https://github.com/hardenedlinux/SonicBoom/issues/1),

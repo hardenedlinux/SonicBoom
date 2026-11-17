@@ -140,8 +140,22 @@ conversations at once.
 ### Reproduce the table
 
 ```sh
-LLAMA_BIN=/path/to/llama.cpp/build/bin tools/bench.sh models/qwen2.5-7b-instruct-1m-q4_k_m.gguf --runs 3 --spec
-LLAMA_BIN=/path/to/llama.cpp/build/bin tools/bench.sh models/qwen2.5-7b-instruct-1m-q4_k_m.gguf --runs 3 --long
+tools/community-bench.sh models/qwen2.5-7b-instruct-1m-q4_k_m.gguf \
+  /path/to/llama.cpp/build/bin
+```
+
+This runs the four steps below in order, writes every line of their output to
+one log, `sonicboom-bench-<datetime>.log`, and prints the path at the end.
+Run the same steps by hand to see or adjust them:
+
+```sh
+export CUDA_VISIBLE_DEVICES=0
+MODEL=models/qwen2.5-7b-instruct-1m-q4_k_m.gguf
+LLAMA=/path/to/llama.cpp/build/bin
+tools/sb-report.sh --model "$MODEL" --no-bench
+git -C "$LLAMA" rev-parse --short HEAD
+LLAMA_BIN="$LLAMA" tools/bench.sh "$MODEL" --runs 3 --spec
+LLAMA_BIN="$LLAMA" tools/bench.sh "$MODEL" --runs 3 --long
 ```
 
 Both `llama-bench` and `llama-server` come from `LLAMA_BIN`; add `--no-llama`
@@ -149,8 +163,8 @@ to measure SonicBoom alone, in which case every llama.cpp cell reads
 `skipped`. The script prints its own command line, the llama.cpp version and
 commit, and the SM clock sampled inside each measurement window.
 
-The first command prints the code-editing rows, and the second the decode and
-prefill rows, for your GPU. The protocol is described in
+The `--spec` run prints the code-editing rows, and the `--long` run the decode
+and prefill rows, for your GPU. The protocol is described in
 [docs/benchmark.md](docs/benchmark.md#code-editing). Post your run in the
 [v0.0.6 results issue]({{ISSUE_URL}}); earlier runs are in issues
 [#1](https://github.com/hardenedlinux/SonicBoom/issues/1),
