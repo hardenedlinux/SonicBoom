@@ -2016,6 +2016,17 @@ static void spec_apply_refined_costs(
 // structurally invalid record (unit error, corrupt) is discarded instead of
 // priced, while a noisy dip inside an otherwise plausible record is projected
 // onto the monotone cone instead of discarding the whole measurement.
+// Opt-in: measure the draft-length prices inside the generation call when the
+// stored curve is missing. Off by default, so a call's stream carries no
+// measurement rounds.
+static bool spec_warm_in_call() {
+  static const bool v = [] {
+    const char* e = std::getenv("SONICBOOM_SPEC_WARM_IN_CALL");
+    return e && std::string_view(e) == "1";
+  }();
+  return v;
+}
+
 static void spec_policy_init(const Gemma4Model& m, uint64_t n_ctx,
                              SpecLengthPolicy& p) {
   if (!tune::enabled()) return;
@@ -2033,9 +2044,11 @@ static void spec_policy_init(const Gemma4Model& m, uint64_t n_ctx,
   }
   if (!complete || !spec_cost_record_valid(read)) {
     // Incomplete (a run ended before the warm-up finished) or structurally
-    // invalid: measure. A stale v1 record is never looked up at all: its key
-    // does not match v2's.
-    p.warm_next = 0;
+    // invalid: the load-time warm-up prices the curve. The in-call
+    // measurement is opt-in (SONICBOOM_SPEC_WARM_IN_CALL=1); without a priced
+    // curve the call runs at the fixed cap (spec_choose_budget). A stale v1
+    // record is never looked up at all: its key does not match v2's.
+    if (spec_warm_in_call()) p.warm_next = 0;
     return;
   }
   p.cost_us = read;

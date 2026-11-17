@@ -99,6 +99,7 @@ The decision root is `$SONICBOOM_TUNE_DIR`, else
 | spec mode / probe | `SONICBOOM_SPEC=off\|on\|auto\|reckless`, `SONICBOOM_SPEC_PROBE_MS` |
 | spec drafter | `SONICBOOM_SPEC_DRAFTER=legacy` (original 2..4-gram); unset = long-match n-gram |
 | spec draft budget | `SONICBOOM_SPEC_MAX_DRAFTS=0..63` (ceiling; a fixed "on" defaults to 15, a policy-driven mode reaches the envelope) |
+| spec draft-length warm-up | `SONICBOOM_SPEC_WARM_IN_CALL=1` measures the draft-length prices inside the generation call when the stored curve is missing (default: the load-time warm-up prices it; until it has, the call runs at the fixed cap) |
 | the T0b algorithm switches | each keeps its documented variable (table in `decisions.cpp`) |
 | attention class (any op) | `SONICBOOM_ATTN_CLASS=<class>`; `SONICBOOM_DIT_ATTN` is kept as its alias |
 | prefill segment treatment | `SONICBOOM_PREFILL_EFFECTS=0` plans every segment's output as read (default: a non-final segment declares the effects consumer and is planned for its cache writes only) |
