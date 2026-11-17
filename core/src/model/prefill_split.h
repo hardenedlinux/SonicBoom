@@ -49,9 +49,11 @@ constexpr uint64_t kSplitRowsPerModelRead = 64;
 // and `off` keeps the pre-round plan.
 enum class SplitLastMode : uint8_t { Auto, On, Off };
 
-// Opt-in: the split changes the last prompt position's arithmetic, and on a
-// greedy run that change reaches the token stream (round 9, part B3).
-constexpr SplitLastMode kPrefillSplitDefault = SplitLastMode::Off;
+// On by default: both parts of the split stay in the batched class, so every
+// row is computed by the same kernels as in the unsplit segment. The Gemma
+// gate (round 10, part B3) compares eight prompt lengths, 200 to 6000, and the
+// first-token logits and 64 greedy tokens are bitwise identical either way.
+constexpr SplitLastMode kPrefillSplitDefault = SplitLastMode::Auto;
 
 // Trailing blocks whose mixer owns neither a cache nor a state, counted from
 // the end of the stack. A block that writes neither contributes nothing a later

@@ -90,7 +90,7 @@ constexpr Knob kKnobs[] = {
     {"SONICBOOM_ASYNC_PREFETCH", "off", "prefill prefetch markers"},
     {"SONICBOOM_PREFILL_EFFECTS", "on",
      "non-final prefill segments plan for their cache writes only: 0 off"},
-    {"SONICBOOM_PREFILL_SPLIT_LAST", "off",
+    {"SONICBOOM_PREFILL_SPLIT_LAST", "auto",
      "the last rows of a prompt run as their own segment, the smallest the "
      "batched kernels take, where whole blocks are dead: auto|on|off"},
 };

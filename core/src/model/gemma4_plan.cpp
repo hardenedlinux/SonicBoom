@@ -1442,8 +1442,9 @@ static bool prefill_effects_enabled() {
 }
 
 // SONICBOOM_PREFILL_SPLIT_LAST = auto | on | off (see prefill_split.h for the
-// policy). `auto` applies the static rule, `on` always splits a final segment
-// of two or more rows and `off` keeps the pre-round plan.
+// policy). `auto` applies the static rule, `on` splits a final segment of at
+// least two batched segments regardless of the block count and `off` keeps the
+// pre-round plan.
 static detail::SplitLastMode prefill_split_last_mode() {
   static const detail::SplitLastMode v = [] {
     const char* e = std::getenv("SONICBOOM_PREFILL_SPLIT_LAST");
