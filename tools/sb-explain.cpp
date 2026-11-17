@@ -87,9 +87,6 @@ constexpr Knob kKnobs[] = {
     {"SONICBOOM_DENSE_GEMM", "on", "SonicBoom dense GEMM"},
     {"SONICBOOM_GEMV_COOP_MIN_BPR", "20", "cooperative gemv blocks-per-row floor"},
     {"SONICBOOM_SPEC", "probe (auto)", "speculative decoding: off|on|auto"},
-    {"SONICBOOM_SPEC_WARM_IN_CALL", "off",
-     "a call that starts without a priced draft-length curve measures it in "
-     "its stream: 1 on"},
     {"SONICBOOM_ASYNC_PREFETCH", "off", "prefill prefetch markers"},
     {"SONICBOOM_PREFILL_EFFECTS", "on",
      "non-final prefill segments plan for their cache writes only: 0 off"},
