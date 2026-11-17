@@ -1886,6 +1886,7 @@ Tuned tune_class(const Call& c, const Fingerprints& fp) {
 //   bypassed          the lookup was skipped (autotune=force, forced candidate)
 //   disabled          autotuning is off
 Tuned resolve_class(const Call& c, const Fingerprints& fp) {
+  ::sonicboom::planner::RecordPause record_pause;
   const Dev& d = device();
   const std::string& cls = fp.key;
   const Autotune mode = autotune_mode();

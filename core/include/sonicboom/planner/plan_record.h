@@ -203,6 +203,22 @@ inline PlanRecorder* recorder() noexcept {
 // asking for a record does not also have to set an environment variable.
 void set_thread_recorder(PlanRecorder* rec) noexcept;
 
+// Suspends this thread's recording for a scope. Launches made while a
+// tuner measures candidates are not part of what the plan did.
+class RecordPause {
+ public:
+  RecordPause() noexcept : saved_(recorder()) {
+    if (saved_) set_thread_recorder(nullptr);
+  }
+  ~RecordPause() {
+    if (saved_) set_thread_recorder(saved_);
+  }
+  RecordPause(const RecordPause&) = delete;
+  RecordPause& operator=(const RecordPause&) = delete;
+ private:
+  PlanRecorder* saved_;
+};
+
 // Deterministic text serialization. Stable ordering, no pointers or addresses.
 std::string serialize_plan_run(const PlanRunRecord& run);
 
