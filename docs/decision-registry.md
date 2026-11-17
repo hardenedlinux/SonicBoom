@@ -102,7 +102,7 @@ The decision root is `$SONICBOOM_TUNE_DIR`, else
 | the T0b algorithm switches | each keeps its documented variable (table in `decisions.cpp`) |
 | attention class (any op) | `SONICBOOM_ATTN_CLASS=<class>`; `SONICBOOM_DIT_ATTN` is kept as its alias |
 | prefill segment treatment | `SONICBOOM_PREFILL_EFFECTS=0` plans every segment's output as read (default: a non-final segment declares the effects consumer and is planned for its cache writes only) |
-| final-segment split | `SONICBOOM_PREFILL_SPLIT_LAST=auto\|on\|off` splits a final segment into `rows - 1` interior rows and a one-row final segment where trailing blocks own no cache or state (default `off`, the pre-round plan; `auto` applies the static rule) |
+| final-segment split | `SONICBOOM_PREFILL_SPLIT_LAST=auto\|on\|off` splits a final segment into interior rows and a final segment of the smallest batched size (`mmq_min_n` rows) where trailing blocks own no cache or state (default `off`, the pre-round plan; `auto` applies the static rule) |
 
 ## Canonical numerics
 

@@ -7,13 +7,13 @@ same: the SonicBoom version, the machine and its GPU, and the warm-up table.
 
 - Greedy decoding, and sampling with the same seed and settings.
 - Speculative decoding on or off: the token sequences are bit-identical.
-- Prefill segmentation: a prompt's last row may run as its own segment
-  (`SONICBOOM_PREFILL_SPLIT_LAST`, opt-in; the default is off). The split
-  changes which kernel class
-  computes the last prompt position, so a split run and an unsplit one may
-  differ in the last digits of that position's logits. The split is a static
-  function of the model and the prompt length, so with the same version, the
-  same machine and the same input the output is still the same every run.
+- Prefill segmentation: the last rows of a prompt may run as their own
+  segment (`SONICBOOM_PREFILL_SPLIT_LAST`, opt-in; the default is off). The
+  rows held back are the smallest segment the batched kernels take, so every
+  prompt row is computed by the same kernels as in the unsplit segment. The
+  split is a static function of the model and the prompt length, so with the
+  same version, the same machine and the same input the output is still the
+  same every run.
 - Continuing a session, as described under [Continuing a session](#continuing-a-session).
 
 ## The warm-up table

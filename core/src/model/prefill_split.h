@@ -14,15 +14,17 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// The final-segment split policy (round 9, part B).
+// The final-segment split policy (round 9, part B; round 10 keeps both parts in
+// the batched class).
 //
 // A prompt's last row is the only one whose hidden state feeds lm_head, so a
-// final segment can be split into `rows - 1` interior rows — planned for their
-// cache writes alone — and a one-row final segment, an existing shape class.
-// Only the trailing blocks that own neither a cache nor a state are dead in
-// every interior segment; the one-row segment runs them once (about one decode
-// step's model read). The split pays when the rows it makes interior repay
-// kSplitRowsPerModelRead rows of that read.
+// final segment can be split into interior rows — planned for their cache
+// writes alone — and a final segment of the last `batched_min` rows. Both parts
+// stay at or above the batch threshold, so every row is computed by the same
+// kernels as in the unsplit segment. Only the trailing blocks that own neither
+// a cache nor a state are dead in every interior segment; the final part runs
+// them once (about one decode step's model read). The split pays when the rows
+// it makes interior repay kSplitRowsPerModelRead rows of that read.
 //
 // The policy is a pure function of the recipe and the row count so the suite
 // can drive it with synthetic stacks. The environment override lives in
@@ -38,11 +40,13 @@
 
 namespace sonicboom::model::detail {
 
+// The last few rows as their own segment read the whole model once, about as
+// expensive as batching 64 rows.
 constexpr uint64_t kSplitRowsPerModelRead = 64;
 
-// `auto` applies the static rule below, `on` splits a final segment of two or
-// more rows regardless of the block count (the test's forcing arm) and `off`
-// keeps the pre-round plan.
+// `auto` applies the static rule below, `on` splits a final segment of at least
+// two batched segments regardless of the block count (the test's forcing arm)
+// and `off` keeps the pre-round plan.
 enum class SplitLastMode : uint8_t { Auto, On, Off };
 
 // Opt-in: the split changes the last prompt position's arithmetic, and on a
@@ -68,17 +72,21 @@ inline uint32_t trailing_dead_blocks(const Recipe& r) {
   return dead;
 }
 
-// Whether a final segment of `rows` rows splits into `rows - 1` interior rows
-// and a one-row final segment. The rule is static (no timing): `auto` splits
-// only where whole blocks are dead and the rows made interior repay the
-// one-row segment's model read.
-inline bool split_last_row(const Recipe& r, uint64_t rows,
-                           SplitLastMode mode) {
-  if (mode == SplitLastMode::Off || rows <= 1) return false;
-  if (mode == SplitLastMode::On) return true;
+// Rows held back from a final segment of `nseg` rows to run as their own
+// final segment; 0 = no split. `batched_min` is the smallest segment the
+// batched kernels take: both parts stay at or above it, so every row is
+// computed by the same kernels as in the unsplit segment.
+inline uint64_t split_tail_rows(const Recipe& r, uint64_t nseg,
+                                uint64_t batched_min,
+                                SplitLastMode mode) {
+  if (mode == SplitLastMode::Off) return 0;
+  if (batched_min == 0 || nseg < 2 * batched_min) return 0;
+  if (mode == SplitLastMode::On) return batched_min;
   const uint64_t dead = trailing_dead_blocks(r);
-  return dead > 0 &&
-         rows - 1 >= kSplitRowsPerModelRead * r.blocks.size() / dead;
+  return dead > 0 && nseg - batched_min >=
+                         kSplitRowsPerModelRead * r.blocks.size() / dead
+             ? batched_min
+             : 0;
 }
 
 }  // namespace sonicboom::model::detail

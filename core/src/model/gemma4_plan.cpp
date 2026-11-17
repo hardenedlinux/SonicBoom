@@ -6445,15 +6445,18 @@ static uint64_t prefill_decode_cuda_impl(
       const uint64_t rem = pos % chunk;
       if (rem != 0 && chunk - rem < nseg)
         nseg = chunk - rem;
-      // A split final segment runs its `nseg - 1` interior rows now; the next
-      // iteration runs the one row whose hidden state reaches lm_head. The
-      // rows made interior pay off by planning away the trailing blocks that
-      // own no cache or state (split_last_row); the split is only taken while
-      // the effects treatment is on.
-      if (off + nseg == n && effects_segments && nseg > 1 &&
-          detail::split_last_row(recipe_for(m), nseg,
-                                 prefill_split_last_mode()))
-        nseg -= 1;
+      // A split final segment runs its `nseg - tail` interior rows now; the
+      // next iteration runs the last `tail` rows, whose hidden state reaches
+      // lm_head. Both parts stay at or above the batch threshold, so every row
+      // is computed by the same kernels as in the unsplit segment. The rows
+      // made interior pay off by planning away the trailing blocks that own no
+      // cache or state (split_tail_rows); the split is only taken while the
+      // effects treatment is on.
+      if (off + nseg == n && effects_segments) {
+        const uint64_t tail = detail::split_tail_rows(
+            recipe_for(m), nseg, mmq_min_n, prefill_split_last_mode());
+        if (tail > 0) nseg -= tail;
+      }
       const bool is_final = (off + nseg == n);
       // Nothing reads a non-final segment's output; the effects treatment
       // plans it for its cache writes. The final segment always produces the

@@ -91,8 +91,8 @@ constexpr Knob kKnobs[] = {
     {"SONICBOOM_PREFILL_EFFECTS", "on",
      "non-final prefill segments plan for their cache writes only: 0 off"},
     {"SONICBOOM_PREFILL_SPLIT_LAST", "off",
-     "the last prompt row runs as its own segment where whole blocks are "
-     "dead: auto|on|off"},
+     "the last rows of a prompt run as their own segment, the smallest the "
+     "batched kernels take, where whole blocks are dead: auto|on|off"},
 };
 
 void section(const char* title) {
