@@ -164,7 +164,7 @@ std::expected<void, std::string> GdnState::restore(
   return {};
 }
 
-StateSet::StateSet(std::vector<nn::GdnDims> dims) {
+StateSet::StateSet(const std::vector<nn::GdnDims>& dims) {
   states_.reserve(dims.size());
   for (const nn::GdnDims& d : dims) states_.emplace_back(d);
 }

@@ -156,13 +156,16 @@ void print_stats_at_exit() {
 
 } // namespace
 
+// The handles are device addresses the runtime spells as u64 (the same
+// spelling the HAL's buffer ids use); the accessors expose one as the opaque
+// pointer the planner API carries.
 const void* ExpertPool::data(uint32_t role) const noexcept {
   if (role > kDown) return nullptr;
-  return reinterpret_cast<const void*>(handles_[role]);
+  return reinterpret_cast<const void*>(handles_[role]);  // NOLINT(performance-no-int-to-ptr)
 }
 
 const void* ExpertPool::selection() const noexcept {
-  return reinterpret_cast<const void*>(sel_handle_);
+  return reinterpret_cast<const void*>(sel_handle_);  // NOLINT(performance-no-int-to-ptr)
 }
 
 ExpertPool::Stats ExpertPool::stats() const {

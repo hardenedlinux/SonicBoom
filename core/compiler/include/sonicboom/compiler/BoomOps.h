@@ -33,14 +33,21 @@
 // They carry no members: a pass asks `op->hasTrait<...>()`.
 namespace sonicboom::compiler::boom::OpTrait {
 
+// Each trait's constructor stays public on purpose: MLIR's Op<> template
+// (OpDefinition.h) constructs every trait base with no access to the concrete
+// op, so a private constructor (the CRTP-accessibility check's suggestion)
+// would not compile.
 template <typename ConcreteType>
+// NOLINTNEXTLINE(bugprone-crtp-constructor-accessibility)
 class Elementwise : public mlir::OpTrait::TraitBase<ConcreteType, Elementwise> {
 };
 
 template <typename ConcreteType>
+// NOLINTNEXTLINE(bugprone-crtp-constructor-accessibility)
 class Monotone : public mlir::OpTrait::TraitBase<ConcreteType, Monotone> {};
 
 template <typename ConcreteType>
+// NOLINTNEXTLINE(bugprone-crtp-constructor-accessibility)
 class RowIndependent
     : public mlir::OpTrait::TraitBase<ConcreteType, RowIndependent> {};
 

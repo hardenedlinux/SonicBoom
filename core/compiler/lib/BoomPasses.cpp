@@ -392,6 +392,12 @@ constexpr uint64_t mmqActivationBaseBytes() {
 // both and is scheduled on whichever the module holds.
 template <class P>
 struct UnitPass : mlir::PassWrapper<P, mlir::OperationPass<>> {
+private:
+  // Only the derived pass constructs one.
+  friend P;
+  UnitPass() = default;
+
+public:
   bool canScheduleOn(mlir::RegisteredOperationName name) const override {
     return name.getStringRef() == "boom.graph" ||
            name.getStringRef() == "boom.step";
@@ -413,6 +419,9 @@ public:
 
   void runOnOperation() override {
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
     const mlir::Location loc = unit.loc();
@@ -522,6 +531,9 @@ public:
 
   void runOnOperation() override {
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
     const mlir::Location loc = unit.loc();
@@ -710,6 +722,9 @@ public:
 
   void runOnOperation() override {
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     fuseActMulQuantize(unit, planner::OpKind::GeluFp16,
                        planner::OpKind::GeluMulQuantize);
   }
@@ -724,6 +739,9 @@ public:
 
   void runOnOperation() override {
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     fuseActMulQuantize(unit, planner::OpKind::Silu,
                        planner::OpKind::SiluMulQuantize);
   }
@@ -745,6 +763,9 @@ public:
 
   void runOnOperation() override {
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
     const mlir::Location loc = unit.loc();
@@ -856,6 +877,9 @@ public:
 
   void runOnOperation() override {
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
     const mlir::Location loc = unit.loc();
@@ -981,6 +1005,9 @@ public:
 
   void runOnOperation() override {
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
     const mlir::Location loc = unit.loc();
@@ -1123,6 +1150,9 @@ public:
 
   void runOnOperation() override {
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
     const mlir::Location loc = unit.loc();
@@ -1314,6 +1344,9 @@ public:
       return;
 
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
     const mlir::Location loc = unit.loc();
@@ -1386,6 +1419,9 @@ public:
       return;
 
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
     const mlir::Location loc = unit.loc();
@@ -1498,6 +1534,9 @@ public:
       return;
 
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
     const mlir::Location loc = unit.loc();
@@ -1601,6 +1640,9 @@ public:
       return;
 
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
     const mlir::Location loc = unit.loc();
@@ -1753,6 +1795,9 @@ public:
     if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
       return;
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     fuseActivationMul(unit, planner::OpKind::GeluFp16, "gelu_mul");
   }
 };
@@ -1773,6 +1818,9 @@ public:
     if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
       return;
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     fuseActivationMul(unit, planner::OpKind::Silu, "silu_mul");
   }
 };
@@ -1809,6 +1857,9 @@ public:
       return;
 
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
     const mlir::Location loc = unit.loc();
@@ -1954,6 +2005,12 @@ public:
       return;
 
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step, so `from` always
+    // finds the op; the check states that invariant.
+    if (!unit) {
+      signalPassFailure();
+      return;
+    }
     mlir::OpBuilder builder(unit.context());
     const std::string attnName = boomOpName(planner::OpKind::Attention);
 
@@ -2044,6 +2101,9 @@ public:
 
   void runOnOperation() override {
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
 
@@ -2189,6 +2249,12 @@ public:
 
   void runOnOperation() override {
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step, so `from` always
+    // finds the op; the check states that invariant.
+    if (!unit) {
+      signalPassFailure();
+      return;
+    }
     GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
     const mlir::Location loc = unit.loc();
@@ -2571,6 +2637,9 @@ public:
 
   void runOnOperation() override {
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     if (!fuseActMulMmq(unit, planner::OpKind::GeluFp16,
                        planner::OpKind::GeluMulQuantize, allow_grow_))
       signalPassFailure();
@@ -2591,6 +2660,9 @@ public:
 
   void runOnOperation() override {
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     if (!fuseActMulMmq(unit, planner::OpKind::Silu,
                        planner::OpKind::SiluMulQuantize, allow_grow_))
       signalPassFailure();
@@ -2624,6 +2696,12 @@ public:
 
   void runOnOperation() override {
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step, so `from` always
+    // finds the op; the check states that invariant.
+    if (!unit) {
+      signalPassFailure();
+      return;
+    }
     GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
     const mlir::Location loc = unit.loc();
@@ -2754,6 +2832,9 @@ public:
       return;
 
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
     const mlir::Location loc = unit.loc();
@@ -2858,6 +2939,12 @@ public:
 
   void runOnOperation() override {
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step, so `from` always
+    // finds the op; the check states that invariant.
+    if (!unit) {
+      signalPassFailure();
+      return;
+    }
     mlir::OpBuilder builder(unit.context());
 
     for (mlir::Operation &node : unit.body()) {
@@ -2922,6 +3009,9 @@ public:
     if (mode == MmqTcMode::Off) return;
 
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
     const mlir::Location loc = unit.loc();
@@ -3028,6 +3118,9 @@ public:
     if (async_prefetch_mode() == AsyncPrefetchMode::Off) return;
 
     const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
     GraphEditor view(unit);
 
     // The resident model-bound weight footprint.
@@ -3644,6 +3737,9 @@ bool narrowToLists(GraphEditor &view, const DemandFacts &facts) {
 // new one: `rows` values of `width` f32 each.
 bool appendConsumerNode(unit::Unit u, planner::OpKind kind,
                         llvm::StringRef tensorName, bool listed) {
+  // The callers pass a unit from collectUnits(), which yields only the two
+  // unit ops; the check states that invariant.
+  if (!u) return false;
   GraphEditor view(u);
   const std::optional<GraphOutput> out = singleOutput(view);
   if (!out) {
@@ -3869,6 +3965,8 @@ bool finishConsumer(mlir::ModuleOp module) {
   bool resolved = false;
   for (mlir::Operation *op : collectUnits(module)) {
     const unit::Unit u = unit::Unit::from(op);
+    // collectUnits yields only the two unit ops.
+    if (!u) continue;
     if (auto graph = llvm::dyn_cast<boom::GraphOp>(op)) {
       const std::optional<llvm::StringRef> declared = graph.getConsumer();
       if (!declared)

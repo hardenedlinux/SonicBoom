@@ -153,9 +153,18 @@ protected:
 
   // ---- primitives ----------------------------------------------------------
 
-  mlir::Value node(OpKind kind, std::vector<mlir::Value> inputs,
-                   const std::string& name, uint64_t width, Attrs attrs) {
-    return b.node(kind, std::move(inputs), name, shape(width), std::move(attrs));
+  // The inputs and attributes are read by the builder during the call and not
+  // retained, so both are passed as references to the caller's objects.
+  mlir::Value node(OpKind kind, const std::vector<mlir::Value>& inputs,
+                   const std::string& name, uint64_t width, const Attrs& attrs) {
+    return b.node(kind, inputs, name, shape(width), attrs);
+  }
+
+  // The per-layer input's width. The phases that read it (the per-layer gate,
+  // the preamble and the per-layer slices) run only for a recipe that carries
+  // the input; a recipe without one reads 0.
+  uint32_t per_layer_width() const {
+    return r.per_layer_input ? r.per_layer_input->width : 0;
   }
 
   // RMSNorm over the full width, with learned weights.
@@ -163,7 +172,7 @@ protected:
                    uint32_t layer, WeightSlot weight) {
     Attrs a = {layer_a(layer), slot_a(weight)};
     norm_extent(a, width);
-    return node(OpKind::RmsNorm, {x}, name, width, std::move(a));
+    return node(OpKind::RmsNorm, {x}, name, width, a);
   }
 
   // RMSNorm per head; unit weight when `weight` is None. `segment` > 0 splits
@@ -179,7 +188,7 @@ protected:
     rows(a);
     if (segment != 0)
       a.push_back(attr_i("dim", segment));
-    return node(OpKind::RmsNormHeads, {x}, name, width, std::move(a));
+    return node(OpKind::RmsNormHeads, {x}, name, width, a);
   }
 
   // The projection's matmul, without its bias.
@@ -187,7 +196,7 @@ protected:
                      const Projection& p, uint32_t layer) {
     Attrs a = {layer_a(layer), slot_a(p.weight)};
     lowering(a, p);
-    return node(OpKind::QuantizedMatmul, {x}, name, p.out, std::move(a));
+    return node(OpKind::QuantizedMatmul, {x}, name, p.out, a);
   }
 
   // The projection's bias; `x` itself when it has none.
@@ -197,7 +206,7 @@ protected:
       return x;
     Attrs a = {layer_a(layer), slot_a(p.bias)};
     rows(a);
-    return node(OpKind::AddBias, {x}, name, p.out, std::move(a));
+    return node(OpKind::AddBias, {x}, name, p.out, a);
   }
 
   // `rot_dims` > 0 rotates only that many leading values of each head, and is
@@ -208,14 +217,14 @@ protected:
     Attrs a = {layer_a(layer)};
     rows(a);
     if (rot_dims != 0) a.push_back(attr_i("rot_dims", int64_t(rot_dims)));
-    return node(OpKind::Rope, {x, position()}, name, width, std::move(a));
+    return node(OpKind::Rope, {x, position()}, name, width, a);
   }
 
   // An elementwise op that carries only its layer.
-  mlir::Value pointwise(OpKind kind, std::vector<mlir::Value> inputs,
+  mlir::Value pointwise(OpKind kind, const std::vector<mlir::Value>& inputs,
                         const std::string& name, uint64_t width,
                         uint32_t layer) {
-    return node(kind, std::move(inputs), name, width, {layer_a(layer)});
+    return node(kind, inputs, name, width, {layer_a(layer)});
   }
 
   mlir::Value scale(mlir::Value x, const std::string& name, uint64_t width,
@@ -229,7 +238,7 @@ protected:
     Attrs a = {slot_a(WeightSlot::TokenEmbd)};
     rows(a);
     const mlir::Value embd =
-        node(OpKind::Embedding, {tokens()}, "embd", r.width, std::move(a));
+        node(OpKind::Embedding, {tokens()}, "embd", r.width, a);
     inp_ = r.scale_embedding
                ? scale(embd, "inp", r.width, std::sqrt(float(r.width)))
                : embd;
@@ -307,7 +316,7 @@ protected:
       return matmul(x, name, p, layer);
     Attrs a = {layer_a(layer), slot_a(p.weight)};
     rows(a);
-    return node(OpKind::MatvecF32, {x}, name, p.out, std::move(a));
+    return node(OpKind::MatvecF32, {x}, name, p.out, a);
   }
 
   // The gated DeltaNet mixer: the four projections the scan consumes, the scan
@@ -398,7 +407,7 @@ protected:
     // it, and runs one decode gemv per (row, expert) without it.
     rows(expert_a);
     const mlir::Value moe = node(OpKind::MoeExperts, {f, routed[0], routed[1]},
-                                 "moe" + s, d, std::move(expert_a));
+                                 "moe" + s, d, expert_a);
     if (!ffn.shared || ffn.shared_gate == WeightSlot::None) return moe;
 
     const Expert& shared = *ffn.shared;
@@ -414,7 +423,7 @@ protected:
     Attrs gate_a = {layer_a(l), slot_a(ffn.shared_gate)};
     rows(gate_a);
     const mlir::Value sgi = node(OpKind::MatvecF32, {f}, "sgi" + s, 1,
-                                 std::move(gate_a));
+                                 gate_a);
     const mlir::Value sgs =
         pointwise(OpKind::Sigmoid, {sgi}, "sgs" + s, 1, l);
     const mlir::Value sg =
@@ -454,24 +463,24 @@ protected:
   mlir::Value per_layer_gate(uint32_t l, mlir::Value x2) {
     const std::string s = std::to_string(l);
     const uint32_t d = r.width;
-    const uint32_t per = r.per_layer_input->width;
+    const uint32_t per = per_layer_width();
 
     const mlir::Value ple = per_layer_slice(l);
     Attrs g0_a = {layer_a(l), slot_a(WeightSlot::InpGate)};
     rows(g0_a);
-    mlir::Value g0 = node(OpKind::MatvecF32, {x2}, "g0" + s, per, std::move(g0_a));
+    mlir::Value g0 = node(OpKind::MatvecF32, {x2}, "g0" + s, per, g0_a);
     g0 = pointwise(OpKind::GeluFp16, {g0}, "g0g" + s, per, l);
     g0 = pointwise(OpKind::Mul, {g0, ple}, "g0m" + s, per, l);
     Attrs g1_a = {layer_a(l), slot_a(WeightSlot::Proj)};
     rows(g1_a);
     const mlir::Value g1 =
-        node(OpKind::MatvecF32, {g0}, "g1" + s, d, std::move(g1_a));
+        node(OpKind::MatvecF32, {g0}, "g1" + s, d, g1_a);
     const mlir::Value g2 = norm(g1, "g2" + s, d, l, WeightSlot::PostNorm);
     return pointwise(OpKind::Add, {x2, g2}, "x3" + s, d, l);
   }
 
   uint32_t per_layer_total() const {
-    return uint32_t(r.blocks.size()) * r.per_layer_input->width;
+    return uint32_t(r.blocks.size()) * per_layer_width();
   }
 };
 
@@ -507,7 +516,7 @@ public:
     Attrs a = {slot_a(r.head.weight)};
     family(a, r.head.type, r.width, r.vocab);
     mlir::Value out = b.node(OpKind::QuantizedMatmul, {hn}, "logits",
-                             {int64_t(r.vocab)}, std::move(a));
+                             {int64_t(r.vocab)}, a);
     if (r.head.softcap != 0.0)
       out = b.node(OpKind::Softcap, {out}, "logits_sc", {int64_t(r.vocab)},
                    {attr_f("scale", r.head.softcap)});
@@ -552,9 +561,9 @@ protected:
     const std::string name = "attn" + std::to_string(l);
     if (at.owns_cache)
       return b.node(OpKind::Attention, {q, k, v, pos_, kv_[at.cache]}, name,
-                    {int64_t(at.q_width())}, std::move(a));
+                    {int64_t(at.q_width())}, a);
     return b.node(OpKind::Attention, {q, pos_, kv_[at.cache]}, name,
-                  {int64_t(at.q_width())}, std::move(a));
+                  {int64_t(at.q_width())}, a);
   }
 
   // The scan starts at the decode position (the verify row scale deals the
@@ -570,7 +579,7 @@ protected:
   // Each block then slices its own `per` values out.
   void per_layer_preamble() override {
     const uint32_t d = r.width;
-    const uint32_t per = r.per_layer_input->width;
+    const uint32_t per = per_layer_width();
     const uint32_t total = per_layer_total();
     const mlir::Value row =
         b.node(OpKind::Embedding, {token_id_}, "ple_row", {int64_t(total)},
@@ -596,7 +605,7 @@ protected:
   }
 
   mlir::Value per_layer_slice(uint32_t l) override {
-    const uint32_t per = r.per_layer_input->width;
+    const uint32_t per = per_layer_width();
     return b.node(OpKind::Slice, {per_layer_all_}, "ple" + std::to_string(l),
                   {int64_t(per)},
                   {attr_i("offset", int64_t(l) * per),
@@ -696,7 +705,7 @@ protected:
     }
     return node(OpKind::FlashAttention,
                 {q, k_[at.cache], v_[at.cache], start_pos_, kv_[at.cache]},
-                "attn" + std::to_string(l), at.q_width(), std::move(a));
+                "attn" + std::to_string(l), at.q_width(), a);
   }
 
   // The scan covers this segment's rows, starting at its start position.
@@ -716,7 +725,7 @@ protected:
   mlir::Value per_layer_slice(uint32_t l) override {
     const std::string s = std::to_string(l);
     const uint32_t d = r.width;
-    const uint32_t per = r.per_layer_input->width;
+    const uint32_t per = per_layer_width();
     const float proj_scale = 1.0f / std::sqrt(float(d));
 
     mlir::Value proj =

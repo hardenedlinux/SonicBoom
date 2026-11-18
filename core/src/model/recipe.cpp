@@ -212,12 +212,12 @@ Recipe recipe_for(const Gemma4Model& m) {
       ffn = dense;
     }
 
-    block.ffn = std::move(ffn);
+    block.ffn = ffn;
     block.post_ffn_norm = t.post_ffn_norm;
     block.per_layer_gate = t.per_layer_input;
     if (t.output_scale && !w.layer_output_scale.empty())
       block.output_scale = double(w.layer_output_scale[0]);
-    r.blocks.push_back(std::move(block));
+    r.blocks.push_back(block);
   }
 
   r.head.weight = t.tied_head ? WeightSlot::TokenEmbd : WeightSlot::Output;

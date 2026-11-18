@@ -177,7 +177,7 @@ read_u64_or_arr(const gguf::Reader& r, std::string_view key) {
   if (v->type != gguf::ValueType::Array) {
     const auto x = read_u64(r, key);
     if (!x) return std::unexpected(std::string(key) + " is not an integer");
-    return std::optional<uint64_t>(*x);
+    return x;
   }
   const auto arr = read_u64_array(r, key);
   if (!arr || arr->empty())

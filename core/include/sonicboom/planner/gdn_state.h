@@ -113,7 +113,7 @@ class GdnState {
 class StateSet {
  public:
   StateSet() = default;
-  explicit StateSet(std::vector<nn::GdnDims> dims);
+  explicit StateSet(const std::vector<nn::GdnDims>& dims);
 
   size_t size() const noexcept { return states_.size(); }
   GdnState& state(size_t index) { return states_[index]; }
