@@ -146,6 +146,7 @@ tools/community-bench.sh models/qwen2.5-7b-instruct-1m-q4_k_m.gguf \
 
 This runs the four steps below in order, writes every line of their output to
 one log, `sonicboom-bench-<datetime>.log`, and prints the path at the end.
+(`--serve` adds a fifth step, the server's streamed code-edit rate.)
 Run the same steps by hand to see or adjust them:
 
 ```sh
@@ -164,7 +165,9 @@ to measure SonicBoom alone, in which case every llama.cpp cell reads
 commit, and the SM clock sampled inside each measurement window.
 
 The `--spec` run prints the code-editing rows, and the `--long` run the decode
-and prefill rows, for your GPU. The protocol is described in
+and prefill rows, for your GPU. The server's streamed code-edit rate is
+`tools/bench-serve.sh MODEL --runs 3`; it is listed separately, not as a ratio
+against llama.cpp. The protocol is described in
 [docs/benchmark.md](docs/benchmark.md#code-editing). Post your run in the
 [v0.0.6 results issue]({{ISSUE_URL}}); earlier runs are in issues
 [#1](https://github.com/hardenedlinux/SonicBoom/issues/1),

@@ -202,6 +202,43 @@ On a coding-chat workload, speculation makes SonicBoom 4.4× faster than its own
 plain decode (176.8 tok/s), with the same output. In the same test, llama.cpp's
 non-speculative output also differed between repeated runs on 5 of 10 turns.
 
+## Server streaming
+
+The server's rows are the same ten code-edit turns sent to SonicBoom's own
+OpenAI-compatible server as ten separate streamed requests, so they measure the
+request path (HTTP, chat template, SSE) as a client sees it, not the C ABI.
+`tools/bench-serve.sh` is the command:
+
+```sh
+tools/bench-serve.sh models/qwen2.5-7b-instruct-1m-q4_k_m.gguf --runs 3
+```
+
+The tree's server serves `/v1/chat/completions` and no raw `/v1/completions`,
+so each turn's prompt (the instruction followed by the file, as in the code
+editing measurement) goes as the sole user message and the chat template owns
+the special tokens. The request is greedy (`temperature` 0, `top_k` 1), streams
+(`stream` true), and asks for usage (`stream_options.include_usage`): a turn's
+generated-token count is the server's own `completion_tokens`, not a count of
+chunks. Each turn's `max_tokens` is the pasted file's token count from
+`codeedit_bench`, the same source `tools/bench.sh --spec` uses.
+
+The arms are SonicBoom spec off (`SONICBOOM_SPEC=off`) and default (unset, the
+startup probe decides). Each arm runs `--runs` (default 3) fresh server
+processes; a rep is one server start, one pass over the ten turns, one server
+stop, with the process exit and the port release confirmed. The rate is total
+generated tokens over the summed wall time from each request to its `[DONE]`;
+the arm's number is the median over its reps. Identity is per turn: the off
+arm's first rep is the reference, and a rep is identical when all ten turns'
+texts hash the same.
+
+The streaming rows are listed separately, not as a ratio against llama.cpp:
+`tools/bench/llama-codeedit.scm` talks to llama-server's `/completion` with the
+raw turn prompt, which is a different request path. The script's table says so
+in its own heading.
+
+`tools/community-bench.sh --serve` runs the same command as its fifth step into
+the same log.
+
 ## Correctness gates
 
 A performance number is only reported for a build that passes:
@@ -319,12 +356,14 @@ standard run — hardware/build record, canonical bench, extended-context tiers,
 clock pinning and what to send — is
 [README: Reproduce the table](../README.md#reproduce-the-table).
 
-One command runs those four steps in order and writes every line of their
-output to one log:
+One command runs those steps in order and writes every line of their output to
+one log:
 
 ```sh
-tools/community-bench.sh <model.gguf> <llama.cpp/build/bin> [--runs N] [--no-llama]
+tools/community-bench.sh <model.gguf> <llama.cpp/build/bin> [--runs N] [--no-llama] [--serve]
 ```
+
+`--serve` adds the [server streaming](#server-streaming) step as a fifth step.
 
 It calls the existing scripts unchanged and does no measurement of its own; a
 step that fails stops the run. The manual steps are listed in the README

@@ -7,27 +7,27 @@ export LC_ALL=C LANG=C
 #
 # community-bench.sh — the community run in one command, one log.
 #
-# A community submission is the four steps in README, "Reproduce the table":
-# the hardware/build record, the llama.cpp commit, the code-editing comparison
-# and the extended-context tiers. Run by hand they leave four separate terminal
-# outputs; this script runs the same commands in order, writes every line of
-# stdout and stderr to one log as it goes, and shows it on the terminal too.
+# A community submission is the steps in README, "Reproduce the table": the
+# hardware/build record, the llama.cpp commit, the code-editing comparison and
+# the extended-context tiers, plus the server's streamed code-edit rate with
+# --serve. Run by hand they leave separate terminal outputs; this script runs
+# the same commands in order, writes every line of stdout and stderr to one log
+# as it goes, and shows it on the terminal too.
 #
 # It does no measurement of its own: each step is the command from the README,
-# unchanged, and any failure stops the run with a non-zero status.
+# unchanged (the server step is tools/bench-serve.sh), and any failure stops the
+# run with a non-zero status.
 #
 # Usage: tools/community-bench.sh <model.gguf> <llama.cpp/build/bin>
-#                                 [--runs N] [--no-llama] [--out FILE]
+#                                 [--runs N] [--no-llama] [--out FILE] [--serve]
 #        <llama.cpp/build/bin> may be omitted with --no-llama.
 #        --runs N   independent process runs per metric (default 3).
 #        --no-llama measure SonicBoom alone: skip the llama.cpp commit and pass
 #                   --no-llama to bench.sh (every llama.cpp cell reads skipped).
 #        --out FILE write the log here (default sonicboom-bench-<datetime>.log).
+#        --serve    add the fifth step, tools/bench-serve.sh <model> --runs N
+#                   (the server's streamed code-edit rate).
 # Env:   CUDA_VISIBLE_DEVICES defaults to 0, as in the README block.
-#
-# The server streaming rows the README quotes have no reproducible command in
-# this tree, so there is no --serve step; a run that needs those numbers has to
-# record its own server command alongside them.
 
 set -euo pipefail
 
@@ -37,6 +37,7 @@ NO_LLAMA=0
 GGUF=""
 LLAMA=""
 OUT=""
+SERVE=0
 
 usage() {
   sed -n '/^# Usage:/,/^#$/p' "$0" | sed 's/^# \{0,1\}//'
@@ -48,10 +49,7 @@ while [ $# -gt 0 ]; do
     --runs) RUNS="${2:-}"; shift 2 ;;
     --no-llama) NO_LLAMA=1; shift ;;
     --out) OUT="${2:-}"; shift 2 ;;
-    --serve)
-      echo "community-bench: --serve is not available: the README's server" >&2
-      echo "  streaming rows have no reproducible command in this tree." >&2
-      exit 2 ;;
+    --serve) SERVE=1; shift ;;
     -h|--help) usage ;;
     -*) echo "community-bench: unknown option $1" >&2; usage ;;
     *)
@@ -108,7 +106,10 @@ step() { # TITLE
   echo
 }
 
-step "1/4 hardware and build record"
+TOTAL=4
+[ "$SERVE" = 1 ] && TOTAL=5
+
+step "1/$TOTAL hardware and build record"
 echo "model:  $GGUF"
 echo "runs:   $RUNS"
 echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
@@ -119,18 +120,18 @@ if ! "$ROOT/tools/sb-report.sh" --model "$GGUF" --no-bench; then
 fi
 
 if [ "$NO_LLAMA" = 0 ]; then
-  step "2/4 llama.cpp commit"
+  step "2/$TOTAL llama.cpp commit"
   COMMIT="$(git -C "$LLAMA" rev-parse --short HEAD 2>/dev/null || true)"
   echo "llama.cpp: $LLAMA"
   echo "commit:    ${COMMIT:-unknown}"
 else
-  step "2/4 llama.cpp commit (skipped: --no-llama)"
+  step "2/$TOTAL llama.cpp commit (skipped: --no-llama)"
 fi
 
 LLAMA_ARGS=()
 [ "$NO_LLAMA" = 1 ] && LLAMA_ARGS+=(--no-llama)
 
-step "3/4 code-editing comparison"
+step "3/$TOTAL code-editing comparison"
 if ! LLAMA_BIN="$LLAMA" "$ROOT/tools/bench.sh" "$GGUF" --runs "$RUNS" --spec \
      "${LLAMA_ARGS[@]}"; then
   echo
@@ -138,12 +139,21 @@ if ! LLAMA_BIN="$LLAMA" "$ROOT/tools/bench.sh" "$GGUF" --runs "$RUNS" --spec \
   exit 1
 fi
 
-step "4/4 extended-context tiers"
+step "4/$TOTAL extended-context tiers"
 if ! LLAMA_BIN="$LLAMA" "$ROOT/tools/bench.sh" "$GGUF" --runs "$RUNS" --long \
      "${LLAMA_ARGS[@]}"; then
   echo
   echo "community-bench: step 4 failed; the log is $OUT" >&2
   exit 1
+fi
+
+if [ "$SERVE" = 1 ]; then
+  step "5/$TOTAL server streaming"
+  if ! "$ROOT/tools/bench-serve.sh" "$GGUF" --runs "$RUNS"; then
+    echo
+    echo "community-bench: step 5 failed; the log is $OUT" >&2
+    exit 1
+  fi
 fi
 
 echo
