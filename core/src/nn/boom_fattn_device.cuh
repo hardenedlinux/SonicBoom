@@ -1451,9 +1451,13 @@ boom_fattn_fa2_kernel(
       boom_cp_wait<0>();
     }
     __syncthreads();  // staged tile visible to every warp
-    // Tiles past both of this warp's rows are fully masked; the staging and
-    // the two barriers still run.
-    if (j0 <= p1)
+    // Tile past the warp's last row: fully masked for all 16 rows the warp
+    // owns, so it would leave every row's state unchanged. The guard must be
+    // warp-uniform, not row-uniform: compute() ends in warp-wide shuffles, so
+    // every lane of the warp has to enter it (a partially entering warp waits
+    // on lanes that never arrive). A row whose own last key is below j0
+    // computes a fully masked tile; that is bit-identical to skipping it.
+    if (j0 <= start + (uint64_t)(qr + 15))
       compute(kbuf + buf * (BC * KS), vbuf + buf * (HEAD_DIM * VS), j0);
     __syncthreads();  // the next tile may overwrite this buffer
     buf ^= 1;
