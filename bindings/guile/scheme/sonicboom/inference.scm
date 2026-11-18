@@ -499,12 +499,21 @@ to hold back until the rest arrives."
 (define (detokenize model tokens)
   "Decode a list of token ids back to text.
 
+A token boundary can fall inside a multi-byte character. When the list ends
+inside one, the incomplete character decodes as a single U+FFFD; a streaming
+caller holds that tail back until the next token completes it.
 Args:
   model: a model handle.
   tokens: a list of token ids.
 Returns: a UTF-8 string.
 PyTorch: none"
-  (utf8->string (detokenize-bytes model tokens)))
+  (let* ((bv (detokenize-bytes model tokens))
+         (n (bytevector-length bv))
+         (complete (utf8-complete-prefix bv n)))
+    (if (= complete n)
+        (utf8->string bv)
+        (string-append (utf8->string (bytevector-range bv 0 complete))
+                       "\ufffd"))))
 
 ;;; --- prefill / generate -----------------------------------------------------
 

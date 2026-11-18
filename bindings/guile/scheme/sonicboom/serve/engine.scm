@@ -548,7 +548,7 @@ PyTorch: none"
                     ;; part; a trailing U+FFFD may be an incomplete multi-byte
                     ;; character, so wait.
                     (let* ((text (detokenize model (reverse generated)))
-                           (ready (if (string-suffix? "\xfffd;" text)
+                           (ready (if (string-suffix? "\ufffd" text)
                                       (1- (string-length text))
                                       (string-length text))))
                       (when (> ready decoded)
