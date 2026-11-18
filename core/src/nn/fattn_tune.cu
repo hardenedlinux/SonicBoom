@@ -124,28 +124,43 @@ struct Cand {
   bool bit_identical;  // byte-identical output to the reference on every class
   bool experimental;   // reachable only by forcing it by id
   const char* note;
+  // The schedule the candidate belongs to: 0 = query-resident (the head dim
+  // is split across NW warps), 1 = row-owning (FlashAttention-2 order, one
+  // warp owns 16 query rows of one head). A tuning run compares candidates of
+  // its family only, and its incumbent is that family's reference.
+  int family;
 };
 
 constexpr Cand kCands[] = {
     {1, "k8-v0-s2-pipe", 8, 0, 2, 1, true, true, false,
      "RTX 3050 reference: KSTRIDE padding, 8-warp phase-1b row-half split, "
-     "unpadded V, QK/PV pipeline"},
+     "unpadded V, QK/PV pipeline", 0},
     {2, "k8-v0-s2-seq", 8, 0, 2, 0, true, true, false,
      "same layout without the QK/PV pipeline (V double buffered); the pipeline "
-     "gain shows up at long context"},
+     "gain shows up at long context", 0},
     {3, "k8-v0-s1-pipe", 8, 0, 1, 1, true, true, false,
      "phase 1b on 4 warps (the row half is not split): the split is across "
-     "row groups, so the output is byte-identical to the reference"},
+     "row groups, so the output is byte-identical to the reference", 0},
     {4, "k0-v0-s2-pipe", 0, 0, 2, 1, true, true, false,
-     "K rows unpadded: 8-way bank conflict on every K fragment load"},
+     "K rows unpadded: 8-way bank conflict on every K fragment load", 0},
     {5, "k8-v8-s2-seq", 8, 8, 2, 0, true, true, false,
-     "V rows padded to 48 B, sequential phases; needs the full sm_8.x opt-in cap"},
+     "V rows padded to 48 B, sequential phases; needs the full sm_8.x opt-in cap",
+     0},
     {6, "k8-v8-s2-pipe", 8, 8, 2, 1, true, true, false,
      "V padding plus the pipeline's third V buffer: over the sm_8.x cap, legal on "
-     "parts with a larger shared-memory budget"},
+     "parts with a larger shared-memory budget", 0},
     {7, "k8-v4-s2-seq", 8, 4, 2, 0, false, false, true,
      "V rows padded to 40 B: 8-byte cp.async.ca, measured 20% slower on sm_86; "
-     "experimental, so its byte identity is not part of the tuning contract"},
+     "experimental, so its byte identity is not part of the tuning contract", 0},
+    // The row-owning family: head dim 128, GQA 7, global attention. BR 16
+    // keeps two blocks per SM (`__launch_bounds__` MINB 2), BR 32 one; both
+    // are bit-identical to each other, and the 32-key tile is the numerics.
+    {8, "fa2-br16-bc32", 0, 0, 0, 0, true, true, false,
+     "row-owning schedule, 16 queries per block and two blocks per SM; the "
+     "family reference", 1},
+    {9, "fa2-br32-bc32", 0, 0, 0, 0, true, true, false,
+     "row-owning schedule, 32 queries per block and one block per SM; same "
+     "arithmetic as the reference", 1},
 };
 const Cand* cand_by_num(int num) {
   for (const Cand& c : kCands)
@@ -210,6 +225,14 @@ Jit jit_mode() {
   return Jit::Auto;
 }
 
+// The row-owning schedule is on by default and switched off with
+// SONICBOOM_FATTN_FA2=0, which returns the class to the query-resident
+// candidates. Read per call, like the other gates.
+bool fa2_enabled() {
+  const char* e = env("SONICBOOM_FATTN_FA2");
+  return !(e != nullptr && std::strcmp(e, "0") == 0);
+}
+
 int64_t budget_ms() {
   if (const char* e = env("SONICBOOM_FATTN_AUTOTUNE_BUDGET_MS"); e != nullptr) {
     char* tail = nullptr;
@@ -249,6 +272,22 @@ Family family(int head_dim, int gqa) {
 }
 
 Geometry geometry(const Cand& c, int head_dim, int gqa) {
+  if (c.family == 1) {
+    // The row-owning kernel: BR query rows x all GQA heads of one KV head per
+    // block, 32-key tiles, K rows padded by 8 and V rows by 8 (2 x BC x KS +
+    // 2 x HEAD_DIM x VS halves). BR is the only candidate axis.
+    Geometry g;
+    g.br = c.num == 9 ? 32 : 16;
+    g.bk = 32;
+    g.block = (g.br / 16) * gqa * 32;
+    g.kstride = head_dim + 8;
+    g.bkp = g.bk + 8;
+    g.softmax_warps = (g.br / 16) * gqa;
+    g.pipeline = false;
+    g.smem = (size_t)(2 * g.bk * g.kstride + 2 * head_dim * g.bkp) *
+             sizeof(__half);
+    return g;
+  }
   const Family f = family(head_dim, gqa);
   const int units = (f.br / 16) * gqa;
   const int subs = f.bk / 16;
@@ -391,6 +430,29 @@ bool aot_image_exists(int candidate, int head_dim, int gqa) {
   return false;
 }
 
+// The candidate family a call is tuned in, decided once per call from the
+// shape class and the gates. Family 1 is the row-owning schedule: head dim
+// 128, GQA 7, global attention, the f16 accumulator, SONICBOOM_FATTN_FA2 not
+// 0, and an AOT image this device can load -- the kernel has no JIT path, so
+// without one the class stays on its query-resident candidates. Canonical
+// numerics keeps the query-resident reference (the documented boom_fattn
+// canonical arm).
+int call_family(const Call& c) {
+  if (c.head_dim != 128 || c.gqa != 7 || c.window != 0) return 0;
+  if (!fa2_enabled() || ::sonicboom::tune::canonical()) return 0;
+  if (jit_mode() == Jit::Force) return 0;
+  if (!aot_image_exists(8, c.head_dim, c.gqa)) return 0;
+  return 1;
+}
+
+// The family's reference candidate: the comparison basis, the incumbent and
+// the fallback of a tuning run in that family.
+const Cand* reference_cand(int fam) {
+  for (const Cand& c : kCands)
+    if (c.family == fam) return &c;
+  return &kCands[0];
+}
+
 // The code path the reference candidate will take here, as resolve_target()
 // decides it: a forced JIT, the AOT image when the cubin has one for this
 // device, otherwise NVRTC. The selection key needs the answer before the
@@ -448,7 +510,14 @@ std::string workload_fingerprint(const Call& c) {
   std::snprintf(buf, sizeof(buf), "hd%d-gqa%d-f16-%s-kv%u", c.head_dim, c.gqa,
                 c.window > 0 ? "swa" : "global",
                 span_bucket(kv_span_bound(c)));
-  return buf;
+  std::string w = buf;
+  // The schedule family is part of the workload: a record measured for the
+  // row-owning kernel names one of its candidates and must never be read by a
+  // query-resident class (or the reverse), and switching SONICBOOM_FATTN_FA2
+  // must miss the cache rather than reuse a selection made under the other
+  // schedule.
+  if (call_family(c) == 1) w += "-fa2";
+  return w;
 }
 
 // Test hook: SONICBOOM_FATTN_FP_SIMULATE="capability=<text>;software=<text>;
@@ -1009,6 +1078,7 @@ void emit_report(const ReportData& r) {
 struct Target {
   void* fn = nullptr;
   bool jit = false;
+  int family = 0;  // Cand::family: names the kernel in the plan record
   fattn_jit::Spec spec;
   int regs = -1;
   int spill_bytes = -1;
@@ -1034,6 +1104,7 @@ bool resolve_target(const Call& c, const Cand& cand, int jit, Target* t,
                     std::string* why) {
   const Dev& d = device();
   const Family f = family(c.head_dim, c.gqa);
+  t->family = cand.family;
   t->spec.id = cand.num;
   t->spec.head_dim = c.head_dim;
   t->spec.gqa = c.gqa;
@@ -1066,6 +1137,13 @@ bool resolve_target(const Call& c, const Cand& cand, int jit, Target* t,
         t->compile = "aot-cubin";
         return true;
       }
+    }
+    if (cand.family == 1) {
+      // The row-owning kernel is compiled AOT only: it is not a variant of
+      // the query-resident body the JIT wrapper emits.
+      *why = "no AOT image for sm_" + std::to_string(d.cc) +
+             " and the row-owning kernel has no JIT path";
+      return false;
     }
     if (jit == int(Jit::Off)) {
       *why = "no AOT image for sm_" + std::to_string(d.cc) +
@@ -1113,7 +1191,10 @@ bool launch_target(Target& t, const Call& c, const Geometry& g, float* out) {
                     &n,  &nq,  &nkv, &ne_pad, &scale,  &out};
 
   const dim3 grid((unsigned)((c.n + g.br - 1) / g.br), (unsigned)c.n_heads_kv);
-  BOOM_NOTE_LAUNCH(boom_fattn_attn_qreg_kernel, grid, g.block, g.smem, stream);
+  if (t.family == 1)
+    BOOM_NOTE_LAUNCH(boom_fattn_fa2_kernel, grid, g.block, g.smem, stream);
+  else
+    BOOM_NOTE_LAUNCH(boom_fattn_attn_qreg_kernel, grid, g.block, g.smem, stream);
 
   if (t.jit)
     return fattn_jit::launch(t.spec, grid, args, stream, g.smem, g.block);
@@ -1398,15 +1479,25 @@ void drop_non_identical(std::vector<int>* ids) {
   }
 }
 
-std::vector<int> tuning_set(std::string* why) {
+std::vector<int> tuning_set(int fam, std::string* why) {
   std::vector<int> ids;
   if (const char* e = env("SONICBOOM_FATTN_CANDIDATES"); e != nullptr) {
     if (!parse_ids(e, &ids, why)) return {};
     drop_non_identical(&ids);
-    return ids;
+  } else {
+    for (const Cand& c : kCands)
+      if (c.in_set) ids.push_back(c.num);
   }
-  for (const Cand& c : kCands)
-    if (c.in_set) ids.push_back(c.num);
+  // A run compares candidates of the call's family only: the family's
+  // reference is the comparison basis, and a candidate of another family has a
+  // different summation order by construction.
+  for (auto it = ids.begin(); it != ids.end();) {
+    const Cand* cand = cand_by_num(*it);
+    if (cand == nullptr || cand->family != fam)
+      it = ids.erase(it);
+    else
+      ++it;
+  }
   return ids;
 }
 
@@ -1445,26 +1536,33 @@ void report_prologue(ReportData* r, const Call& c, const Fingerprints& fp) {
   }
 }
 
-// The reference selection: no measurement, just the incumbent candidate.
+// Resolve a reference candidate for a call: legality, compile, registers.
+bool prepare_reference(const Call& c, const Cand* cand, Tuned* t,
+                       std::string* why) {
+  t->cand = cand;
+  t->geo = geometry(*cand, c.head_dim, c.gqa);
+  return resource_legal(device(), c, *cand, t->geo, why) &&
+         resolve_target(c, *cand, int(jit_mode()), &t->target, why) &&
+         registers_legal(device(), t->target, t->geo, why);
+}
+
+// The reference selection: no measurement, just the family's incumbent.
 Tuned reference_tuned(const Call& c, const Fingerprints& fp,
                       const char* source, std::string reason) {
   Tuned t;
-  t.cand = &kCands[0];
-  t.geo = geometry(*t.cand, c.head_dim, c.gqa);
-  std::string why;
   report_prologue(&t.report, c, fp);
   t.report.source = source;
   t.report.reason = reason;
-  t.report.selected_id = t.cand->id;
-  t.report.selected_num = t.cand->num;
-  t.report.geo = t.geo;
-  // The fallback is the reference geometry, not an exemption from the checks:
+  // The fallback is a reference geometry, not an exemption from the checks:
   // if the reference cannot legally run here, nothing runs and the caller's
   // own path is used. This is also what keeps a failed or unreliable device
-  // probe from turning into a guess.
-  if (!resource_legal(device(), c, *t.cand, t.geo, &why) ||
-      !resolve_target(c, *t.cand, int(jit_mode()), &t.target, &why) ||
-      !registers_legal(device(), t.target, t.geo, &why)) {
+  // probe from turning into a guess. A row-owning incumbent that cannot run
+  // (no image on this device) leaves the query-resident reference as the
+  // fallback, so the class keeps a path.
+  std::string why;
+  if (!prepare_reference(c, reference_cand(call_family(c)), &t, &why) &&
+      (t.cand == &kCands[0] ||
+       !prepare_reference(c, &kCands[0], &t, &why))) {
     t.ok = false;
     t.reason = why;
     return t;
@@ -1472,6 +1570,9 @@ Tuned reference_tuned(const Call& c, const Fingerprints& fp,
   t.ok = true;
   t.source = source;
   t.reason = std::move(reason);
+  t.report.selected_id = t.cand->id;
+  t.report.selected_num = t.cand->num;
+  t.report.geo = t.geo;
   t.report.regs = t.target.regs;
   t.report.spill_bytes = t.target.spill_bytes;
   t.report.impl = t.target.impl;
@@ -1500,16 +1601,19 @@ Tuned tune_class(const Call& c, const Fingerprints& fp) {
   ReportData& rep = t.report;
 
   // ---- candidate list ----------------------------------------------------
+  const int fam = call_family(c);
+  const Cand* ref_cand = reference_cand(fam);
   std::string parse_why;
-  std::vector<int> ids = tuning_set(&parse_why);
+  std::vector<int> ids = tuning_set(fam, &parse_why);
   if (ids.empty()) {
     return reference_tuned(
         c, fp, "fallback",
         parse_why.empty() ? "the candidate set is empty" : parse_why);
   }
-  // The reference is always first: it is the comparison basis and the fallback.
-  ids.erase(std::remove(ids.begin(), ids.end(), kCands[0].num), ids.end());
-  ids.insert(ids.begin(), kCands[0].num);
+  // The family's reference is always first: it is the comparison basis and
+  // the fallback.
+  ids.erase(std::remove(ids.begin(), ids.end(), ref_cand->num), ids.end());
+  ids.insert(ids.begin(), ref_cand->num);
   rep.n_total = int(ids.size());
   for (const int num : ids) {
     const Cand* cand = cand_by_num(num);
@@ -1541,27 +1645,27 @@ Tuned tune_class(const Call& c, const Fingerprints& fp) {
     }
     legal.push_back(cand);
   }
-  if (legal.empty() || legal.front()->num != kCands[0].num) {
+  if (legal.empty() || legal.front()->num != ref_cand->num) {
     std::string why = "no candidate passed the resource check on this device";
-    if (const CandResult* r = result_for(&rep, kCands[0].num);
+    if (const CandResult* r = result_for(&rep, ref_cand->num);
         r != nullptr && !r->reason.empty())
       why = "the reference candidate cannot run: " + r->reason;
     return reference_tuned(c, fp, "fallback", why);
   }
 
   // ---- the reference, compiled and launched once -------------------------
-  Ready ref{&kCands[0], geometry(kCands[0], c.head_dim, c.gqa), Target{}, true};
+  Ready ref{ref_cand, geometry(*ref_cand, c.head_dim, c.gqa), Target{}, true};
   {
     std::string why;
-    if (!resolve_target(c, kCands[0], int(jit_mode()), &ref.target, &why)) {
-      CandResult* r = result_for(&rep, kCands[0].num);
+    if (!resolve_target(c, *ref_cand, int(jit_mode()), &ref.target, &why)) {
+      CandResult* r = result_for(&rep, ref_cand->num);
       r->status = "compile-failed";
       r->reason = why;
       ++rep.n_compile_failed;
       return reference_tuned(c, fp, "fallback",
                              "the reference candidate did not compile: " + why);
     }
-    CandResult* r = result_for(&rep, kCands[0].num);
+    CandResult* r = result_for(&rep, ref_cand->num);
     r->regs = ref.target.regs;
     r->impl = ref.target.impl;
     r->compile = ref.target.compile;
@@ -1636,7 +1740,7 @@ Tuned tune_class(const Call& c, const Fingerprints& fp) {
   // ---- budget ------------------------------------------------------------
   const double est = std::max(rep.probe_ms, 0.01);
   if (rep.budget_ms > 0 && est > double(rep.budget_ms) / 4.0) {
-    CandResult* r = result_for(&rep, kCands[0].num);
+    CandResult* r = result_for(&rep, ref_cand->num);
     r->status = "reference";
     r->median_ms = rep.probe_ms;
     r->reps = 1;
@@ -1722,7 +1826,7 @@ Tuned tune_class(const Call& c, const Fingerprints& fp) {
 
   // The reference: its probe launch was the warm-up, so it goes straight to
   // the timed samples every challenger gets.
-  CandResult* ref_r = result_for(&rep, kCands[0].num);
+  CandResult* ref_r = result_for(&rep, ref_cand->num);
   {
     std::vector<double> samples;
     bool ok = true;
@@ -1832,9 +1936,9 @@ Tuned tune_class(const Call& c, const Fingerprints& fp) {
   const Cand* winner = best_r->median_ms <
                                ref_r->median_ms * (1.0 - kMarginPct / 100.0)
                            ? cand_by_num(best_r->num)
-                           : &kCands[0];
-  if (winner == nullptr) winner = &kCands[0];
-  Ready* winner_ready = winner->num == kCands[0].num ? &ref : nullptr;
+                           : ref_cand;
+  if (winner == nullptr) winner = ref_cand;
+  Ready* winner_ready = winner->num == ref_cand->num ? &ref : nullptr;
   for (Ready& rd : ready)
     if (rd.cand->num == winner->num) winner_ready = &rd;
   if (winner_ready == nullptr)
@@ -1921,6 +2025,13 @@ Tuned resolve_class(const Call& c, const Fingerprints& fp) {
     if (cand == nullptr) {
       why = std::string("SONICBOOM_FATTN_CANDIDATE='") + forced +
             "' is not a candidate";
+    } else if (cand->family == 1 && call_family(c) != 1) {
+      // The row-owning kernel is staged for by the caller only when its
+      // family is in effect, so a forced family-1 candidate would read past
+      // the workspace padding. Refuse it rather than run it out of bounds.
+      why = "the row-owning candidate is not in effect for this call "
+            "(SONICBOOM_FATTN_FA2=0, canonical numerics, a forced JIT, or no "
+            "AOT image for this device)";
     } else {
       t.cand = cand;
       t.geo = geometry(*cand, c.head_dim, c.gqa);
@@ -1991,6 +2102,15 @@ Tuned resolve_class(const Call& c, const Fingerprints& fp) {
           cache_status = "invalidated";
           cache_reason = "the record names variant '" + std::string(cand->id) +
                          "', which is not bit-identical to the reference";
+          break;
+        }
+        if (cand->family != call_family(c)) {
+          // The workload key carries the family, so this can only happen for a
+          // record written by a build whose family rule differed; never apply
+          // a selection measured under the other schedule.
+          cache_status = "invalidated";
+          cache_reason = "the record names variant '" + std::string(cand->id) +
+                         "', which belongs to another schedule family";
           break;
         }
         Tuned t;

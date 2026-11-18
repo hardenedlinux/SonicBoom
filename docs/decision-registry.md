@@ -75,7 +75,11 @@ the class is retimed; `=0` skips measurement and keeps the defaults.
   that key fits; older files are reported as `version-mismatch` and not read.
   See `fattn-autotune.md`. The workload's KV span is bucketed to a power of two
   because every selectable candidate is measured bit-identical to the
-  reference; a non-bit-identical candidate must not join that set.
+  reference; a non-bit-identical candidate must not join that set. Candidates
+  belong to a schedule family (query-resident or row-owning), a tuning run
+  compares only the call's family against that family's reference, and the
+  family is part of the workload component (`…-fa2`), so a record measured
+  under one schedule is never read by the other.
 - **Spec ratio**: the `spec_verify_ratio` record in the per-SM JIT file.
 - **Plan cache**: `PlannerEnv` carries `decisions::fingerprint()`, an FNV-1a
   hash of the sorted `(name, scope, value)` triples. A new decision changes the
@@ -95,7 +99,7 @@ The decision root is `$SONICBOOM_TUNE_DIR`, else
 | reduction mode | `SONICBOOM_REDUCE=f64\|df32\|f32` |
 | hand-written tuner picks | `SONICBOOM_AUTOTUNE=0` (defaults), `=force` (retime) |
 | JIT candidate picks | `SONICBOOM_AUTOTUNE_JIT=0`, `SONICBOOM_AUTOTUNE_BUDGET_MS` |
-| `boom_fattn` kernel candidates | `SONICBOOM_FATTN_AUTOTUNE`, `SONICBOOM_FATTN_CANDIDATE` (see `fattn-autotune.md`) |
+| `boom_fattn` kernel candidates | `SONICBOOM_FATTN_AUTOTUNE`, `SONICBOOM_FATTN_CANDIDATE`, `SONICBOOM_FATTN_FA2` (schedule family, default on for head dim 128 / GQA 7 / global attention; see `fattn-autotune.md`) |
 | spec mode / probe | `SONICBOOM_SPEC=off\|on\|auto\|reckless`, `SONICBOOM_SPEC_PROBE_MS` |
 | spec drafter | `SONICBOOM_SPEC_DRAFTER=legacy` (original 2..4-gram); unset = long-match n-gram |
 | spec draft budget | `SONICBOOM_SPEC_MAX_DRAFTS=0..63` (ceiling; a fixed "on" defaults to 15, a policy-driven mode reaches the envelope) |
@@ -119,7 +123,7 @@ populated tune directory. The tables are:
 | `decode-attn` | fdec; partition P1 for a causal class, uniform `c64` for a windowed one |
 | `attention-decode` | the class-derived chunk (no per-tier picks) |
 | `attention-full` | the static tiled default |
-| `boom_fattn` | reference candidate 1 |
+| `boom_fattn` | reference candidate 1 (the row-owning family is not used under canonical numerics) |
 | `dense-gemm` | cuBLASLt |
 | `dense-f32` | chunked sgemm |
 | `mmq-j` | the policy decomposition and upstream's J rule |

@@ -367,7 +367,10 @@ bool run_chunk(const float* q, const float* k_batch, const float* v_batch,
 
 // The tuned path: stage, then let the candidate tuner select and launch (the
 // selection is a map lookup after the first call for this shape class).
-template <int HEAD_DIM, int GQA>
+// SPANPAD is the key padding the staged workspace is sized for: 16 keys for
+// the query-resident kernels' tiles, 32 for the row-owning family's 32-key
+// tile, which may read a whole tile past its last query row.
+template <int HEAD_DIM, int GQA, int SPANPAD = 16>
 bool run_tuned(const float* q, const float* k_batch, const float* v_batch,
                const float* k_cache, const float* v_cache,
                const uint64_t* start, uint64_t n_slots, int n, int n_heads_q,
@@ -377,9 +380,9 @@ bool run_tuned(const float* q, const float* k_batch, const float* v_batch,
   __half* k_ws = nullptr;
   __half* v_ws = nullptr;
   int ne_pad = 0;
-  if (!stage_kv<HEAD_DIM, 16>(q, k_batch, v_batch, k_cache, v_cache, start,
-                              n_slots, n, n_heads_q, n_heads_kv, window,
-                              kv_f16, kv_q8, &q16, &k_ws, &v_ws, &ne_pad))
+  if (!stage_kv<HEAD_DIM, SPANPAD>(q, k_batch, v_batch, k_cache, v_cache, start,
+                                   n_slots, n, n_heads_q, n_heads_kv, window,
+                                   kv_f16, kv_q8, &q16, &k_ws, &v_ws, &ne_pad))
     return false;
 
   fattn_tune::Call call;
@@ -415,6 +418,13 @@ bool run_tuned(const float* q, const float* k_batch, const float* v_batch,
 bool acc_f16() {
   const char* e = std::getenv("SONICBOOM_BOOM_FATTN_ACC");
   return !(e != nullptr && std::string_view(e) == "f32");
+}
+
+// Read per call for the same reason: it selects the row-owning schedule for
+// the shapes that have it (head dim 128, GQA 7, global attention).
+bool fa2_enabled() {
+  const char* e = std::getenv("SONICBOOM_FATTN_FA2");
+  return !(e != nullptr && std::string_view(e) == "0");
 }
 
 template <int HEAD_DIM, int GQA, int BR, int BK, int NW, bool F16ACC,
@@ -542,10 +552,18 @@ bool flash_attention_boom_fattn_chunk_dev_pos(
           q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
           n_heads_kv, sliding_window, scale, out, kv_f16, kv_q8);
     }
-    if (acc_f16())
+    if (acc_f16()) {
+      // Global d128/GQA-7 attention runs the row-owning schedule family by
+      // default; its 32-key tile needs the wider span padding. The tuner and
+      // this staging rule read the same switch.
+      if (fa2_enabled() && sliding_window == 0)
+        return run_tuned<128, 7, 32>(q, k_batch, v_batch, k_cache, v_cache,
+                                     start, n_slots, n, n_heads_q, n_heads_kv,
+                                     sliding_window, scale, out, kv_f16, kv_q8);
       return run_tuned<128, 7>(q, k_batch, v_batch, k_cache, v_cache, start,
                                n_slots, n, n_heads_q, n_heads_kv,
                                sliding_window, scale, out, kv_f16, kv_q8);
+    }
     return run_chunk<128, 7, 16, 16, 4, false>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
         n_heads_kv, sliding_window, scale, out, kv_f16, kv_q8);
@@ -750,8 +768,13 @@ void* fattn_tune::aot_kernel(int candidate, int head_dim, int gqa) {
     return qreg_aot_candidate<256, 4, 16, 16, 4>(candidate);
   if (head_dim == 256 && gqa == 8)
     return qreg_aot_candidate<256, 8, 16, 16, 4>(candidate);
-  if (head_dim == 128 && gqa == 7)
+  if (head_dim == 128 && gqa == 7) {
+    // The row-owning family: candidates 8 (BR 16, two blocks per SM) and 9
+    // (BR 32, one block per SM), both f16 accumulator.
+    if (candidate == 8) return fa2_aot<16, true, 2>();
+    if (candidate == 9) return fa2_aot<32, true, 1>();
     return qreg_aot_candidate<128, 7, 16, 16, 4>(candidate);
+  }
   if (head_dim == 128 && gqa == 6)
     return qreg_aot_candidate<128, 6, 16, 16, 4>(candidate);
   if (head_dim == 64 && gqa == 7)

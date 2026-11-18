@@ -42,6 +42,9 @@
 //   SONICBOOM_FATTN_AUTOTUNE=0|1|force  off / on (default) / retime now
 //   SONICBOOM_FATTN_CANDIDATE=<id>      force one candidate (by id or name)
 //   SONICBOOM_FATTN_CANDIDATES=<a,b,..> restrict the tuning set
+//   SONICBOOM_FATTN_FA2=0|1             row-owning schedule for d128/GQA-7
+//                                       global attention (default 1); 0 keeps
+//                                       the query-resident family
 //   SONICBOOM_FATTN_JIT=off|auto|force  AOT only / AOT-or-JIT / JIT only
 //   SONICBOOM_FATTN_REPORT=0|1          startup report (default 1)
 //   SONICBOOM_FATTN_REPORT_FILE=<path>  also write the full report there
@@ -63,7 +66,7 @@ namespace sonicboom::nn::cuda::fattn_tune {
 // Candidate registry version. Part of the persistent cache key: bump it when a
 // candidate is added, removed or its code changes, and every stored selection
 // for this backend is invalidated.
-constexpr int kRegistryVersion = 2;
+constexpr int kRegistryVersion = 3;
 
 // Fingerprint schema version. A selection key is
 //   f<version>/<capability>/<software>/<workload>
