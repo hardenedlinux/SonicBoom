@@ -706,6 +706,24 @@ void* qreg_aot() {
                                    VPAD, SPW, PIPE>);
 }
 
+// The row-owning (FlashAttention-2 order) kernel at head dim 128, GQA 7:
+// candidates 8 (BR 16) and 9 (BR 32) are the f16-accumulator pair the tuner
+// selects from; the f32-accumulator pair is instantiated for comparison only.
+template <int BR, bool F16ACC>
+void* fa2_aot() {
+  return reinterpret_cast<void*>(&boom_fattn_fa2_kernel<128, 7, BR, 32, F16ACC>);
+}
+
+__attribute__((used)) void* fa2_aot_all(int which) {
+  switch (which) {
+    case 0: return fa2_aot<16, true>();
+    case 1: return fa2_aot<32, true>();
+    case 2: return fa2_aot<16, false>();
+    case 3: return fa2_aot<32, false>();
+    default: return nullptr;
+  }
+}
+
 template <int HEAD_DIM, int GQA, int BR, int BK, int NW>
 void* qreg_aot_candidate(int candidate) {
   // Phase 1b's row-half split needs two dim slices.

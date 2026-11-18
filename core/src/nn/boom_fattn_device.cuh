@@ -1180,6 +1180,320 @@ boom_fattn_attn_qreg_kernel(
                               n_heads_q, n_heads_kv, ne_pad, scale, out);
 }
 
+// ---------------------------------------------------------------------------
+// FlashAttention-2 order, head dim 128: each warp owns whole query rows.
+//
+// One warp owns 16 query rows of one query head across the full head
+// dimension. S, the online-softmax state, P and O live in registers; only K
+// and V go through shared memory, and each key tile costs one barrier (the
+// staging barrier; the trailing barrier protects the buffer the next tile
+// overwrites). The deployed query-resident kernel instead splits a unit's
+// head dimension across NW warps and round-trips partial S (f32) and P (f16)
+// through shared memory with three barriers per tile.
+//
+// Warp mapping and the key-tile range are the query-resident body's:
+// `(BR/16) * GQA` warps for one KV head, grid `(ceil(n/BR), n_heads_kv)`,
+// warp `qg = warp % GQA` serving query head `kvh*GQA + qg`, rows
+// `blockIdx.x*BR + rc*16 .. +15`. Candidate layouts differ only in BR, which
+// changes which warps share a staged tile and never a row's arithmetic.
+// ---------------------------------------------------------------------------
+
+// Four 8x8 b16 matrices from shared memory; lane L supplies the address of
+// row (L % 8) of matrix (L / 8). The caller's address pattern selects which
+// rows and columns each matrix covers.
+__device__ __forceinline__ void boom_fa2_ldsm_x4(uint32_t r[4],
+                                                 const __half* p) {
+  const uint32_t addr =
+      static_cast<uint32_t>(__cvta_generic_to_shared(const_cast<__half*>(p)));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+               "{%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(addr));
+}
+
+// Two f32 to one packed half2 word: x in the low half, y in the high half.
+__device__ __forceinline__ uint32_t boom_fa2_pack2(float x, float y) {
+  const __half2 h = __floats2half2_rn(x, y);
+  return *reinterpret_cast<const uint32_t*>(&h);
+}
+
+template <int HEAD_DIM, int GQA, int BR, int BC, bool F16ACC>
+__global__ void __launch_bounds__((BR / 16) * GQA * 32)
+boom_fattn_fa2_kernel(
+    const __half* __restrict__ q, const __half* __restrict__ k_ws,
+    const __half* __restrict__ v_ws, const uint64_t* __restrict__ start_ptr,
+    uint64_t n_slots, uint64_t window, int n, int n_heads_q, int n_heads_kv,
+    int ne_pad, float scale, float* __restrict__ out) {
+  constexpr int WARPS = (BR / 16) * GQA;
+  constexpr int KS = HEAD_DIM + 8;   // K tile row stride (halves)
+  constexpr int VS = BC + 8;         // V tile row stride (halves)
+  constexpr int NT = HEAD_DIM / 8;   // O n8 tiles
+  constexpr int KSTEPS = HEAD_DIM / 16;
+  constexpr int SN = BC / 8;         // S n8 tiles
+  static_assert(HEAD_DIM % 16 == 0, "head dim is a whole number of k16 steps");
+  static_assert(BC % 16 == 0, "key tile is a whole number of k16 steps");
+  static_assert(BR % 16 == 0, "query tile is a whole number of 16-row units");
+  static_assert(WARPS <= 32, "boom_fattn launch geometry is at most 1024 threads");
+
+  extern __shared__ __half smem[];
+  __half* kbuf = smem;                    // 2 * BC * KS
+  __half* vbuf = kbuf + 2 * BC * KS;      // 2 * HEAD_DIM * VS
+
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int qg = warp % GQA;
+  const int rc = warp / GQA;
+  const int kvh = blockIdx.y;
+  const int hq = kvh * GQA + qg;
+  const int qr = blockIdx.x * BR + rc * 16;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+
+  const uint64_t start = *start_ptr;
+  const uint64_t key_end = start + (uint64_t)n - 1;
+  const int iq0 = qr + g;
+  const int iq1 = qr + g + 8;
+  const uint64_t p0 = start + (uint64_t)iq0;
+  const uint64_t p1 = start + (uint64_t)iq1;
+  uint64_t low0 = 0, low1 = 0;
+  if (window > 0) {
+    low0 = (p0 + 1 >= window) ? p0 - (window - 1) : 0;
+    low1 = (p1 + 1 >= window) ? p1 - (window - 1) : 0;
+  }
+
+  // Block-uniform key-tile range, as the query-resident body derives it. The
+  // tiles are aligned to absolute multiples of BC from the span base, so a
+  // row's arithmetic does not depend on the chunk split.
+  const uint64_t pblk = start + (uint64_t)blockIdx.x * (uint64_t)BR;
+  uint64_t key_start = 0;
+  if (window > 0) key_start = (pblk + 1 >= window) ? pblk - (window - 1) : 0;
+  const uint64_t j0_start = key_start - key_start % (uint64_t)BC;
+  const uint64_t last_q =
+      start + (uint64_t)blockIdx.x * (uint64_t)BR + (uint64_t)(BR - 1);
+  const uint64_t key_last = last_q < key_end ? last_q : key_end;
+  const uint64_t base = boom_span_base(start, window);
+
+  // Q, once per call: this warp's whole 16-row unit of its query head.
+  uint32_t qreg[KSTEPS][4];
+#pragma unroll
+  for (int j = 0; j < KSTEPS; ++j)
+    boom_load_q(qreg[j], q, hq, n_heads_q, HEAD_DIM, qr, j * 16, n);
+
+  // Stage one key tile: K as [key][d] with padded rows, V as [d][key].
+  auto stage = [&](int buf, uint64_t rel0) {
+    __half* kd = kbuf + buf * (BC * KS);
+    for (int i = threadIdx.x; i < BC * HEAD_DIM / 8; i += WARPS * 32) {
+      const int e = i * 8;
+      const int key = e / HEAD_DIM;
+      const int dd = e - key * HEAD_DIM;
+      boom_cp_async_16(kd + key * KS + dd,
+                       k_ws + ((size_t)kvh * (size_t)ne_pad +
+                               (size_t)(rel0 + (uint64_t)key)) *
+                                  (size_t)HEAD_DIM +
+                           dd);
+    }
+    __half* vd = vbuf + buf * (HEAD_DIM * VS);
+    for (int i = threadIdx.x; i < HEAD_DIM * BC / 8; i += WARPS * 32) {
+      const int e = i * 8;
+      const int dim = e / BC;
+      const int koff = e - dim * BC;
+      boom_cp_async_16(vd + dim * VS + koff,
+                       v_ws + ((size_t)kvh * (size_t)HEAD_DIM + (size_t)dim) *
+                                  (size_t)ne_pad +
+                           rel0 + (uint64_t)koff);
+    }
+  };
+
+  using ACC_T = boom_cond_t<F16ACC, uint32_t, float>;
+  constexpr int ACC_N = F16ACC ? 2 : 4;
+  ACC_T o[NT][ACC_N] = {};
+  float m[2] = {-1e30f, -1e30f};
+  float l[2] = {0.0f, 0.0f};
+
+  // One key tile: QK^T, mask + online softmax, P in registers, PV. `s` holds
+  // the S tile and is overwritten by P in place after the row max is folded.
+  const float c = scale * 1.4426950408889634f;  // scale * log2(e)
+  auto compute = [&](const __half* kt, const __half* vt, uint64_t j0) {
+    float s[SN][4];
+#pragma unroll
+    for (int sn = 0; sn < SN; ++sn) {
+      s[sn][0] = 0.f;
+      s[sn][1] = 0.f;
+      s[sn][2] = 0.f;
+      s[sn][3] = 0.f;
+    }
+    // a) S = Q K^T. Two n8 key subtiles per ldmatrix.x4; the k-step loop is
+    //    inside the subtile-pair loop, which fixes the accumulation order.
+#pragma unroll
+    for (int sp = 0; sp < SN; sp += 2) {
+#pragma unroll
+      for (int j = 0; j < KSTEPS; ++j) {
+        uint32_t r[4];
+        boom_fa2_ldsm_x4(r, kt + (sp * 8 + (lane / 16) * 8 + lane % 8) * KS +
+                                j * 16 + ((lane / 8) % 2) * 8);
+        const uint32_t b0[2] = {r[0], r[1]};
+        const uint32_t b1[2] = {r[2], r[3]};
+        boom_mma_f32(s[sp], qreg[j], b0);
+        boom_mma_f32(s[sp + 1], qreg[j], b1);
+      }
+    }
+
+    // b) scale and mask (causal, window, past the last key)
+    const bool whole_tile_open =
+        window == 0 && j0 + (uint64_t)(BC - 1) <= p0 && j0 + (uint64_t)(BC - 1) <= key_end;
+    if (whole_tile_open) {
+#pragma unroll
+      for (int sn = 0; sn < SN; ++sn) {
+        s[sn][0] *= c;
+        s[sn][1] *= c;
+        s[sn][2] *= c;
+        s[sn][3] *= c;
+      }
+    } else {
+#pragma unroll
+      for (int sn = 0; sn < SN; ++sn) {
+        const uint64_t k0 = j0 + (uint64_t)(sn * 8 + t * 2);
+        const uint64_t k1 = k0 + 1;
+        s[sn][0] = (k0 > p0 || k0 < low0 || k0 > key_end) ? -1e30f : s[sn][0] * c;
+        s[sn][1] = (k1 > p0 || k1 < low0 || k1 > key_end) ? -1e30f : s[sn][1] * c;
+        s[sn][2] = (k0 > p1 || k0 < low1 || k0 > key_end) ? -1e30f : s[sn][2] * c;
+        s[sn][3] = (k1 > p1 || k1 < low1 || k1 > key_end) ? -1e30f : s[sn][3] * c;
+      }
+    }
+
+    // c) online softmax (one max/sum pair per row)
+    float mx0 = s[0][0], mx1 = s[0][2];
+#pragma unroll
+    for (int sn = 0; sn < SN; ++sn) {
+      mx0 = fmaxf(mx0, fmaxf(s[sn][0], s[sn][1]));
+      mx1 = fmaxf(mx1, fmaxf(s[sn][2], s[sn][3]));
+    }
+    mx0 = boom_rmax4(mx0);
+    mx1 = boom_rmax4(mx1);
+    const float m_new0 = fmaxf(m[0], mx0);
+    const float m_new1 = fmaxf(m[1], mx1);
+    const float rs0 = exp2f(m[0] - m_new0);
+    const float rs1 = exp2f(m[1] - m_new1);
+    float sum0 = 0.f, sum1 = 0.f;
+#pragma unroll
+    for (int sn = 0; sn < SN; ++sn) {
+      const float a0 = (s[sn][0] > -1e29f) ? exp2f(s[sn][0] - m_new0) : 0.0f;
+      const float a1 = (s[sn][1] > -1e29f) ? exp2f(s[sn][1] - m_new0) : 0.0f;
+      const float b0 = (s[sn][2] > -1e29f) ? exp2f(s[sn][2] - m_new1) : 0.0f;
+      const float b1 = (s[sn][3] > -1e29f) ? exp2f(s[sn][3] - m_new1) : 0.0f;
+      s[sn][0] = a0;
+      s[sn][1] = a1;
+      s[sn][2] = b0;
+      s[sn][3] = b1;
+      sum0 += a0;
+      sum0 += a1;
+      sum1 += b0;
+      sum1 += b1;
+    }
+    l[0] = l[0] * rs0 + boom_rsum4(sum0);
+    l[1] = l[1] * rs1 + boom_rsum4(sum1);
+    m[0] = m_new0;
+    m[1] = m_new1;
+
+    // O rows scaled by the rescale factor (f16 accumulate: two halves per row).
+#pragma unroll
+    for (int i = 0; i < NT; ++i) {
+      if constexpr (F16ACC) {
+        const __half2 h0 = __float2half2_rn(rs0);
+        const __half2 h1 = __float2half2_rn(rs1);
+        o[i][0] = boom_as_u32(__hmul2(boom_as_h2(o[i][0]), h0));
+        o[i][1] = boom_as_u32(__hmul2(boom_as_h2(o[i][1]), h1));
+      } else {
+        o[i][0] *= rs0;
+        o[i][1] *= rs0;
+        o[i][2] *= rs1;
+        o[i][3] *= rs1;
+      }
+    }
+
+    // d) P to A fragments in registers, then e) O += P V.
+#pragma unroll
+    for (int kk = 0; kk < BC / 16; ++kk) {
+      uint32_t a[4];
+      a[0] = boom_fa2_pack2(s[2 * kk][0], s[2 * kk][1]);
+      a[1] = boom_fa2_pack2(s[2 * kk][2], s[2 * kk][3]);
+      a[2] = boom_fa2_pack2(s[2 * kk + 1][0], s[2 * kk + 1][1]);
+      a[3] = boom_fa2_pack2(s[2 * kk + 1][2], s[2 * kk + 1][3]);
+#pragma unroll
+      for (int i = 0; i < NT; i += 2) {
+        uint32_t r[4];
+        boom_fa2_ldsm_x4(r, vt + (i * 8 + (lane / 16) * 8 + lane % 8) * VS +
+                                kk * 16 + ((lane / 8) % 2) * 8);
+        const uint32_t b0[2] = {r[0], r[1]};
+        const uint32_t b1[2] = {r[2], r[3]};
+        if constexpr (F16ACC) {
+          boom_mma_f16(o[i], a, b0);
+          boom_mma_f16(o[i + 1], a, b1);
+        } else {
+          boom_mma_f32(o[i], a, b0);
+          boom_mma_f32(o[i + 1], a, b1);
+        }
+      }
+    }
+  };
+
+  const int n_tiles = (int)((key_last - j0_start) / (uint64_t)BC) + 1;
+  uint64_t j0 = j0_start;
+  int buf = 0;
+  stage(0, j0_start - base);
+  boom_cp_commit();
+  for (int tile = 0; tile < n_tiles; ++tile) {
+    if (tile + 1 < n_tiles) {
+      stage(buf ^ 1, j0 + (uint64_t)BC - base);
+      boom_cp_commit();
+      boom_cp_wait<1>();
+    } else {
+      boom_cp_wait<0>();
+    }
+    __syncthreads();  // staged tile visible to every warp
+    // Tiles past both of this warp's rows are fully masked; the staging and
+    // the two barriers still run.
+    if (j0 <= p1)
+      compute(kbuf + buf * (BC * KS), vbuf + buf * (HEAD_DIM * VS), j0);
+    __syncthreads();  // the next tile may overwrite this buffer
+    buf ^= 1;
+    j0 += (uint64_t)BC;
+  }
+
+  const float inv0 = 1.0f / l[0];
+  const float inv1 = 1.0f / l[1];
+  const size_t row_stride = (size_t)n_heads_q * HEAD_DIM;
+  const int dd0 = t * 2;
+  float* out0 = out + (size_t)iq0 * row_stride + (size_t)hq * HEAD_DIM + dd0;
+  float* out1 = out + (size_t)iq1 * row_stride + (size_t)hq * HEAD_DIM + dd0;
+  const bool w0 = iq0 < n;
+  const bool w1 = iq1 < n;
+#pragma unroll
+  for (int i = 0; i < NT; ++i) {
+    if constexpr (F16ACC) {
+      const float2 f0 = __half22float2(boom_as_h2(o[i][0]));
+      const float2 f1 = __half22float2(boom_as_h2(o[i][1]));
+      if (w0) {
+        out0[i * 8] = f0.x * inv0;
+        out0[i * 8 + 1] = f0.y * inv0;
+      }
+      if (w1) {
+        out1[i * 8] = f1.x * inv1;
+        out1[i * 8 + 1] = f1.y * inv1;
+      }
+    } else {
+      if (w0) {
+        out0[i * 8] = o[i][0] * inv0;
+        out0[i * 8 + 1] = o[i][1] * inv0;
+      }
+      if (w1) {
+        out1[i * 8] = o[i][2] * inv1;
+        out1[i * 8 + 1] = o[i][3] * inv1;
+      }
+    }
+  }
+}
+
 
 }  // namespace
 }  // namespace sonicboom::nn::cuda
