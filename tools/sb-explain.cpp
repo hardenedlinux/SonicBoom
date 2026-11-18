@@ -76,9 +76,10 @@ constexpr Knob kKnobs[] = {
      "decode attention pair: auto|own (prefill is always boom_fattn)"},
     {"SONICBOOM_ATTN_DECODE", "auto", "decode attention: auto|own|codegen"},
     {"SONICBOOM_ATTN_DECODE_CHUNK", "identity rule", "decode split-KV chunk"},
-    {"SONICBOOM_FATTN_FA2", "on",
+    {"SONICBOOM_FATTN_FA2", "off",
      "prefill attention schedule at head dim 128 / GQA 7 / global attention: "
-     "on = row-owning (one warp per 16 query rows), 0 = query-resident"},
+     "1 = row-owning (one warp per 16 query rows, opt-in), "
+     "0 or unset = query-resident"},
     {"SONICBOOM_ATTN_CLASS", "auto (full.tiled above 2048 tokens)",
      "attention class by op attributes: auto|full.score-gemm|full.tiled|"
      "full.codegen|full.own|full.scalar"},

@@ -420,11 +420,12 @@ bool acc_f16() {
   return !(e != nullptr && std::string_view(e) == "f32");
 }
 
-// Read per call for the same reason: it selects the row-owning schedule for
-// the shapes that have it (head dim 128, GQA 7, global attention).
+// Read per call for the same reason: SONICBOOM_FATTN_FA2=1 selects the
+// row-owning schedule for the shapes that have it (head dim 128, GQA 7,
+// global attention); anything else keeps the query-resident family.
 bool fa2_enabled() {
   const char* e = std::getenv("SONICBOOM_FATTN_FA2");
-  return !(e != nullptr && std::string_view(e) == "0");
+  return e != nullptr && std::string_view(e) == "1";
 }
 
 template <int HEAD_DIM, int GQA, int BR, int BK, int NW, bool F16ACC,
@@ -553,8 +554,8 @@ bool flash_attention_boom_fattn_chunk_dev_pos(
           n_heads_kv, sliding_window, scale, out, kv_f16, kv_q8);
     }
     if (acc_f16()) {
-      // Global d128/GQA-7 attention runs the row-owning schedule family by
-      // default; its 32-key tile needs the wider span padding. The tuner and
+      // Global d128/GQA-7 attention runs the row-owning schedule family when
+      // opted in; its 32-key tile needs the wider span padding. The tuner and
       // this staging rule read the same switch.
       if (fa2_enabled() && sliding_window == 0)
         return run_tuned<128, 7, 32>(q, k_batch, v_batch, k_cache, v_cache,

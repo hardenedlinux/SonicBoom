@@ -99,7 +99,7 @@ The decision root is `$SONICBOOM_TUNE_DIR`, else
 | reduction mode | `SONICBOOM_REDUCE=f64\|df32\|f32` |
 | hand-written tuner picks | `SONICBOOM_AUTOTUNE=0` (defaults), `=force` (retime) |
 | JIT candidate picks | `SONICBOOM_AUTOTUNE_JIT=0`, `SONICBOOM_AUTOTUNE_BUDGET_MS` |
-| `boom_fattn` kernel candidates | `SONICBOOM_FATTN_AUTOTUNE`, `SONICBOOM_FATTN_CANDIDATE`, `SONICBOOM_FATTN_FA2` (schedule family, default on for head dim 128 / GQA 7 / global attention; see `fattn-autotune.md`) |
+| `boom_fattn` kernel candidates | `SONICBOOM_FATTN_AUTOTUNE`, `SONICBOOM_FATTN_CANDIDATE`, `SONICBOOM_FATTN_FA2` (schedule family, opt-in `=1` for head dim 128 / GQA 7 / global attention, default off; see `fattn-autotune.md`) |
 | spec mode / probe | `SONICBOOM_SPEC=off\|on\|auto\|reckless`, `SONICBOOM_SPEC_PROBE_MS` |
 | spec drafter | `SONICBOOM_SPEC_DRAFTER=legacy` (original 2..4-gram); unset = long-match n-gram |
 | spec draft budget | `SONICBOOM_SPEC_MAX_DRAFTS=0..63` (ceiling; a fixed "on" defaults to 15, a policy-driven mode reaches the envelope) |
