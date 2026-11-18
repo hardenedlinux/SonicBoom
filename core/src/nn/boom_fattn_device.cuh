@@ -1217,8 +1217,8 @@ __device__ __forceinline__ uint32_t boom_fa2_pack2(float x, float y) {
   return *reinterpret_cast<const uint32_t*>(&h);
 }
 
-template <int HEAD_DIM, int GQA, int BR, int BC, bool F16ACC>
-__global__ void __launch_bounds__((BR / 16) * GQA * 32)
+template <int HEAD_DIM, int GQA, int BR, int BC, bool F16ACC, int MINB>
+__global__ void __launch_bounds__((BR / 16) * GQA * 32, MINB)
 boom_fattn_fa2_kernel(
     const __half* __restrict__ q, const __half* __restrict__ k_ws,
     const __half* __restrict__ v_ws, const uint64_t* __restrict__ start_ptr,

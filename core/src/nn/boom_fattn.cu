@@ -709,17 +709,18 @@ void* qreg_aot() {
 // The row-owning (FlashAttention-2 order) kernel at head dim 128, GQA 7:
 // candidates 8 (BR 16) and 9 (BR 32) are the f16-accumulator pair the tuner
 // selects from; the f32-accumulator pair is instantiated for comparison only.
-template <int BR, bool F16ACC>
+template <int BR, bool F16ACC, int MINB>
 void* fa2_aot() {
-  return reinterpret_cast<void*>(&boom_fattn_fa2_kernel<128, 7, BR, 32, F16ACC>);
+  return reinterpret_cast<void*>(
+      &boom_fattn_fa2_kernel<128, 7, BR, 32, F16ACC, MINB>);
 }
 
 __attribute__((used)) void* fa2_aot_all(int which) {
   switch (which) {
-    case 0: return fa2_aot<16, true>();
-    case 1: return fa2_aot<32, true>();
-    case 2: return fa2_aot<16, false>();
-    case 3: return fa2_aot<32, false>();
+    case 0: return fa2_aot<16, true, 2>();
+    case 1: return fa2_aot<32, true, 1>();
+    case 2: return fa2_aot<16, false, 2>();
+    case 3: return fa2_aot<32, false, 1>();
     default: return nullptr;
   }
 }
