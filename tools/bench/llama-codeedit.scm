@@ -35,7 +35,7 @@
 ;; Usage:
 ;;   guile tools/bench/llama-codeedit.scm --server PATH --model GGUF
 ;;        --data DIR --ctx CTX --gen-tokens FILE --arm off|ngram-mod
-;;        --reps N --out DIR
+;;        --reps N --out DIR [--moe-args TEXT]
 ;;
 ;; Output, one line per turn per rep, then one line per rep:
 ;;   turn=NN rep=R prompt_n=P predicted_n=G predicted_ms=T
@@ -164,14 +164,20 @@
 (define (pid-alive? pid)
   (catch #t (lambda () (kill pid 0) #t) (lambda _ #f)))
 
-(define (start-server server model ctx arm pidfile logfile)
+;; MOE-ARGS is the llama.cpp offload argument text for a routed-expert model
+;; (e.g. "-ncmoe 16"), or "" when the model is dense. It holds no spaces
+;; inside an argument, so splitting on spaces recovers argv.
+(define (start-server server model ctx arm pidfile logfile moe-args)
   (let* ((args (append (list server "-m" model "-ngl" "99" "-fa" "on"
                              "-np" "1" "--no-webui" "--seed" "1234"
                              "-c" (number->string ctx)
                              "--port" (number->string port-number))
                        (if (string=? arm "ngram-mod")
                            (list "--spec-type" "ngram-mod")
-                           '())))
+                           '())
+                       (if (string-null? moe-args)
+                           '()
+                           (string-split moe-args #\space))))
          (launcher (string-append out-dir "/server-" arm ".sh")))
     ;; The launcher records its own pid and becomes the server, so the pid
     ;; read back is the server's. It also puts the server's own directory on
@@ -257,7 +263,7 @@
 
 (define (parse-args args)
   (let loop ((rest args) (server #f) (model #f) (ctx #f) (gen-file #f)
-             (arm #f) (reps #f))
+             (arm #f) (reps #f) (moe-args ""))
     (cond
      ((null? rest)
       (unless (and server model data-dir ctx gen-file arm reps)
@@ -265,27 +271,29 @@
              --ctx CTX --gen-tokens FILE --arm off|ngram-mod --reps N --out DIR"))
       (unless (or (string=? arm "off") (string=? arm "ngram-mod"))
         (die "llama-codeedit: --arm must be off or ngram-mod"))
-      (list server model ctx gen-file arm reps))
+      (list server model ctx gen-file arm reps moe-args))
      ((string=? (car rest) "--server")
-      (loop (cddr rest) (cadr rest) model ctx gen-file arm reps))
+      (loop (cddr rest) (cadr rest) model ctx gen-file arm reps moe-args))
      ((string=? (car rest) "--model")
-      (loop (cddr rest) server (cadr rest) ctx gen-file arm reps))
+      (loop (cddr rest) server (cadr rest) ctx gen-file arm reps moe-args))
      ((string=? (car rest) "--data")
       (set! data-dir (cadr rest))
-      (loop (cddr rest) server model ctx gen-file arm reps))
+      (loop (cddr rest) server model ctx gen-file arm reps moe-args))
      ((string=? (car rest) "--ctx")
       (loop (cddr rest) server model (string->number (cadr rest)) gen-file arm
-            reps))
+            reps moe-args))
      ((string=? (car rest) "--gen-tokens")
-      (loop (cddr rest) server model ctx (cadr rest) arm reps))
+      (loop (cddr rest) server model ctx (cadr rest) arm reps moe-args))
      ((string=? (car rest) "--arm")
-      (loop (cddr rest) server model ctx gen-file (cadr rest) reps))
+      (loop (cddr rest) server model ctx gen-file (cadr rest) reps moe-args))
      ((string=? (car rest) "--reps")
       (loop (cddr rest) server model ctx gen-file arm
-            (string->number (cadr rest))))
+            (string->number (cadr rest)) moe-args))
      ((string=? (car rest) "--out")
       (set! out-dir (cadr rest))
-      (loop (cddr rest) server model ctx gen-file arm reps))
+      (loop (cddr rest) server model ctx gen-file arm reps moe-args))
+     ((string=? (car rest) "--moe-args")
+      (loop (cddr rest) server model ctx gen-file arm reps (cadr rest)))
      (else (die "llama-codeedit: unknown option ~a" (car rest))))))
 
 ;; One rep: every turn, in order; returns (gen . ms) sums and the contents.
@@ -325,6 +333,7 @@
          (gen-file (list-ref parsed 3))
          (arm (list-ref parsed 4))
          (reps (list-ref parsed 5))
+         (moe-args (list-ref parsed 6))
          (turns (read-turns))
          (gens (read-gen-tokens gen-file)))
     (set! arm-name arm)
@@ -337,13 +346,13 @@
           (let loop ((rep 0) (pid #f))
             (when (< rep reps)
               (when pid (stop-server pid))
-              (let ((pid (start-server server model ctx arm pidfile logfile)))
+              (let ((pid (start-server server model ctx arm pidfile logfile moe-args)))
                 (run-rep turns gens rep)
                 (loop (+ rep 1) pid)))
             (when pid (stop-server pid)))
           ;; The no-spec arm keeps one server for the run; it starts with an
           ;; empty cache.
-          (let ((pid (start-server server model ctx arm pidfile logfile)))
+          (let ((pid (start-server server model ctx arm pidfile logfile moe-args)))
             (let loop ((rep 0))
               (when (< rep reps)
                 (run-rep turns gens rep)

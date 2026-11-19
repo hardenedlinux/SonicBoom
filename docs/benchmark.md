@@ -73,6 +73,19 @@ machine, the same session, `llama-bench -ngl 99`. SonicBoom's correctness
 reference is its own CPU path (and the committed goldens). A number without a
 baseline row is a regression check, not a claim.
 
+A routed-expert model does not fit an 8 GB card with every weight in VRAM.
+`tools/bench.sh` reads `expert_count` from the GGUF key-value block; when it is
+non-zero, every llama.cpp arm (llama-bench and llama-server alike) keeps the
+experts of the first L layers on the host with `--n-cpu-moe L`. L is chosen by
+probing from 0 upward in steps of 4 with llama-bench until the model loads: the
+smallest count that allocates leaves the most weights on the GPU, so the
+reference runs as fast as the card allows rather than at an arbitrary split.
+A build without `--n-cpu-moe` uses `-ot '\.ffn_(up|down|gate)_exps\.=CPU'`
+instead (no layer count is needed there); a build with neither skips the
+llama.cpp column and says so. Dense models (no `expert_count` key) run the
+exact commands they always did. The chosen arguments are printed in the run's
+reproduction header.
+
 ## Run protocol
 
 - Every metric is the **median of independent process runs** (`--runs`,

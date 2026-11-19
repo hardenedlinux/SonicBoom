@@ -237,6 +237,72 @@ else
       LLAMA_WARN="WARNING: llama.cpp is not 43fe9; ratios are not comparable with the README, which is measured against llama.cpp 43fe9."
       echo "$LLAMA_WARN" ;;
   esac
+
+  # --- routed-expert offload ------------------------------------------------
+  # A routed-expert model (GGUF expert_count > 0) does not fit an 8 GB card
+  # with every weight in VRAM, so the llama.cpp arms keep the experts of the
+  # first L layers on the host. L is the smallest count llama-bench allocates
+  # with: every layer closer to the GPU stays there, and none is given up for
+  # headroom the card does not need. Dense models get no extra argument.
+  #
+  # expert_count is read from the GGUF key-value block, whose layout is fixed
+  # (uint64 key length, key bytes, uint32 value type, value); no SonicBoom
+  # program reports it.
+  gguf_u32() { # FILE KEY-SUFFIX -> UINT32 value, empty when absent
+    local file=$1 suffix=$2 m off key klen ty
+    m=$(LC_ALL=C grep -aboE "[a-z0-9_]+\.$suffix" "$file" 2>/dev/null |
+        sed -n '1p') || true
+    [ -n "$m" ] || return 0
+    off=${m%%:*}; key=${m#*:}; klen=${#key}
+    ty=$(od -An -t u4 -j $((off + klen)) -N 4 "$file" 2>/dev/null | tr -d ' ')
+    [ "$ty" = 4 ] || return 0
+    od -An -t u4 -j $((off + klen + 4)) -N 4 "$file" 2>/dev/null | tr -d ' '
+  }
+
+  LLAMA_MOE_ARGS=()    # appended to every llama-bench command
+  LLAMA_MOE_SERVER=""  # the same arguments for llama-server, one string
+  LLAMA_MOE_INFO=""
+  moe_experts=$(gguf_u32 "$GGUF" expert_count)
+  if [ -n "$moe_experts" ] && [ "$moe_experts" -gt 0 ]; then
+    moe_blocks=$(gguf_u32 "$GGUF" block_count)
+    [ -n "$moe_blocks" ] || moe_blocks=$moe_experts
+    bench_help=$("$LLAMA_BENCH" --help 2>&1 || true)
+    server_help=$("$LLAMA_SERVER" --help 2>&1 || true)
+    if printf '%s\n' "$bench_help" | grep -q -- '--n-cpu-moe' &&
+       printf '%s\n' "$server_help" | grep -q -- '--n-cpu-moe'; then
+      # The first count that loads and measures; probing upward in steps of 4
+      # starts from the card holding everything and trades layers away only
+      # as far as allocation actually requires.
+      moe_layers=""
+      for ((l=0; l<=moe_blocks; l+=4)); do
+        probe=$(mktemp)
+        if "$LLAMA_BENCH" -m "$GGUF" -p 512 -n 1 -d 0 -ngl 99 -fa on -r 1 \
+             -ncmoe "$l" -o csv >"$probe" 2>&1; then
+          moe_layers=$l
+          rm -f "$probe"
+          break
+        fi
+        rm -f "$probe"
+      done
+      if [ -n "$moe_layers" ]; then
+        LLAMA_MOE_ARGS=(-ncmoe "$moe_layers")
+        LLAMA_MOE_SERVER="-ncmoe $moe_layers"
+        LLAMA_MOE_INFO="MoE offload: $moe_experts experts over $moe_blocks blocks; llama.cpp keeps the experts of the first $moe_layers layers on the host (--n-cpu-moe $moe_layers)"
+      else
+        LLAMA_MOE_INFO="MoE offload: $moe_experts experts over $moe_blocks blocks; no --n-cpu-moe count loaded, llama.cpp arms are left unoffloaded"
+      fi
+    elif printf '%s\n' "$bench_help" | grep -q -- '--override-tensor' &&
+         printf '%s\n' "$server_help" | grep -q -- '--override-tensor'; then
+      LLAMA_MOE_ARGS=(-ot '\.ffn_(up|down|gate)_exps\.=CPU')
+      LLAMA_MOE_SERVER='-ot \.ffn_(up|down|gate)_exps\.=CPU'
+      LLAMA_MOE_INFO="MoE offload: $moe_experts experts over $moe_blocks blocks; llama.cpp -ot '\.ffn_(up|down|gate)_exps\.=CPU' (no --n-cpu-moe in this build)"
+    else
+      LLAMA_MOE_INFO="MoE offload: unsupported (this llama.cpp build has neither --n-cpu-moe nor --override-tensor); llama.cpp arms are not compared"
+      NO_LLAMA=1
+      LLAMA_WARN=""
+    fi
+    [ -z "$LLAMA_MOE_INFO" ] || echo "$LLAMA_MOE_INFO"
+  fi
 fi
 
 export LD_LIBRARY_PATH="$ROOT/build/core${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -588,7 +654,7 @@ if [ "$NO_LLAMA" = 0 ]; then
   for ((i=1;i<=RUNS;i++)); do
     f=$(mktemp)
     "$LLAMA_BENCH" -m "$GGUF" -p 0,512 -n 64,0 -d 0,512 -ngl 99 -fa on -r 3 -o csv \
-      >"$f" 2>/dev/null || true
+      ${LLAMA_MOE_ARGS[@]+"${LLAMA_MOE_ARGS[@]}"} >"$f" 2>/dev/null || true
     csvs+=("$f")
   done
   measure_end
@@ -642,7 +708,7 @@ if [ "$LONG" = 1 ]; then
     for ((i=1;i<=RUNS;i++)); do
       f=$(mktemp)
       "$LLAMA_BENCH" -m "$GGUF" -p "$p" -n "$g" -d "$d" -ngl 99 -fa on -r 1 -o csv \
-        >"$f" 2>/dev/null || true
+        ${LLAMA_MOE_ARGS[@]+"${LLAMA_MOE_ARGS[@]}"} >"$f" 2>/dev/null || true
       local v
       v=$(awk -F, -v P="$p" -v G="$g" -v D="$d" '
             {gsub(/"/,"")}
@@ -721,17 +787,21 @@ if [ "$SPEC" = 1 ]; then
     LLAMA_OK=1
     echo "code editing: llama.cpp no spec, $RUNS reps" >&2
     measure_begin "codeedit llama off"
+    moe_server_opt=()
+    [ -z "$LLAMA_MOE_SERVER" ] || moe_server_opt=(--moe-args "$LLAMA_MOE_SERVER")
     guile "$ROOT/tools/bench/llama-codeedit.scm" --server "$LLAMA_SERVER" \
       --model "$GGUF" --data "$DATA" --ctx "$CTX" \
       --gen-tokens "$SPEC_OUT/boom_off.txt" --arm off --reps "$RUNS" \
-      --out "$SPEC_OUT/llama_off" > "$SPEC_OUT/llama_off.txt"
+      --out "$SPEC_OUT/llama_off" "${moe_server_opt[@]}" \
+      > "$SPEC_OUT/llama_off.txt"
     measure_end
     echo "code editing: llama.cpp ngram-mod, $RUNS reps" >&2
     measure_begin "codeedit llama ngram-mod"
     guile "$ROOT/tools/bench/llama-codeedit.scm" --server "$LLAMA_SERVER" \
       --model "$GGUF" --data "$DATA" --ctx "$CTX" \
       --gen-tokens "$SPEC_OUT/boom_off.txt" --arm ngram-mod --reps "$RUNS" \
-      --out "$SPEC_OUT/llama_ngram" > "$SPEC_OUT/llama_ngram.txt"
+      --out "$SPEC_OUT/llama_ngram" "${moe_server_opt[@]}" \
+      > "$SPEC_OUT/llama_ngram.txt"
     measure_end
   fi
 
