@@ -420,12 +420,12 @@ bool acc_f16() {
   return !(e != nullptr && std::string_view(e) == "f32");
 }
 
-// Read per call for the same reason: SONICBOOM_FATTN_FA2=1 selects the
-// row-owning schedule for the shapes that have it (head dim 128, GQA 7,
-// global attention); anything else keeps the query-resident family.
+// Read per call for the same reason: the row-owning schedule is the default
+// for the shapes that have it (head dim 128, GQA 7, global attention);
+// SONICBOOM_FATTN_FA2=0 keeps the query-resident family.
 bool fa2_enabled() {
   const char* e = std::getenv("SONICBOOM_FATTN_FA2");
-  return e != nullptr && std::string_view(e) == "1";
+  return e == nullptr || std::string_view(e) == "1";
 }
 
 template <int HEAD_DIM, int GQA, int BR, int BK, int NW, bool F16ACC,

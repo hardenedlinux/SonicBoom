@@ -238,12 +238,12 @@ Jit jit_mode() {
   return Jit::Auto;
 }
 
-// The row-owning schedule is opt-in: SONICBOOM_FATTN_FA2=1 hands the class to
-// its row-owning candidates, anything else keeps the query-resident ones.
-// Read per call, like the other gates.
+// The row-owning schedule is the default: the class goes to its row-owning
+// candidates unless SONICBOOM_FATTN_FA2=0, which keeps the query-resident
+// ones. Read per call, like the other gates.
 bool fa2_enabled() {
   const char* e = env("SONICBOOM_FATTN_FA2");
-  return e != nullptr && std::strcmp(e, "1") == 0;
+  return e == nullptr || std::strcmp(e, "1") == 0;
 }
 
 // The output accumulator's precision, read per call like the other gates.
@@ -448,8 +448,8 @@ bool aot_image_exists(int candidate, int head_dim, int gqa) {
 
 // The candidate family a call is tuned in, decided once per call from the
 // shape class and the gates. Family 1 is the row-owning schedule: head dim
-// 128, GQA 7, global attention, the f16 accumulator, SONICBOOM_FATTN_FA2=1,
-// and an AOT image this device can load -- the kernel has no JIT path, so
+// 128, GQA 7, global attention, the f16 accumulator, SONICBOOM_FATTN_FA2 not
+// disabled, and an AOT image this device can load -- the kernel has no JIT path, so
 // without one the class stays on its query-resident candidates. Canonical
 // numerics keeps the query-resident reference (the documented boom_fattn
 // canonical arm).
@@ -2055,7 +2055,7 @@ Tuned resolve_class(const Call& c, const Fingerprints& fp) {
       // family is in effect, so a forced family-1 candidate would read past
       // the workspace padding. Refuse it rather than run it out of bounds.
       why = "the row-owning candidate is not in effect for this call "
-            "(SONICBOOM_FATTN_FA2 is not 1, canonical numerics, a forced JIT, "
+            "(SONICBOOM_FATTN_FA2=0, canonical numerics, a forced JIT, "
             "or no "
             "AOT image for this device)";
     } else {

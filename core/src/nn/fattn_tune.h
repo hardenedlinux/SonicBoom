@@ -43,8 +43,8 @@
 //   SONICBOOM_FATTN_CANDIDATE=<id>      force one candidate (by id or name)
 //   SONICBOOM_FATTN_CANDIDATES=<a,b,..> restrict the tuning set
 //   SONICBOOM_FATTN_FA2=0|1             row-owning schedule for d128/GQA-7
-//                                       global attention (opt-in, default 0);
-//                                       1 selects it, 0 or unset keeps the
+//                                       global attention (default 1);
+//                                       unset or 1 selects it, 0 keeps the
 //                                       query-resident family
 //   SONICBOOM_FATTN_JIT=off|auto|force  AOT only / AOT-or-JIT / JIT only
 //   SONICBOOM_FATTN_REPORT=0|1          startup report (default 1)
