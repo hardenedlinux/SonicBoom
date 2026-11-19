@@ -207,6 +207,26 @@
   (response-emit (scm->json-string obj) #:status status
                  #:headers '((content-type . (application/json)))))
 
+;; An SSE event body must be one byte per character: the event writer counts
+;; characters for its chunk headers and the socket port it writes through is
+;; ISO-8859-1. scm->json-string with #:unicode escapes most non-ASCII
+;; characters but leaves Latin-1 raw, so escape everything above ASCII.
+(define (json-ascii-string obj)
+  (call-with-output-string
+   (lambda (out)
+     (string-for-each
+      (lambda (ch)
+        (let ((n (char->integer ch)))
+          (cond
+           ((< n 128) (write-char ch out))
+           ((< n #x10000) (format out "\\u~4,'0x" n))
+           (else
+            (let ((m (- n #x10000)))
+              (format out "\\u~4,'0x\\u~4,'0x"
+                      (+ #xd800 (quotient m #x400))
+                      (+ #xdc00 (remainder m #x400))))))))
+      (scm->json-string obj #:unicode #t)))))
+
 (define (error-emit status type message param code)
   (json-emit status (openai-error-object type message param code)))
 
@@ -326,7 +346,7 @@
                 (sse-response
                  (lambda (send)
                    (stream-chunks ticket request include-usage?
-                                  (lambda (obj) (send (scm->json-string obj)))
+                                  (lambda (obj) (send (json-ascii-string obj)))
                                   send)))
                 ;; NOTE: No dynamic-wind around call-with-runner: the task
                 ;;       is suspended by aborting to the Ragnarok scheduler,
