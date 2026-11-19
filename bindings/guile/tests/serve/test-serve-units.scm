@@ -13,6 +13,7 @@
 (use-modules (srfi srfi-1)
              (srfi srfi-64)
              (ice-9 match)
+             (rnrs bytevectors)
              (json)
              (sonicboom serve backend)
              (sonicboom serve mock-backend)
@@ -278,6 +279,112 @@
   (engine-drop! engine t1)
   (engine-drop! engine t2)
   (test-equal "dropped tickets leave the queue" 0 (assq-ref (engine-stats engine) 'waiting)))
+
+;;; --- incremental detokenization ------------------------------------------------
+
+;; A backend whose detokenizer is not character-aligned. Token 101 is the first
+;; byte of the three-byte character "中", tokens 102 and 103 the rest; token 104
+;; renders "world" when it opens the token list and " world" after another
+;; token. The engine decodes only the window since its last output, so this
+;; catches a window that starts inside a character or loses the context of a
+;; token it re-decodes.
+(define (stream-piece-bytes toks)
+  (let lp ((ts toks) (first? #t) (out '()))
+    (if (null? ts)
+        (apply append (reverse out))
+        (lp (cdr ts) #f
+            (cons (case (car ts)
+                    ((100) (map char->integer (string->list "Hello")))
+                    ((104) (map char->integer (string->list (if first? "world" " world"))))
+                    ((101) '(#xe4))
+                    ((102) '(#xb8))
+                    ((103) '(#xad))
+                    (else '()))
+                  out)))))
+
+;; Length of the longest prefix of BYTES that ends at a character boundary.
+(define (stream-complete-length bytes)
+  (let* ((n (length bytes))
+         (bv (u8-list->bytevector bytes))
+         (start (let lp ((i (1- n)))
+                  (if (< i 0)
+                      -1
+                      (if (>= (bytevector-u8-ref bv i) #xc0) i (lp (1- i)))))))
+    (if (< start 0)
+        n
+        (let* ((b (bytevector-u8-ref bv start))
+               (need (cond ((< b #xe0) 2) ((< b #xf0) 3) ((< b #xf8) 4) (else 1))))
+          (if (>= (- n start) need) n start)))))
+
+(define (stream-detokenize model toks)
+  (let* ((bytes (stream-piece-bytes toks))
+         (n (stream-complete-length bytes)))
+    (if (= n (length bytes))
+        (utf8->string (u8-list->bytevector bytes))
+        (string-append (utf8->string (u8-list->bytevector (take bytes n)))
+                       "\ufffd"))))
+
+(define (stream-backend)
+  (make-backend
+   #:name "stream"
+   #:load-model (lambda (config) 'stream-model)
+   #:model-info (lambda (m)
+                  '((id . "s") (family . gemma) (context-length . 8192)
+                    (eos-tokens . (200)) (vocab-size . 10000)))
+   #:tokenize (lambda (m text) (list 1))
+   #:detokenize stream-detokenize
+   #:render-chat (lambda (m messages tools tool-choice)
+                   (list (cons 'text "prompt")))
+   #:create-session (lambda (m) (vector (list 100 104 101 102 103 200)))
+   #:free-session (lambda (session) #t)
+   #:prefill (lambda (session toks constraint) 0)
+   #:step (lambda (session sampler constraint)
+            (let ((rest (vector-ref session 0)))
+              (if (null? rest)
+                  #f
+                  (begin (vector-set! session 0 (cdr rest)) (car rest)))))
+   #:generate (lambda (session sampler constraint max on-token)
+                (let lp ((ts '(100 104 101 102 103 200)) (n 0))
+                  (if (or (null? ts) (>= n max))
+                      n
+                      (if (on-token (car ts))
+                          (lp (cdr ts) (1+ n))
+                          n))))))
+
+(let* ((stream-engine (make-engine (list (load-model (stream-backend)
+                                                     '((id . "s"))))))
+       (pieces '())
+       (r (engine-generate
+           stream-engine
+           (make-chat-request #:model "s"
+                              #:messages (list (msg "user" "hi"))
+                              #:temperature 0)
+           (lambda (kind . args)
+             (when (eq? kind 'content)
+               (set! pieces (cons (car args) pieces)))
+             #t))))
+  (test-equal "a reply whose character spans tokens streams as one detokenize"
+    "Hello world中"
+    (apply string-append (reverse pieces)))
+  (test-equal "the streamed text is the result content" "Hello world中"
+    (result-content r)))
+
+;; The same window rules hold for the token-at-a-time path.
+(let* ((stream-engine (make-engine (list (load-model (stream-backend)
+                                                     '((id . "s"))))))
+       (pieces '()))
+  (setenv "SONICBOOM_SERVE_STEP" "1")
+  (engine-generate
+   stream-engine
+   (make-chat-request #:model "s" #:messages (list (msg "user" "hi"))
+                      #:temperature 0)
+   (lambda (kind . args)
+     (when (eq? kind 'content) (set! pieces (cons (car args) pieces)))
+     #t))
+  (unsetenv "SONICBOOM_SERVE_STEP")
+  (test-equal "the step path streams the same text"
+    "Hello world中"
+    (apply string-append (reverse pieces))))
 
 (define failures (test-runner-fail-count (test-runner-current)))
 (test-end "sonicboom-serve-units")

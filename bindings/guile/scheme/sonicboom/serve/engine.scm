@@ -475,16 +475,30 @@ PyTorch: none"
     (bump! engine 'requests 1)
     (let* ((entry (pool-acquire! pool prompt-tokens))
            (session (pool-entry-session entry))
-           (generated '())                 ; sampled tokens, newest first
+           (tokens (make-vector 64 0))     ; sampled tokens, in order
+           (n-tokens 0)
+           (prefix-off 0)                  ; first token of the decode window
+           (read-off 0)                    ; first token whose text is unread
            (content '())                   ; emitted content pieces, newest first
            (calls '()))                    ; (id name args), newest first
+      ;; The token log grows by doubling. The detokenizer is handed only the
+      ;; window since the last emitted text, so its per-call work stays small.
+      (define (token-add! t)
+        (when (= n-tokens (vector-length tokens))
+          (let ((bigger (make-vector (* 2 (vector-length tokens)) 0)))
+            (vector-move-left! tokens 0 n-tokens bigger 0)
+            (set! tokens bigger)))
+        (vector-set! tokens n-tokens t)
+        (set! n-tokens (1+ n-tokens)))
+      (define (token-range a b)           ; [a, b) as a list, in order
+        (let lp ((i (1- b)) (acc '()))
+          (if (< i a) acc (lp (1- i) (cons (vector-ref tokens i) acc)))))
       (dynamic-wind
         (lambda () #t)
         (lambda ()
           (let ((cached (prefill session prompt-tokens
                                  (chat-request-constraint request))))
             ;; State of the text filter.
-            (define decoded 0)             ; chars of the decoded text consumed
             (define buffer "")             ; undecided text
             (define in-call? #f)
             (define cancelled? #f)
@@ -503,6 +517,31 @@ PyTorch: none"
                                (apply on-event 'tool-call (1- (length calls)) call))
                      (set! cancelled? #t))))))
             (define eos-seen? #f)
+            ;; Incremental decoding. prefix-off..read-off is the window whose
+            ;; text was already emitted; read-off..end is the tail that may
+            ;; still be incomplete. Both texts start at prefix-off, so the new
+            ;; text extends the old one by the characters to emit next.
+            (define (decode-window a b) (detokenize model (token-range a b)))
+            (define (stream-text!)
+              (let* ((prefix (decode-window prefix-off read-off))
+                     (text (decode-window prefix-off n-tokens)))
+                ;; A trailing U+FFFD may be an incomplete multi-byte character
+                ;; that the next token completes, so wait for it.
+                (when (and (> (string-length text) (string-length prefix))
+                           (not (string-suffix? "\ufffd" text)))
+                  (feed! (substring text (string-length prefix)) #f)
+                  (set! prefix-off read-off)
+                  (set! read-off n-tokens))))
+            ;; The reply is over: emit what is left. An incomplete character at
+            ;; the very end is dropped, as it was before.
+            (define (flush-text!)
+              (let* ((prefix (decode-window prefix-off read-off))
+                     (text (decode-window prefix-off n-tokens))
+                     (ready (if (string-suffix? "\ufffd" text)
+                                (1- (string-length text))
+                                (string-length text))))
+                (when (> ready (string-length prefix))
+                  (feed! (substring text (string-length prefix) ready) #f))))
             (define (feed! text final?)
               (set! buffer (string-append buffer text))
               (let lp ()
@@ -537,27 +576,23 @@ PyTorch: none"
             ;; is over (an end-of-turn token, a stop string, the client gone, or
             ;; the limit reached).
             (define (handle-token! t)
-              (set! generated (cons t generated))
               (if (memv t eos)
                   (begin
                     (set! eos-seen? #t)
+                    ;; The end-of-turn token has no reply text; flush what the
+                    ;; text tokens before it still held back, then log it.
+                    (flush-text!)
+                    (token-add! t)
                     (feed! "" #t)
                     #f)
                   (begin
-                    ;; Decode everything generated so far and feed the new
-                    ;; part; a trailing U+FFFD may be an incomplete multi-byte
-                    ;; character, so wait.
-                    (let* ((text (detokenize model (reverse generated)))
-                           (ready (if (string-suffix? "\ufffd" text)
-                                      (1- (string-length text))
-                                      (string-length text))))
-                      (when (> ready decoded)
-                        (feed! (substring text decoded ready) #f)
-                        (set! decoded ready)))
+                    (token-add! t)
+                    (stream-text!)
                     (cond
                      (cancelled? #f)
                      (stopped? #f)
-                     ((>= (length generated) limit)
+                     ((>= n-tokens limit)
+                      (flush-text!)
                       (feed! "" #t)
                       #f)
                      (else #t)))))
@@ -565,11 +600,11 @@ PyTorch: none"
               (cond
                (cancelled? "cancelled")
                ((or stopped? eos-seen?) "stop")
-               ((>= (length generated) limit) "length")
+               ((>= n-tokens limit) "length")
                (else "stop")))
             (define finish
               (cond
-               ((>= 0 limit) (feed! "" #t) "length")
+               ((>= 0 limit) (flush-text!) (feed! "" #t) "length")
                ;; A backend that produces the whole reply in one call drives
                ;; the token loop through its callback. Ending short of the
                ;; limit without a stop means a grammar closed the reply: the
@@ -583,6 +618,7 @@ PyTorch: none"
                   (when (and (< produced limit)
                              (not cancelled?)
                              (not stopped?))
+                    (flush-text!)
                     (feed! "" #t))
                   (finish-reason)))
                (else
@@ -590,7 +626,7 @@ PyTorch: none"
                   (let ((t (step session sampler
                                  (chat-request-constraint request))))
                     (cond
-                     ((not t) (feed! "" #t) (finish-reason))
+                     ((not t) (flush-text!) (feed! "" #t) (finish-reason))
                      ((handle-token! t) (lp))
                      (else (finish-reason))))))))
             (let* ((reason (cond ((equal? finish "cancelled") "cancelled")
@@ -600,18 +636,18 @@ PyTorch: none"
                                         (string-concatenate-reverse content)
                                         (reverse calls)
                                         n-prompt
-                                        (length generated)
+                                        n-tokens
                                         cached)))
               (bump! engine (if (equal? reason "cancelled") 'cancelled 'completed) 1)
               (bump! engine 'prompt-tokens n-prompt)
-              (bump! engine 'completion-tokens (length generated))
+              (bump! engine 'completion-tokens n-tokens)
               (bump! engine 'cached-tokens cached)
               (when (equal? reason "cancelled")
-                (stat-set! engine 'last-cancelled-completion-tokens (length generated)))
+                (stat-set! engine 'last-cancelled-completion-tokens n-tokens))
               result)))
         (lambda ()
           ;; The session now holds the prompt and every sampled token.
-          (pool-release! pool entry (append prompt-tokens (reverse generated))))))))
+          (pool-release! pool entry (append prompt-tokens (token-range 0 n-tokens))))))))
 
 (define (engine-stats engine)
   "The counters of ENGINE as an alist.
