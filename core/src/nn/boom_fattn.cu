@@ -565,6 +565,12 @@ bool flash_attention_boom_fattn_chunk_dev_pos(
                                n_slots, n, n_heads_q, n_heads_kv,
                                sliding_window, scale, out, kv_f16, kv_q8);
     }
+    // The f32 accumulator keeps the row-owning schedule when opted in: its
+    // candidate set is the family's f32 pair.
+    if (fa2_enabled() && sliding_window == 0)
+      return run_tuned<128, 7, 32>(q, k_batch, v_batch, k_cache, v_cache, start,
+                                   n_slots, n, n_heads_q, n_heads_kv,
+                                   sliding_window, scale, out, kv_f16, kv_q8);
     return run_chunk<128, 7, 16, 16, 4, false>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
         n_heads_kv, sliding_window, scale, out, kv_f16, kv_q8);
@@ -663,6 +669,7 @@ bool flash_attention_boom_fattn_config(int head_dim, int gqa, int* br, int* bk,
   }
   if (head_dim == 128 && gqa == 7) {
     if (acc_f16()) return describe_tuned(128, 7, br, bk, block, smem);
+    if (fa2_enabled()) return describe_tuned(128, 7, br, bk, block, smem);
     describe<128, 7, 16, 16, 4, false>(br, bk, block, smem);
     return true;
   }
@@ -771,9 +778,12 @@ void* fattn_tune::aot_kernel(int candidate, int head_dim, int gqa) {
     return qreg_aot_candidate<256, 8, 16, 16, 4>(candidate);
   if (head_dim == 128 && gqa == 7) {
     // The row-owning family: candidates 8 (BR 16, two blocks per SM) and 9
-    // (BR 32, one block per SM), both f16 accumulator.
+    // (BR 32, one block per SM), both f16 accumulator; candidates 10 and 11
+    // are the same geometries with an f32 accumulator.
     if (candidate == 8) return fa2_aot<16, true, 2>();
     if (candidate == 9) return fa2_aot<32, true, 1>();
+    if (candidate == 10) return fa2_aot<16, false, 2>();
+    if (candidate == 11) return fa2_aot<32, false, 1>();
     return qreg_aot_candidate<128, 7, 16, 16, 4>(candidate);
   }
   if (head_dim == 128 && gqa == 6)

@@ -129,38 +129,51 @@ struct Cand {
   // warp owns 16 query rows of one head). A tuning run compares candidates of
   // its family only, and its incumbent is that family's reference.
   int family;
+  // The row-owning family has an f16- and an f32-accumulator pair; a run
+  // compares candidates of one accumulator precision only. The query-resident
+  // family has no f32 instance, so its rows are all false.
+  bool acc_f32;
 };
 
 constexpr Cand kCands[] = {
     {1, "k8-v0-s2-pipe", 8, 0, 2, 1, true, true, false,
      "RTX 3050 reference: KSTRIDE padding, 8-warp phase-1b row-half split, "
-     "unpadded V, QK/PV pipeline", 0},
+     "unpadded V, QK/PV pipeline", 0, false},
     {2, "k8-v0-s2-seq", 8, 0, 2, 0, true, true, false,
      "same layout without the QK/PV pipeline (V double buffered); the pipeline "
-     "gain shows up at long context", 0},
+     "gain shows up at long context", 0, false},
     {3, "k8-v0-s1-pipe", 8, 0, 1, 1, true, true, false,
      "phase 1b on 4 warps (the row half is not split): the split is across "
-     "row groups, so the output is byte-identical to the reference", 0},
+     "row groups, so the output is byte-identical to the reference", 0, false},
     {4, "k0-v0-s2-pipe", 0, 0, 2, 1, true, true, false,
-     "K rows unpadded: 8-way bank conflict on every K fragment load", 0},
+     "K rows unpadded: 8-way bank conflict on every K fragment load", 0, false},
     {5, "k8-v8-s2-seq", 8, 8, 2, 0, true, true, false,
      "V rows padded to 48 B, sequential phases; needs the full sm_8.x opt-in cap",
-     0},
+     0, false},
     {6, "k8-v8-s2-pipe", 8, 8, 2, 1, true, true, false,
      "V padding plus the pipeline's third V buffer: over the sm_8.x cap, legal on "
-     "parts with a larger shared-memory budget", 0},
+     "parts with a larger shared-memory budget", 0, false},
     {7, "k8-v4-s2-seq", 8, 4, 2, 0, false, false, true,
      "V rows padded to 40 B: 8-byte cp.async.ca, measured 20% slower on sm_86; "
-     "experimental, so its byte identity is not part of the tuning contract", 0},
+     "experimental, so its byte identity is not part of the tuning contract", 0,
+     false},
     // The row-owning family: head dim 128, GQA 7, global attention. BR 16
     // keeps two blocks per SM (`__launch_bounds__` MINB 2), BR 32 one; both
     // are bit-identical to each other, and the 32-key tile is the numerics.
     {8, "fa2-br16-bc32", 0, 0, 0, 0, true, true, false,
      "row-owning schedule, 16 queries per block and two blocks per SM; the "
-     "family reference", 1},
+     "family reference", 1, false},
     {9, "fa2-br32-bc32", 0, 0, 0, 0, true, true, false,
      "row-owning schedule, 32 queries per block and one block per SM; same "
-     "arithmetic as the reference", 1},
+     "arithmetic as the reference", 1, false},
+    // The same two geometries with an f32 output accumulator: the family's
+    // f32 set, selected when SONICBOOM_BOOM_FATTN_ACC=f32.
+    {10, "fa2-br16-bc32-f32", 0, 0, 0, 0, true, true, false,
+     "row-owning schedule, 16 queries per block and two blocks per SM, f32 "
+     "accumulator; the family's f32 reference", 1, true},
+    {11, "fa2-br32-bc32-f32", 0, 0, 0, 0, true, true, false,
+     "row-owning schedule, 32 queries per block and one block per SM, f32 "
+     "accumulator; same arithmetic as the f32 reference", 1, true},
 };
 const Cand* cand_by_num(int num) {
   for (const Cand& c : kCands)
@@ -233,6 +246,9 @@ bool fa2_enabled() {
   return e != nullptr && std::strcmp(e, "1") == 0;
 }
 
+// The output accumulator's precision, read per call like the other gates.
+bool acc_f16() { return !env_is("SONICBOOM_BOOM_FATTN_ACC", "f32"); }
+
 int64_t budget_ms() {
   if (const char* e = env("SONICBOOM_FATTN_AUTOTUNE_BUDGET_MS"); e != nullptr) {
     char* tail = nullptr;
@@ -277,7 +293,7 @@ Geometry geometry(const Cand& c, int head_dim, int gqa) {
     // block, 32-key tiles, K rows padded by 8 and V rows by 8 (2 x BC x KS +
     // 2 x HEAD_DIM x VS halves). BR is the only candidate axis.
     Geometry g;
-    g.br = c.num == 9 ? 32 : 16;
+    g.br = (c.num == 9 || c.num == 11) ? 32 : 16;
     g.bk = 32;
     g.block = (g.br / 16) * gqa * 32;
     g.kstride = head_dim + 8;
@@ -441,15 +457,17 @@ int call_family(const Call& c) {
   if (c.head_dim != 128 || c.gqa != 7 || c.window != 0) return 0;
   if (!fa2_enabled() || ::sonicboom::tune::canonical()) return 0;
   if (jit_mode() == Jit::Force) return 0;
-  if (!aot_image_exists(8, c.head_dim, c.gqa)) return 0;
+  if (!aot_image_exists(acc_f16() ? 8 : 10, c.head_dim, c.gqa)) return 0;
   return 1;
 }
 
 // The family's reference candidate: the comparison basis, the incumbent and
-// the fallback of a tuning run in that family.
+// the fallback of a tuning run in that family. The row-owning family has one
+// reference per accumulator precision.
 const Cand* reference_cand(int fam) {
+  const bool want_f32 = fam == 1 && !acc_f16();
   for (const Cand& c : kCands)
-    if (c.family == fam) return &c;
+    if (c.family == fam && c.acc_f32 == want_f32) return &c;
   return &kCands[0];
 }
 
@@ -516,7 +534,12 @@ std::string workload_fingerprint(const Call& c) {
   // query-resident class (or the reverse), and switching SONICBOOM_FATTN_FA2
   // must miss the cache rather than reuse a selection made under the other
   // schedule.
-  if (call_family(c) == 1) w += "-fa2";
+  if (call_family(c) == 1) {
+    w += "-fa2";
+    // The accumulator precision is a different kernel instantiation and a
+    // different candidate set; a record made for one must not serve the other.
+    if (!acc_f16()) w += "-f32";
+  }
   return w;
 }
 
@@ -1490,10 +1513,12 @@ std::vector<int> tuning_set(int fam, std::string* why) {
   }
   // A run compares candidates of the call's family only: the family's
   // reference is the comparison basis, and a candidate of another family has a
-  // different summation order by construction.
+  // different summation order by construction. Within the row-owning family
+  // the accumulator precision splits the set the same way.
+  const bool want_f32 = fam == 1 && !acc_f16();
   for (auto it = ids.begin(); it != ids.end();) {
     const Cand* cand = cand_by_num(*it);
-    if (cand == nullptr || cand->family != fam)
+    if (cand == nullptr || cand->family != fam || cand->acc_f32 != want_f32)
       it = ids.erase(it);
     else
       ++it;

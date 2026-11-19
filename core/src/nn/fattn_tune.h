@@ -67,7 +67,7 @@ namespace sonicboom::nn::cuda::fattn_tune {
 // Candidate registry version. Part of the persistent cache key: bump it when a
 // candidate is added, removed or its code changes, and every stored selection
 // for this backend is invalidated.
-constexpr int kRegistryVersion = 3;
+constexpr int kRegistryVersion = 4;
 
 // Fingerprint schema version. A selection key is
 //   f<version>/<capability>/<software>/<workload>
