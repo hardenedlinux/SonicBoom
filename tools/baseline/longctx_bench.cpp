@@ -33,6 +33,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -236,6 +237,22 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  // Every call below starts at position 0. A recipe with recurrent state keeps
+  // that state in the cached decode runtime, so a second call on the same
+  // runtime would scan from a position its state has already passed. Such a
+  // recipe runs each call on its own session — a fresh cache and a fresh state,
+  // an empty prefix — exactly as the prefill subtraction above does. A recipe
+  // without recurrent state keeps the one anonymous runtime the warm-up below
+  // is written for.
+  const bool recurrent =
+      std::any_of(m->config.recurrent_layers.begin(),
+                  m->config.recurrent_layers.end(), [](bool r) { return r; });
+  auto fresh_session = [&](sbplanner::KvCacheSession* s) {
+    if (!recurrent) return true;
+    s->n_ctx = ctx;
+    return sbmodel::kv_session_allocate(*m, *s, ctx);
+  };
+
   // Warm up at the EXACT n_ctx the timed runs use. The decode runtime (greedy
   // graph + plan + CUDA-graph capture) is cached per (model, n_ctx); the
   // subtraction below cancels the shared `depth` decode steps but NOT a one-time
@@ -245,13 +262,24 @@ int main(int argc, char** argv) {
   // test_generate.
   {
     std::vector<int64_t> warm(1, -1);
-    sbmodel::generate_spine_cuda(*m, seed, 0, warm, ctx);
+    sbplanner::KvCacheSession s;
+    if (!fresh_session(&s)) {
+      fprintf(stderr, "session allocate failed at n_ctx %llu\n",
+              (unsigned long long)ctx);
+      return 1;
+    }
+    sbmodel::generate_spine_cuda(*m, seed, 0, warm, ctx, {},
+                                 recurrent ? &s : nullptr);
   }
 
   auto run_decode = [&](uint64_t n, double* secs) -> uint64_t {
     std::vector<int64_t> toks(n, -1);
+    sbplanner::KvCacheSession s;
+    if (!fresh_session(&s)) return 0;
     const auto t0 = std::chrono::steady_clock::now();
-    const uint64_t done = sbmodel::generate_spine_cuda(*m, seed, 0, toks, ctx);
+    const uint64_t done =
+        sbmodel::generate_spine_cuda(*m, seed, 0, toks, ctx, {},
+                                     recurrent ? &s : nullptr);
     const auto t1 = std::chrono::steady_clock::now();
     *secs = std::chrono::duration<double>(t1 - t0).count();
     return done;
