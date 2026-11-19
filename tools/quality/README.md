@@ -85,8 +85,13 @@ Ubuntu 24.04 / Debian:
 sudo apt-get install -y \
   g++-13 gcc-13 cmake ninja-build ccache \
   guile-3.0 guile-3.0-dev autoconf automake libtool pkg-config \
-  clang-19 clang-tidy-19 valgrind
+  clang-19 clang-tidy-19 valgrind pandoc
 ```
+
+- **pandoc** is needed by the `test-docs-site` documentation test, which runs
+  in every sanitizer build. Without it the site generator cannot write the
+  syntax-highlight stylesheet and the sanitizer check fails. python3, also
+  used by that test, is part of the base Ubuntu installation.
 
 - **Clang 19 or newer is required** for the Clang Static Analyzer and
   clang-tidy passes. Clang 18's frontend cannot parse libstdc++ 13's

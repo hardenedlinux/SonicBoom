@@ -64,7 +64,7 @@ jobs:
           sudo apt-get install -y \
             g++-13 gcc-13 cmake ninja-build ccache \
             guile-3.0 guile-3.0-dev autoconf automake libtool pkg-config \
-            clang-19 clang-tidy-19
+            clang-19 clang-tidy-19 pandoc
 
       # Shallow clones only: the four native-torch submodules are always
       # needed; llvm-project is fetched only when the MLIR cache misses.
