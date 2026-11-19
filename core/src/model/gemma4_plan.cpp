@@ -7282,8 +7282,11 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
     const uint64_t chunk = (m.config.sliding_window > 0)
                                ? m.config.sliding_window
                                : kDefaultPrefillChunk;
+    // An empty prefix is not a continuation: a session cleared to no history
+    // must restart its recurrent state, not resume whatever position the old
+    // continuation left behind.
     const bool continues_live =
-        prefix_len == session_len && session_len % chunk == 0;
+        prefix_len > 0 && prefix_len == session_len && session_len % chunk == 0;
     if (live_continue) {
       // Continue the whole recorded session from the live state: it is already
       // at the end of the session, so there is nothing to restore.
