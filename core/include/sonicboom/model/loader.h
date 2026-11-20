@@ -41,6 +41,9 @@ struct Gemma4Model {
   std::vector<LayerConfig> plan;  // one per block, index == layer
   // Owns converted Q5_K bytes referenced by weight QuantizedTensors.
   std::vector<std::vector<uint8_t>> owned_quant_buffers;
+  // Owns f32 copies of tensors a file stores in another type (Gemma's
+  // per-layer gating matrices); the bound spans point into these buffers.
+  std::vector<std::vector<float>> owned_f32_buffers;
   // Device initialization state: false until ensure_device_ready() runs for
   // this model. The load is host-side only, so a process that forks before its
   // first device use forks with no CUDA state; the child's first runtime build

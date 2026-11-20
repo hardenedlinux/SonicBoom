@@ -16,6 +16,7 @@
 
 #include <sonicboom/model/loader.h>
 #include <sonicboom/model/plan.h>
+#include <sonicboom/quant/dequant.h>
 
 #include "../quant/foreign_dequant.h"
 #include "../quant/quantize_q5_k.h"
@@ -429,6 +430,52 @@ std::optional<std::span<const float>> bind_f32_2d(const gguf::Reader& r,
   }
   return std::span<const float>(reinterpret_cast<const float*>(data->data()),
                                 t->n_elements);
+}
+
+// 2-D f32 tensor that a file may store in any block type (e.g. Gemma's
+// per-layer gate matrices). An f32 tensor is borrowed from the reader; any
+// other type is dequantized once at load into `owned`, and the span points
+// into that buffer (heap-stable: appending to the outer vector moves only the
+// inner vector objects, never their data).
+std::optional<std::span<const float>> bind_f32_2d_any(
+    const gguf::Reader& r, std::string_view name,
+    std::initializer_list<uint64_t> dims, std::string& errs,
+    std::vector<std::vector<float>>& owned) {
+  const gguf::TensorInfo* t = r.tensor(name);
+  if (!t || !dims_match(t->dims, dims)) {
+    errs += "f32 2d tensor mismatch: ";
+    errs += name;
+    errs += "\n";
+    return std::nullopt;
+  }
+  if (t->type == kF32) return bind_f32_2d(r, name, dims, errs);
+  auto data = r.tensor_data(*t);
+  if (!data) {
+    errs += "tensor data unresolvable: ";
+    errs += name;
+    errs += "\n";
+    return std::nullopt;
+  }
+  std::expected<std::vector<float>, std::string> f32 = std::unexpected(
+      std::string("unsupported stored type ") + std::to_string(t->type));
+  if (auto qt = quant::quantized_tensor_from_gguf(t->type, t->dims, *data)) {
+    f32 = std::vector<float>(t->n_elements);
+    if (!quant::dequantize_f32(*qt, f32->data(), t->n_elements))
+      f32 = std::unexpected(std::string("quantized tensor invalid"));
+  } else {
+    f32 = quant::dequant_foreign_to_f32(
+        t->type, reinterpret_cast<const uint8_t*>(data->data()), t->n_elements);
+  }
+  if (!f32) {
+    errs += "cannot convert tensor ";
+    errs += name;
+    errs += ": ";
+    errs += f32.error();
+    errs += "\n";
+    return std::nullopt;
+  }
+  owned.push_back(std::move(*f32));
+  return std::span<const float>(owned.back());
 }
 
 // A projection stored either way ("as in the file", the way the mixture's
@@ -1223,12 +1270,16 @@ std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
       bw.ffn_up = *q;
     if (auto q = bind_quant(r, p + "ffn_down.weight", {kQ5K, kQ4K}, {ff, d}, errs, m.owned_quant_buffers, converted))
       bw.ffn_down = *q;
-    // Per-layer embedding gating (f32): inp_gate [d, per], proj [per, d]. Bound
-    // and shape-validated; the gating arithmetic is unresolved (not consumed).
+    // Per-layer embedding gating: inp_gate [d, per], proj [per, d]. Bound and
+    // shape-validated in f32 form; files that store them quantized (Q8_0,
+    // Q6_K, F16) are dequantized once at load. The gating arithmetic is
+    // unresolved (not consumed).
     const uint64_t per = c.per_layer_input;
-    if (auto s = bind_f32_2d(r, p + "inp_gate.weight", {d, per}, errs))
+    if (auto s = bind_f32_2d_any(r, p + "inp_gate.weight", {d, per}, errs,
+                                 m.owned_f32_buffers))
       bw.inp_gate = *s;
-    if (auto s = bind_f32_2d(r, p + "proj.weight", {per, d}, errs))
+    if (auto s = bind_f32_2d_any(r, p + "proj.weight", {per, d}, errs,
+                                 m.owned_f32_buffers))
       bw.proj = *s;
     if (auto s = bind_f32(r, p + "layer_output_scale.weight", 1, errs))
       bw.layer_output_scale = *s;
