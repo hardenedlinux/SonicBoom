@@ -31,12 +31,19 @@
   (family real-model-family)
   (eos-tokens real-model-eos-tokens))
 
+;; The held token sequence is kept newest-first: the decode callback appends
+;; one token per step, and consing is O(1) where appending to a forward list
+;; copies the whole history. Readers take (session-history), which reverses
+;; once per call.
 (define-record-type <real-session>
-  (make-real-session model handle history)
+  (make-real-session model handle rev-history)
   real-session?
   (model real-session-model)
   (handle real-session-handle)
-  (history real-session-history set-real-session-history!))
+  (rev-history real-session-rev-history set-real-session-rev-history!))
+
+(define (session-history session)
+  (reverse (real-session-rev-history session)))
 
 ;; The GGUF architecture the C ABI reports ("gemma4", "qwen2") -> the chat
 ;; template family. This is the ONE place the two names are matched: everything
@@ -145,7 +152,7 @@
 (define (real-prefill session tokens constraint)
   (real-apply-constraint session constraint)
   (let ((reused (inference:prefill! (real-session-handle session) tokens)))
-    (set-real-session-history! session tokens)
+    (set-real-session-rev-history! session (reverse tokens))
     reused))
 
 (define (real-step session sampler constraint)
@@ -160,7 +167,7 @@
   ;; output is complete: #f tells the engine there is nothing left to produce.
   (let* ((tokens (inference:generate-tokens
                   (real-session-handle session)
-                  (real-session-history session) 1 #f
+                  (session-history session) 1 #f
                   #:temperature (if (sampler-greedy? sampler)
                                     0.0
                                     (sampler-temperature sampler))
@@ -172,8 +179,8 @@
          (token (and (pair? tokens) (car tokens))))
     (cond
      (token
-      (set-real-session-history! session
-                                 (append (real-session-history session) (list token)))
+      (set-real-session-rev-history! session
+                                     (cons token (real-session-rev-history session)))
       token)
      ((constraint? constraint) #f)
      (else (error "SonicBoom backend produced no token")))))
@@ -193,9 +200,8 @@
          (cb (lambda (user token)
                (catch #t
                  (lambda ()
-                   (set-real-session-history!
-                    session (append (real-session-history session)
-                                    (list token)))
+                   (set-real-session-rev-history!
+                    session (cons token (real-session-rev-history session)))
                    (set! produced (1+ produced))
                    (if (on-token token) 0 1))   ; 0 = continue, else stop
                  (lambda (key . args)
