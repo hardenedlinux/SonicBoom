@@ -1,0 +1,1 @@
+{"type":"object","properties":{"name":{"enum":["search_web","read_file","write_file","run_command"]},"arguments":{"type":"object","properties":{"path":{"type":"string"},"query":{"type":"string"},"content":{"type":"string"},"timeout_s":{"type":"integer"}},"required":["path","query","content","timeout_s"]}},"required":["name","arguments"]}

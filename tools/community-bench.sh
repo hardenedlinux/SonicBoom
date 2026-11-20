@@ -20,13 +20,16 @@ export LC_ALL=C LANG=C
 #
 # Usage: tools/community-bench.sh <model.gguf> <llama.cpp/build/bin>
 #                                 [--runs N] [--no-llama] [--out FILE] [--serve]
+#                                 [--toolcall]
 #        <llama.cpp/build/bin> may be omitted with --no-llama.
 #        --runs N   independent process runs per metric (default 3).
 #        --no-llama measure SonicBoom alone: skip the llama.cpp commit and pass
 #                   --no-llama to bench.sh (every llama.cpp cell reads skipped).
 #        --out FILE write the log here (default sonicboom-bench-<datetime>.log).
-#        --serve    add the fifth step, tools/bench-serve.sh <model> --runs N
+#        --serve    add a step, tools/bench-serve.sh <model> --runs N
 #                   (the server's streamed code-edit rate).
+#        --toolcall add a step, tools/bench-toolcall.sh <model> --runs N
+#                   (constrained JSON tool calls against llama-server).
 # Env:   CUDA_VISIBLE_DEVICES defaults to 0, as in the README block.
 
 set -euo pipefail
@@ -38,6 +41,7 @@ GGUF=""
 LLAMA=""
 OUT=""
 SERVE=0
+TOOLCALL=0
 
 usage() {
   sed -n '/^# Usage:/,/^#$/p' "$0" | sed 's/^# \{0,1\}//'
@@ -50,6 +54,7 @@ while [ $# -gt 0 ]; do
     --no-llama) NO_LLAMA=1; shift ;;
     --out) OUT="${2:-}"; shift 2 ;;
     --serve) SERVE=1; shift ;;
+    --toolcall) TOOLCALL=1; shift ;;
     -h|--help) usage ;;
     -*) echo "community-bench: unknown option $1" >&2; usage ;;
     *)
@@ -100,16 +105,19 @@ esac
 # One log, in order, on the terminal at the same time.
 exec > >(tee "$OUT") 2>&1
 
+STEP=0
 step() { # TITLE
+  STEP=$((STEP + 1))
   echo
-  echo "== $1"
+  echo "== $STEP/$TOTAL $1"
   echo
 }
 
 TOTAL=4
-[ "$SERVE" = 1 ] && TOTAL=5
+[ "$SERVE" = 1 ] && TOTAL=$((TOTAL + 1))
+[ "$TOOLCALL" = 1 ] && TOTAL=$((TOTAL + 1))
 
-step "1/$TOTAL hardware and build record"
+step "hardware and build record"
 echo "model:  $GGUF"
 echo "runs:   $RUNS"
 echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
@@ -120,18 +128,18 @@ if ! "$ROOT/tools/sb-report.sh" --model "$GGUF" --no-bench; then
 fi
 
 if [ "$NO_LLAMA" = 0 ]; then
-  step "2/$TOTAL llama.cpp commit"
+  step "llama.cpp commit"
   COMMIT="$(git -C "$LLAMA" rev-parse --short HEAD 2>/dev/null || true)"
   echo "llama.cpp: $LLAMA"
   echo "commit:    ${COMMIT:-unknown}"
 else
-  step "2/$TOTAL llama.cpp commit (skipped: --no-llama)"
+  step "llama.cpp commit (skipped: --no-llama)"
 fi
 
 LLAMA_ARGS=()
 [ "$NO_LLAMA" = 1 ] && LLAMA_ARGS+=(--no-llama)
 
-step "3/$TOTAL code-editing comparison"
+step "code-editing comparison"
 if ! LLAMA_BIN="$LLAMA" "$ROOT/tools/bench.sh" "$GGUF" --runs "$RUNS" --spec \
      "${LLAMA_ARGS[@]}"; then
   echo
@@ -139,7 +147,7 @@ if ! LLAMA_BIN="$LLAMA" "$ROOT/tools/bench.sh" "$GGUF" --runs "$RUNS" --spec \
   exit 1
 fi
 
-step "4/$TOTAL extended-context tiers"
+step "extended-context tiers"
 if ! LLAMA_BIN="$LLAMA" "$ROOT/tools/bench.sh" "$GGUF" --runs "$RUNS" --long \
      "${LLAMA_ARGS[@]}"; then
   echo
@@ -148,10 +156,19 @@ if ! LLAMA_BIN="$LLAMA" "$ROOT/tools/bench.sh" "$GGUF" --runs "$RUNS" --long \
 fi
 
 if [ "$SERVE" = 1 ]; then
-  step "5/$TOTAL server streaming"
+  step "server streaming"
   if ! "$ROOT/tools/bench-serve.sh" "$GGUF" --runs "$RUNS"; then
     echo
-    echo "community-bench: step 5 failed; the log is $OUT" >&2
+    echo "community-bench: the server-streaming step failed; the log is $OUT" >&2
+    exit 1
+  fi
+fi
+
+if [ "$TOOLCALL" = 1 ]; then
+  step "constrained tool calls"
+  if ! LLAMA_BIN="$LLAMA" "$ROOT/tools/bench-toolcall.sh" "$GGUF" --runs "$RUNS"; then
+    echo
+    echo "community-bench: the tool-call step failed; the log is $OUT" >&2
     exit 1
   fi
 fi
