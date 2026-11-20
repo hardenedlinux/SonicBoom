@@ -16,6 +16,7 @@
 #include <sonicboom/model/plan.h>
 #include <sonicboom/planner/kv_cache.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -178,16 +179,46 @@ int main(int argc, char** argv) {
     sbmodel::generate_prefill_spine_cuda_prefix(*m, prefix, 0, warm, s);
   }
 
-  // No-reuse: full prefill of the whole prompt, one decode token.
+  // No-reuse: a full prefill of the whole prompt, one decode token, on a fresh
+  // session each rep. A fresh session carries no token history and no recurrent
+  // state, so the measured call is a real prefill from position 0. The
+  // sessionless overload runs on the anonymous runtime-owned cache, whose
+  // history and state survive between calls: on a model with recurrent blocks
+  // the continuation policy then reads the new request as a live continuation
+  // and the prefill is refused, so the control would measure nothing. Each
+  // session's runtime is built and its prefill shape captured by an untimed
+  // warm prefill; clearing the recorded history lets the timed call prefill
+  // from scratch again (the empty-history path resets the recurrent state; a
+  // model without one just rewrites its KV rows).
   bool ok = true;
-  const double t_noreuse = best(
-      [&]() {
-        std::vector<int64_t> toks(1, -1);
-        return sbmodel::generate_prefill_spine_cuda(*m, full, 0, toks,
-                                                    full.size() + 1);
-      },
-      &ok);
-  if (!ok) { fprintf(stderr, "no-reuse prefill failed\n"); return 1; }
+  double t_noreuse = 1e18;
+  for (uint64_t rep = 0; rep < reps; ++rep) {
+    sbplanner::KvCacheSession fresh;
+    if (!sbmodel::kv_session_allocate(*m, fresh, full.size() + 1)) {
+      fprintf(stderr, "no-reuse session allocate failed\n");
+      return 1;
+    }
+    {
+      std::vector<int64_t> warm(1, -1);
+      if (sbmodel::generate_prefill_spine_cuda_prefix(*m, full, 0, warm,
+                                                      fresh) == 0) {
+        fprintf(stderr, "no-reuse warm prefill failed\n");
+        return 1;
+      }
+      fresh.filled_tokens.clear();
+    }
+    std::vector<int64_t> toks(1, -1);
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint64_t done = sbmodel::generate_prefill_spine_cuda_prefix(
+        *m, full, 0, toks, fresh);
+    const auto t1 = std::chrono::steady_clock::now();
+    if (done == 0) {
+      fprintf(stderr, "no-reuse prefill failed\n");
+      return 1;
+    }
+    t_noreuse = std::min(t_noreuse,
+                         std::chrono::duration<double>(t1 - t0).count());
+  }
 
   // Reuse: seed the prefix once, then per rep prefill only the new suffix
   // (vary the suffix so each rep matches only the shared prefix).
