@@ -809,6 +809,13 @@ std::expected<Gemma4Config, std::string> load_qwen35moe_config(
   c.ssm_time_step_rank = uint32_t(*ssm_dt);
   c.ssm_group_count = uint32_t(*ssm_group);
   c.n_layer_nextn = nextn ? uint32_t(*nextn) : 0;
+  // A file that carries multi-token-prediction blocks declares them in
+  // nextn_predict_layers: the last k blocks belong to the speculative head,
+  // not to the trunk. The main model is the trunk; those blocks' tensors
+  // (nextn.* and the head's own attention/experts) are left unbound.
+  if (c.n_layer_nextn >= c.block_count)
+    return invalid("qwen35moe.nextn_predict_layers (covers the whole trunk)");
+  c.block_count -= c.n_layer_nextn;
   c.rope_dimension_count = rope_dims ? uint32_t(*rope_dims) : 0;
   if (c.rope_dimension_count > c.head_dim_global)
     return invalid("qwen35moe.rope.dimension_count (exceeds head_dim)");
