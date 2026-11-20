@@ -521,14 +521,39 @@ pm() { # MEDIAN SD -> "M ± SD" / "n/a"
     printf "%g ± %g", m, s}'
 }
 
+# Every bench_stats run keeps its tool's stderr in a log under the run
+# directory: a measurement tool that fails (a rejected model, a refused
+# allocation) prints no RESULT line and would otherwise surface as an empty
+# cell with its own explanation thrown away. bench_failures prints the tail of
+# each failed metric's log under the table it belongs to.
+bench_failed_file() { # the failure record lives in a file: bench_stats runs
+  echo "${RUN_TMP:-${TMPDIR:-/tmp}}/bench-failed.tsv"   # in a subshell
+}
 bench_stats() { # KEY CMD... ; "<median> <stdev>" of RUNS runs of CMD's RESULT KEY
   local key=$1; shift
-  local vals="" v
+  local vals="" v log
+  log=$(mktemp "${RUN_TMP:-${TMPDIR:-/tmp}}/bench-log.XXXXXX")
   for ((i=1;i<=RUNS;i++)); do
-    v=$("$@" 2>/dev/null | grep '^RESULT ' | res_field "$key") || v=""
+    v=$("$@" 2>>"$log" | grep '^RESULT ' | res_field "$key") || v=""
     [ -n "$v" ] && vals="$vals$v\n"
   done
+  if [ -z "$vals" ]; then # no run produced the value: this cell stays empty
+    printf '%s\t%s\t%s\n' "$key" "$*" "$log" >>"$(bench_failed_file)"
+  fi
   printf '%b' "$vals" | stats
+}
+
+bench_failures() { # print the last words of every metric that produced no value
+  local f; f=$(bench_failed_file)
+  [ -s "$f" ] || return 0
+  local key cmd log
+  while IFS=$'\t' read -r key cmd log; do
+    [ -n "$key" ] || continue
+    echo "! no $key RESULT: $cmd"
+    echo "  last 5 stderr lines ($log):"
+    tail -n 5 "$log" | sed 's/^/    /'
+  done <"$f"
+  rm -f "$f"
 }
 
 ratio() { # SB LL -> "1.03x", "n/a" or "skipped"
@@ -692,6 +717,7 @@ row "d512-spec"      "$boom_d512_spec" "$boom_d512_spec_sd" "$RATIO_NONE" "$RATI
 row "pp512"          "$boom_pp512" "$boom_pp512_sd" "$ll_pp512" "$(ratio "$boom_pp512" "$ll_pp512")" "tok/s"
 row "reuse 512+64"   "$boom_reuse" "$boom_reuse_sd" "$RATIO_NONE" "$RATIO_NONE" "ms"
 echo
+bench_failures
 echo "RESULT bench model=$LABEL tg64=$boom_tg64 d512=$boom_d512 d512_spec=$boom_d512_spec pp512=$boom_pp512 reuse_ms=$boom_reuse"
 
 # --- extended-context tiers (--long) ---------------------------------------
@@ -751,6 +777,8 @@ if [ "$LONG" = 1 ]; then
     row "pp${n}" "$sb" "$sbsd" "$lld" "$(ratio "$sb" "$lld")" "tok/s"
     echo "RESULT bench_long model=$LABEL tier=pp$n tok_s=$sb llama_tok_s=$lld"
   done
+  echo
+  bench_failures
 fi
 
 # --- code editing (--spec) -------------------------------------------------
