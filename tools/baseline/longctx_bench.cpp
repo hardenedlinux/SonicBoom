@@ -51,7 +51,12 @@ int main(int argc, char** argv) {
   uint64_t depth = 512;
   uint64_t steps = 64;
   uint64_t seed = 2;
-  uint64_t n_ctx = 0;  // 0 = default (depth + steps)
+  // Headroom for what one decode step can append beyond the requested token: a
+  // speculative verify writes up to draft-cap + 1 rows (the default draft
+  // ceiling is 15, so 16 rows). No shared constant names this lookahead for a
+  // tool; the value is the default verify batch.
+  constexpr uint64_t kMaxLookahead = 16;
+  uint64_t n_ctx = 0;  // 0 = default (depth + steps + kMaxLookahead)
   bool prefill_mode = false;
   bool legacy = true;
   for (int i = 1; i < argc; ++i) {
@@ -84,9 +89,11 @@ int main(int argc, char** argv) {
   // Otherwise the warm run (n tokens) and the full run (n+steps tokens) size the
   // global-layer KV cache and the split-KV chunk (= n_ctx/40) differently, so
   // the first `depth` steps are not timing-identical and the subtraction
-  // over/under-counts the tail. --n-ctx overrides to probe the chunk-size
-  // dependence at a fixed depth (the n_ctx sensitivity sweep).
-  const uint64_t ctx = n_ctx ? n_ctx : (depth + steps);
+  // over/under-counts the tail. The default also carries the maximum lookahead
+  // (kMaxLookahead slots), so the last measured step's verify batch fits even
+  // when the step count is the whole budget. --n-ctx overrides to probe the
+  // chunk-size dependence at a fixed depth (the n_ctx sensitivity sweep).
+  const uint64_t ctx = n_ctx ? n_ctx : (depth + steps + kMaxLookahead);
 
   // Direct measurement: bring a session cache to `depth`, warm a few steps, then
   // time exactly `steps` decode steps with events on the stream boundary. The
