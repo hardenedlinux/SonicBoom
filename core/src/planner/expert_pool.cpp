@@ -250,6 +250,10 @@ std::expected<std::unique_ptr<ExpertPool>, std::string> ExpertPool::create(
     const uint64_t reserved = 1024ull * 1024ull * 1024ull;
     const uint64_t taken = non_expert_bytes(weights);
     pool_bytes = free_mem > reserved + taken ? free_mem - reserved - taken : 0;
+    // The default must cover every expert one block can select at once: when
+    // the free memory beyond the margin does not reach that floor, the floor
+    // comes out of the margin. What one block needs is not a preference.
+    pool_bytes = std::max(pool_bytes, slot_bytes * max_experts);
   }
 
   pool->n_slots_ = pool_bytes / slot_bytes;

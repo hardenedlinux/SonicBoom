@@ -30,8 +30,10 @@
 // are kept zero. N is the pool bytes divided by B_gate + B_up + B_down, where
 // the pool bytes are SONICBOOM_EXPERT_POOL_MB when set and otherwise the free
 // device memory at creation minus the model's non-expert weights minus
-// 1024 MB. N must cover every expert one block can select at once; a smaller
-// pool is an error that names the missing bytes.
+// 1024 MB, raised to one block's worth of experts when that figure is
+// smaller: the default always covers every expert one block can select at
+// once, taking the floor out of the margin if needed. A setting below that
+// floor is an error that names the missing bytes.
 //
 // Before a node's kernel runs, select() reads its selected expert ids (the
 // caller has already read them from the device), copies each absent expert's
