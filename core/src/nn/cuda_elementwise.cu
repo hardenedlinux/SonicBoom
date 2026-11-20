@@ -6773,7 +6773,8 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                                    uint64_t n_slots, int n, int n_heads_q,
                                    int n_heads_kv, int head_dim,
                                    uint64_t sliding_window, float scale,
-                                   float* out, bool kv_f16, bool kv_q8) {
+                                   float* out, bool kv_f16, bool kv_q8,
+                                   AttentionPhase phase) {
   if (!available()) return false;
   if (n <= 0 || n_heads_q <= 0 || n_heads_kv <= 0 || head_dim <= 0 || n_slots == 0)
     return false;
@@ -6793,7 +6794,8 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
   // here rather than falling through to a different kernel.
   if (!flash_attention_boom_fattn_chunk_dev_pos(
           q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
-          n_heads_kv, head_dim, sliding_window, scale, out, kv_f16, kv_q8))
+          n_heads_kv, head_dim, sliding_window, scale, out, kv_f16, kv_q8,
+          phase))
     return false;
 
   int sbr = 0, sbk = 0, sblock = 0;

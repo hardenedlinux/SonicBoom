@@ -2741,12 +2741,16 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       double attn_scale = 1.0;
       attr_f(*node, "scale", attn_scale);
       nn::cuda::attention_trace_set_layer(int(layer));  // no-op when tracing off
+      // The prefill phase is the only emitter of this node kind: the verify
+      // step deals one decode graph over rows and its attention stays an
+      // OpKind::Attention node, so this entry is never reached with verify
+      // attention.
       ok = nn::cuda::flash_attention_chunk_dev_pos(
           dev(in[0]), dev(in[1]), dev(in[2]), dev_mut(cache.k_buf.id),
           dev_mut(cache.v_buf.id), reinterpret_cast<const uint64_t*>(pos_slot()),
           cache.n_slots, int(nb), int(lc.n_heads_q), int(cache.n_heads_kv),
           int(cache.head_dim), lc.sliding_window, float(attn_scale), out,
-          cache.f16(), cache.q8());
+          cache.f16(), cache.q8(), nn::cuda::AttentionPhase::Prefill);
       break;
     }
     case OpKind::KvAppend: {

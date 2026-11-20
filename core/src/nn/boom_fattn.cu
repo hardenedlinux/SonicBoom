@@ -400,6 +400,9 @@ bool run_tuned(const float* q, const float* k_batch, const float* v_batch,
   call.out = out;
   call.head_dim = HEAD_DIM;
   call.gqa = GQA;
+  // SPANPAD 32 is the row-owning family's staging; every other class stages
+  // for the query-resident kernels.
+  call.row_owning = SPANPAD == 32;
   if (fattn_tune::run(call)) return true;
   // The tuner already emitted its report; this line is the caller-visible
   // reason the call declines (there is no fallback backend). Once per message.
@@ -421,8 +424,9 @@ bool acc_f16() {
 }
 
 // Read per call for the same reason: the row-owning schedule is the default
-// for the shapes that have it (head dim 128, GQA 7, global attention);
-// SONICBOOM_FATTN_FA2=0 keeps the query-resident family.
+// for the shapes that have it (head dim 128, GQA 7, global attention) in the
+// prefill phase; the verify phase and SONICBOOM_FATTN_FA2=0 keep the
+// query-resident family.
 bool fa2_enabled() {
   const char* e = std::getenv("SONICBOOM_FATTN_FA2");
   return e == nullptr || std::string_view(e) == "1";
@@ -454,7 +458,7 @@ bool flash_attention_boom_fattn_chunk_dev_pos(
     const float* k_cache, const float* v_cache, const uint64_t* start,
     uint64_t n_slots, int n, int n_heads_q, int n_heads_kv, int head_dim,
     uint64_t sliding_window, float scale, float* out, bool kv_f16,
-    bool kv_q8) {
+    bool kv_q8, AttentionPhase phase) {
   if (!q || !k_batch || !v_batch || !k_cache || !v_cache || !start || !out)
     return false;
   if (n <= 0 || n_heads_q <= 0 || n_heads_kv <= 0 || n_slots == 0) return false;
@@ -544,6 +548,11 @@ bool flash_attention_boom_fattn_chunk_dev_pos(
         n_heads_kv, sliding_window, scale, out, kv_f16, kv_q8);
   }
   if (head_dim == 128) {  // gqa == 7, or gqa == 6 with SONICBOOM_FATTN_G6=mma
+    // The row-owning schedule is a prefill-phase kernel. A verify call keeps
+    // the query-resident family whatever its query count: the verify step's
+    // rows must stay bit-identical to plain decode steps.
+    const bool row_owning =
+        phase == AttentionPhase::Prefill && fa2_enabled() && sliding_window == 0;
     if (gqa == 6) {
       if (acc_f16())
         return run_tuned<128, 6>(q, k_batch, v_batch, k_cache, v_cache, start,
@@ -557,7 +566,7 @@ bool flash_attention_boom_fattn_chunk_dev_pos(
       // Global d128/GQA-7 attention runs the row-owning schedule family when
       // opted in; its 32-key tile needs the wider span padding. The tuner and
       // this staging rule read the same switch.
-      if (fa2_enabled() && sliding_window == 0)
+      if (row_owning)
         return run_tuned<128, 7, 32>(q, k_batch, v_batch, k_cache, v_cache,
                                      start, n_slots, n, n_heads_q, n_heads_kv,
                                      sliding_window, scale, out, kv_f16, kv_q8);
@@ -567,7 +576,7 @@ bool flash_attention_boom_fattn_chunk_dev_pos(
     }
     // The f32 accumulator keeps the row-owning schedule when opted in: its
     // candidate set is the family's f32 pair.
-    if (fa2_enabled() && sliding_window == 0)
+    if (row_owning)
       return run_tuned<128, 7, 32>(q, k_batch, v_batch, k_cache, v_cache, start,
                                    n_slots, n, n_heads_q, n_heads_kv,
                                    sliding_window, scale, out, kv_f16, kv_q8);

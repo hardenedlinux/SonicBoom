@@ -134,6 +134,12 @@ struct Call {
   float* out = nullptr;
   int head_dim = 0;
   int gqa = 0;
+  // The caller staged the wider span padding for the row-owning family. The
+  // selected candidate must belong to the family the workspace was staged
+  // for, so this gates family 1 in call_family() before the shape and env
+  // checks: a verify call stages the query-resident family whatever the
+  // prefill default is.
+  bool row_owning = false;
 };
 
 // Select (once per shape class per device) and launch. False means no

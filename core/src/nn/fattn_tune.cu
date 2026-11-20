@@ -454,6 +454,10 @@ bool aot_image_exists(int candidate, int head_dim, int gqa) {
 // numerics keeps the query-resident reference (the documented boom_fattn
 // canonical arm).
 int call_family(const Call& c) {
+  // The caller decides the family by staging (the row-owning kernel reads a
+  // 32-key-tile-padded workspace); the shape and env gates below can only
+  // take family 1 away, never add it.
+  if (!c.row_owning) return 0;
   if (c.head_dim != 128 || c.gqa != 7 || c.window != 0) return 0;
   if (!fa2_enabled() || ::sonicboom::tune::canonical()) return 0;
   if (jit_mode() == Jit::Force) return 0;

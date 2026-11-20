@@ -279,6 +279,14 @@ void flash_attention_full_release_scratch();
 // after every layer (including shared donors) has read it, so the cache still
 // holds the prior context here. For start == 0 the prior range is empty, so the
 // kernel reads the current chunk only. q is [n, n_heads_q, head_dim];
+// The graph phase an attention call belongs to. The row-owning schedule
+// (candidate family 1) is a prefill-phase kernel: the speculative verify step
+// keeps the query-resident family, which is what its row-invariance contract
+// (every row bit-identical to a plain decode step) is measured on. The caller
+// passes the phase from the graph it is running; nothing is inferred from n.
+// Append-only.
+enum class AttentionPhase : uint8_t { Prefill = 0, Verify = 1 };
+
 // k_batch/v_batch are [n, n_heads_kv, head_dim] (fp16-rounded f32); k_cache/
 // v_cache are [n_slots, n_heads_kv, head_dim]. out is [n, n_heads_q, head_dim].
 // Device-position variant: `start` is a DEVICE uint64_t read in-kernel, so the
@@ -293,7 +301,8 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                                    int n_heads_kv, int head_dim,
                                    uint64_t sliding_window, float scale,
                                    float* out, bool kv_f16 = false,
-                                   bool kv_q8 = false);
+                                   bool kv_q8 = false,
+                                   AttentionPhase phase = AttentionPhase::Prefill);
 
 // The prefill attention implementation (core/src/nn/boom_fattn.cu): f16 KV
 // span materialization (f32/f16/q8 cache rows are dequantized into the f16
@@ -305,7 +314,7 @@ bool flash_attention_boom_fattn_chunk_dev_pos(
     const float* k_cache, const float* v_cache, const uint64_t* start,
     uint64_t n_slots, int n, int n_heads_q, int n_heads_kv, int head_dim,
     uint64_t sliding_window, float scale, float* out, bool kv_f16 = false,
-    bool kv_q8 = false);
+    bool kv_q8 = false, AttentionPhase phase = AttentionPhase::Prefill);
 
 // boom_fattn's strict-order path for the d128/GQA-6 class
 // (core/src/nn/boom_fattn_strict.cu). Same contract; false for any other
