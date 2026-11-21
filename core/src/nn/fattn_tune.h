@@ -67,7 +67,7 @@ namespace sonicboom::nn::cuda::fattn_tune {
 // Candidate registry version. Part of the persistent cache key: bump it when a
 // candidate is added, removed or its code changes, and every stored selection
 // for this backend is invalidated.
-constexpr int kRegistryVersion = 4;
+constexpr int kRegistryVersion = 5;
 
 // Fingerprint schema version. A selection key is
 //   f<version>/<capability>/<software>/<workload>
@@ -123,6 +123,17 @@ struct Call {
   const __half* q16 = nullptr;
   const __half* k_ws = nullptr;
   const __half* v_ws = nullptr;
+  // Direct-load sources for the row-owning family: the f32 Q activation, the
+  // current chunk's f32 K/V batch and the layer's K/V cache. The row-owning
+  // kernel reads these itself (cp.async from the cache, rounding the batch and
+  // Q in-kernel), so it needs no staged workspace. The query-resident family
+  // keeps q16/k_ws/v_ws.
+  const float* q_f32 = nullptr;
+  const float* k_batch = nullptr;
+  const float* v_batch = nullptr;
+  const void* k_cache = nullptr;
+  const void* v_cache = nullptr;
+  int kv_dtype = 0;  // 0 = f32, 1 = f16, 2 = q8 cache
   const uint64_t* start = nullptr;
   uint64_t n_slots = 0;
   uint64_t window = 0;
@@ -146,6 +157,12 @@ struct Call {
 // candidate could run at all and the caller must use its own fallback path;
 // the reason is available through last_error().
 bool run(const Call& call);
+
+// The candidate family a call resolves to (1 = row-owning, 0 = query-resident),
+// using the same gates run() applies. The caller uses it to decide whether the
+// call needs the direct-load sources (family 1) or the staged gather + qcast
+// workspace (family 0, and any row-owning call whose gate fails).
+int family_for(const Call& call);
 
 // The geometry of the current selection for (head_dim, gqa), or the reference
 // geometry when the class has not been resolved. False when unsupported.

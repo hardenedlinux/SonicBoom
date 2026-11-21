@@ -109,6 +109,36 @@ __device__ __forceinline__ void boom_load_q(uint32_t a[4],
   a[3] = v1 ? *reinterpret_cast<const uint32_t*>(p1 + t * 2 + 8) : 0u;
 }
 
+// A-fragment from f32 Q: the direct-load twin of boom_load_q. The source is the
+// caller's f32 activation (no materialized q16 workspace); each pair is
+// converted with the same __float2half_rn rounding the qcast kernel applied, so
+// the fragment bits are unchanged.
+__device__ __forceinline__ uint32_t boom_pack2_half(float x, float y) {
+  const __half2 h = __halves2half2(__float2half_rn(x), __float2half_rn(y));
+  return *reinterpret_cast<const uint32_t*>(&h);
+}
+
+__device__ __forceinline__ void boom_load_q_f32(uint32_t a[4],
+                                                const float* __restrict__ q,
+                                                int hq, int n_heads_q,
+                                                int head_dim, int qr, int k0,
+                                                int n) {
+  const int lane = threadIdx.x & 31;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const size_t row_stride = (size_t)n_heads_q * head_dim;
+  const int r0 = qr + g;
+  const int r1 = qr + g + 8;
+  const bool v0 = r0 < n;
+  const bool v1 = r1 < n;
+  const float* p0 = q + (size_t)r0 * row_stride + (size_t)hq * head_dim + k0;
+  const float* p1 = q + (size_t)r1 * row_stride + (size_t)hq * head_dim + k0;
+  a[0] = v0 ? boom_pack2_half(p0[t * 2], p0[t * 2 + 1]) : 0u;
+  a[1] = v1 ? boom_pack2_half(p1[t * 2], p1[t * 2 + 1]) : 0u;
+  a[2] = v0 ? boom_pack2_half(p0[t * 2 + 8], p0[t * 2 + 9]) : 0u;
+  a[3] = v1 ? boom_pack2_half(p1[t * 2 + 8], p1[t * 2 + 9]) : 0u;
+}
+
 // B-fragment from the K tile [BK][head_dim]: n = keys key_off..+7, k = dims
 // k0..k0+15.
 __device__ __forceinline__ void boom_load_k(uint32_t b[2],
@@ -1196,6 +1226,16 @@ boom_fattn_attn_qreg_kernel(
 // warp `qg = warp % GQA` serving query head `kvh*GQA + qg`, rows
 // `blockIdx.x*BR + rc*16 .. +15`. Candidate layouts differ only in BR, which
 // changes which warps share a staged tile and never a row's arithmetic.
+//
+// The kernel reads the model's own K/V sources: the prior span straight from
+// the layer's cache (cp.async, address = cache row for the position's ring
+// slot) and the current chunk from the f32 batch buffer (converted with the
+// same __float2half_rn rounding the gather applied). V is staged in the
+// cache's natural [key][dim] order and read with ldmatrix.trans, so no
+// transposing gather pass is needed. Q is read from the f32 activation and
+// rounded in the fragment load. This replaces the per-call gather + qcast
+// workspace materialization (round 14, Part B); the values and therefore the
+// output are bit-identical to that path.
 // ---------------------------------------------------------------------------
 
 // Four 8x8 b16 matrices from shared memory; lane L supplies the address of
@@ -1211,6 +1251,20 @@ __device__ __forceinline__ void boom_fa2_ldsm_x4(uint32_t r[4],
                : "r"(addr));
 }
 
+// Transposed variant: four 8x8 b16 matrices loaded transposed. Used for V when
+// the tile is staged in the cache's natural [key][dim] order: each transposed
+// 8x8 block is exactly the [dim][key] block the PV B-fragment expects, with the
+// same element values, so the mma operands are unchanged.
+__device__ __forceinline__ void boom_fa2_ldsm_x4_trans(uint32_t r[4],
+                                                       const __half* p) {
+  const uint32_t addr =
+      static_cast<uint32_t>(__cvta_generic_to_shared(const_cast<__half*>(p)));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+               "{%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(addr));
+}
+
 // Two f32 to one packed half2 word: x in the low half, y in the high half.
 __device__ __forceinline__ uint32_t boom_fa2_pack2(float x, float y) {
   const __half2 h = __floats2half2_rn(x, y);
@@ -1220,13 +1274,15 @@ __device__ __forceinline__ uint32_t boom_fa2_pack2(float x, float y) {
 template <int HEAD_DIM, int GQA, int BR, int BC, bool F16ACC, int MINB>
 __global__ void __launch_bounds__((BR / 16) * GQA * 32, MINB)
 boom_fattn_fa2_kernel(
-    const __half* __restrict__ q, const __half* __restrict__ k_ws,
-    const __half* __restrict__ v_ws, const uint64_t* __restrict__ start_ptr,
+    const float* __restrict__ q, const float* __restrict__ k_batch,
+    const float* __restrict__ v_batch, const void* __restrict__ k_cache,
+    const void* __restrict__ v_cache, const uint64_t* __restrict__ start_ptr,
     uint64_t n_slots, uint64_t window, int n, int n_heads_q, int n_heads_kv,
-    int ne_pad, float scale, float* __restrict__ out) {
+    int kv_dtype, float scale, float* __restrict__ out) {
+  // kv_dtype: 0 = f32 cache, 1 = f16 cache, 2 = q8 cache (row = head_dim int8
+  // followed by its f32 scale), the same cache layouts the gather read.
   constexpr int WARPS = (BR / 16) * GQA;
-  constexpr int KS = HEAD_DIM + 8;   // K tile row stride (halves)
-  constexpr int VS = BC + 8;         // V tile row stride (halves)
+  constexpr int KS = HEAD_DIM + 8;   // K and V tile row stride (halves)
   constexpr int NT = HEAD_DIM / 8;   // O n8 tiles
   constexpr int KSTEPS = HEAD_DIM / 16;
   constexpr int SN = BC / 8;         // S n8 tiles
@@ -1237,7 +1293,7 @@ boom_fattn_fa2_kernel(
 
   extern __shared__ __half smem[];
   __half* kbuf = smem;                    // 2 * BC * KS
-  __half* vbuf = kbuf + 2 * BC * KS;      // 2 * HEAD_DIM * VS
+  __half* vbuf = kbuf + 2 * BC * KS;      // 2 * BC * KS (same [key][dim] layout)
 
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
@@ -1273,34 +1329,95 @@ boom_fattn_fa2_kernel(
   const uint64_t key_last = last_q < key_end ? last_q : key_end;
   const uint64_t base = boom_span_base(start, window);
 
-  // Q, once per call: this warp's whole 16-row unit of its query head.
+  // Q, once per call: this warp's whole 16-row unit of its query head, read
+  // from the f32 activation with the qcast rounding.
   uint32_t qreg[KSTEPS][4];
 #pragma unroll
   for (int j = 0; j < KSTEPS; ++j)
-    boom_load_q(qreg[j], q, hq, n_heads_q, HEAD_DIM, qr, j * 16, n);
+    boom_load_q_f32(qreg[j], q, hq, n_heads_q, HEAD_DIM, qr, j * 16, n);
 
-  // Stage one key tile: K as [key][d] with padded rows, V as [d][key].
+  // One 8-element chunk of one key row, from the cache (prior positions) or
+  // the f32 batch (current chunk); positions past the chunk are zeros. Every
+  // path reproduces the values the gather kernel wrote, including its f16
+  // rounding, so the staged tiles are bit-identical to the workspace.
+  const uint64_t key_end_excl = start + (uint64_t)n;
+  auto stage8 = [&](__half* dst, const void* cache, const float* batch,
+                    uint64_t abs, uint64_t slot, int dd) {
+    if (abs >= start) {
+      if (abs < key_end_excl) {
+        const uint64_t bi = abs - start;
+        const size_t off =
+            (size_t)(bi * (uint64_t)n_heads_kv + (uint64_t)kvh) *
+                (size_t)HEAD_DIM +
+            (size_t)dd;
+        const float* p = batch + off;
+        boom_half8 h;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) h.h[i] = __float2half_rn(p[i]);
+        *reinterpret_cast<uint4*>(dst) = h.u;
+      } else {
+        *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+      }
+      return;
+    }
+    const uint64_t row = slot * (uint64_t)n_heads_kv + (uint64_t)kvh;
+    if (kv_dtype == 1) {
+      // f16 cache: the row is already the staged dtype, 16-byte aligned, so
+      // the tile copy is one cp.async straight from the cache.
+      const __half* p = static_cast<const __half*>(cache) +
+                        row * (uint64_t)HEAD_DIM + (uint64_t)dd;
+      boom_cp_async_16(dst, p);
+    } else if (kv_dtype == 2) {
+      const int8_t* p = static_cast<const int8_t*>(cache) +
+                        row * (uint64_t)(HEAD_DIM + 4);
+      const float s = *reinterpret_cast<const float*>(p + HEAD_DIM);
+      boom_half8 h;
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        h.h[i] = __float2half_rn(float(p[dd + i]) * s);
+      *reinterpret_cast<uint4*>(dst) = h.u;
+    } else {
+      const float* p = static_cast<const float*>(cache) +
+                       row * (uint64_t)HEAD_DIM + (uint64_t)dd;
+      boom_half8 h;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) h.h[i] = __float2half_rn(p[i]);
+      *reinterpret_cast<uint4*>(dst) = h.u;
+    }
+  };
+
+  // Stage one key tile: K and V both as [key][dim] with padded rows (V is read
+  // transposed with ldmatrix.trans).
   auto stage = [&](int buf, uint64_t rel0) {
     __half* kd = kbuf + buf * (BC * KS);
+    __half* vd = vbuf + buf * (BC * KS);
+    // One ring slot for the tile's first key, then a conditional subtract per
+    // key: the keys are consecutive, so the 64-bit modulo runs once per tile
+    // instead of once per chunk (K and V share the answer). With fewer slots
+    // than a tile there can be more than one wrap, so that case keeps the
+    // modulo; a tile wholly in the current chunk reads no slot at all.
+    const uint64_t abs0 = base + rel0;
+    const bool tile_has_cache = abs0 < start;
+    const bool slots_span_tile = n_slots >= (uint64_t)BC;
+    const uint64_t slot0 =
+        (tile_has_cache && slots_span_tile) ? abs0 % n_slots : 0;
     for (int i = threadIdx.x; i < BC * HEAD_DIM / 8; i += WARPS * 32) {
       const int e = i * 8;
       const int key = e / HEAD_DIM;
       const int dd = e - key * HEAD_DIM;
-      boom_cp_async_16(kd + key * KS + dd,
-                       k_ws + ((size_t)kvh * (size_t)ne_pad +
-                               (size_t)(rel0 + (uint64_t)key)) *
-                                  (size_t)HEAD_DIM +
-                           dd);
-    }
-    __half* vd = vbuf + buf * (HEAD_DIM * VS);
-    for (int i = threadIdx.x; i < HEAD_DIM * BC / 8; i += WARPS * 32) {
-      const int e = i * 8;
-      const int dim = e / BC;
-      const int koff = e - dim * BC;
-      boom_cp_async_16(vd + dim * VS + koff,
-                       v_ws + ((size_t)kvh * (size_t)HEAD_DIM + (size_t)dim) *
-                                  (size_t)ne_pad +
-                           rel0 + (uint64_t)koff);
+      const uint64_t abs = abs0 + (uint64_t)key;
+      uint64_t slot = 0;
+      if (tile_has_cache) {
+        if (slots_span_tile) {
+          slot = slot0 + (uint64_t)key;
+          if (slot >= n_slots) slot -= n_slots;
+        } else {
+          slot = abs % n_slots;
+        }
+      }
+      const int dst = key * KS + dd;
+      stage8(kd + dst, k_cache, k_batch, abs, slot, dd);
+      stage8(vd + dst, v_cache, v_batch, abs, slot, dd);
     }
   };
 
@@ -1422,8 +1539,11 @@ boom_fattn_fa2_kernel(
 #pragma unroll
       for (int i = 0; i < NT; i += 2) {
         uint32_t r[4];
-        boom_fa2_ldsm_x4(r, vt + (i * 8 + (lane / 16) * 8 + lane % 8) * VS +
-                                kk * 16 + ((lane / 8) % 2) * 8);
+        // V is staged [key][dim]; the transposed load gives the same [dim][key]
+        // blocks the previous transposed workspace held.
+        boom_fa2_ldsm_x4_trans(
+            r, vt + (kk * 16 + ((lane / 8) % 2) * 8 + lane % 8) * KS +
+                   i * 8 + (lane / 16) * 8);
         const uint32_t b0[2] = {r[0], r[1]};
         const uint32_t b1[2] = {r[2], r[3]};
         if constexpr (F16ACC) {
@@ -1458,7 +1578,7 @@ boom_fattn_fa2_kernel(
     // on lanes that never arrive). A row whose own last key is below j0
     // computes a fully masked tile; that is bit-identical to skipping it.
     if (j0 <= start + (uint64_t)(qr + 15))
-      compute(kbuf + buf * (BC * KS), vbuf + buf * (HEAD_DIM * VS), j0);
+      compute(kbuf + buf * (BC * KS), vbuf + buf * (BC * KS), j0);
     __syncthreads();  // the next tile may overwrite this buffer
     buf ^= 1;
     j0 += (uint64_t)BC;

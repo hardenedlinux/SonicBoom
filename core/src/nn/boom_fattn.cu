@@ -36,12 +36,15 @@
 //
 // Structure, and where it differs from the llama.cpp prefill kernel:
 //
-//   1. A gather kernel materializes the KV span this call needs once, as
-//      [kv_head][key][dim] f16 for K and [kv_head][dim][key] f16 for V
-//      (transposed, so the PV B-fragments are contiguous key runs). Reads of
-//      the f32 batch buffer and of the f32/f16 cache are vectorized, and the
-//      transpose is done through one 32x64 shared-memory tile per block. This
-//      replaces ggml's scalar per-element cast and its large f16 additive mask.
+//   1. The query-resident family's gather kernel materializes the KV span a
+//      call needs once, as [kv_head][key][dim] f16 for K and [kv_head][dim][key]
+//      f16 for V (transposed, so the PV B-fragments are contiguous key runs).
+//      Reads of the f32 batch buffer and of the f32/f16 cache are vectorized,
+//      and the transpose is done through one 32x64 shared-memory tile per
+//      block. The row-owning (FlashAttention-2) family does not use it: it
+//      stages K/V tiles directly from the cache/batch and reads V transposed
+//      with ldmatrix.trans, and it reads Q from the f32 activation with the
+//      qcast rounding (round 14, Part B).
 //   2. The attention kernel derives the causal + sliding-window mask in
 //      registers from the device start position, so there is no mask buffer
 //      and no KV_max buffer, and the launch shape never depends on `start`
@@ -65,10 +68,12 @@
 //   4. K and V staging is cp.async double-buffered per key tile; the V tile is
 //      padded to a 16-byte-aligned stride (BK+8 halves) so every cp.async is a
 //      16-byte transfer.
-//   5. Q is materialized as f16 once per call (a linear cast kernel) and read
-//      from there by phase 1: the same __float2half_rn rounding as before, half
-//      the bytes, no per-tile conversion. Measured +7.6% at pp4096 and +12% at
-//      pp8192 on top of the f16-KV kernel.
+//   5. For the query-resident family Q is materialized as f16 once per call (a
+//      linear cast kernel) and read from there by phase 1: the same
+//      __float2half_rn rounding as before, half the bytes, no per-tile
+//      conversion. Measured +7.6% at pp4096 and +12% at pp8192 on top of the
+//      f16-KV kernel. The row-owning family reads Q from the f32 activation
+//      and rounds in the fragment load, with the same rounding.
 //   6. The PV accumulation is fp16 (half2) by default, like ggml's prefill
 //      kernel, and can be switched to fp32 with SONICBOOM_BOOM_FATTN_ACC=f32. The
 //      fp32 variant halves the tile or widens the dim split to stay within the
@@ -224,7 +229,8 @@ int d256_mode() {
 
 // Stage this call's inputs: materialize the KV span the attention kernel scans
 // as [kv_head][key][dim] f16 (K) and [kv_head][dim][key] f16 (V), and cast Q to
-// f16 once. Shared by the tuned path and the fixed legacy variants.
+// f16 once. Used by the query-resident tuned path and the fixed legacy
+// variants; the row-owning family reads its sources directly instead.
 //
 // Relative span bound. Windowed: the span starts at most window-1 keys below
 // the first query, and the span base is aligned down by up to 31 keys; the last
@@ -365,44 +371,78 @@ bool run_chunk(const float* q, const float* k_batch, const float* v_batch,
   return cudaGetLastError() == cudaSuccess;
 }
 
-// The tuned path: stage, then let the candidate tuner select and launch (the
-// selection is a map lookup after the first call for this shape class).
-// SPANPAD is the key padding the staged workspace is sized for: 16 keys for
-// the query-resident kernels' tiles, 32 for the row-owning family's 32-key
-// tile, which may read a whole tile past its last query row.
+// The tuned path: let the candidate tuner select and launch (the selection is
+// a map lookup after the first call for this shape class). SPANPAD is the key
+// padding the staged workspace is sized for: 16 keys for the query-resident
+// kernels' tiles, 32 for the row-owning family's 32-key tile, which may read a
+// whole tile past its last query row. A row-owning call whose family gate
+// passes is handed the direct sources and skips the gather/qcast staging; a
+// row-owning call that falls back to the query-resident family stages the
+// workspace as before.
 template <int HEAD_DIM, int GQA, int SPANPAD = 16>
 bool run_tuned(const float* q, const float* k_batch, const float* v_batch,
                const float* k_cache, const float* v_cache,
                const uint64_t* start, uint64_t n_slots, int n, int n_heads_q,
                int n_heads_kv, uint64_t window, float scale, float* out,
                bool kv_f16, bool kv_q8) {
-  __half* q16 = nullptr;
-  __half* k_ws = nullptr;
-  __half* v_ws = nullptr;
-  int ne_pad = 0;
-  if (!stage_kv<HEAD_DIM, SPANPAD>(q, k_batch, v_batch, k_cache, v_cache, start,
-                                   n_slots, n, n_heads_q, n_heads_kv, window,
-                                   kv_f16, kv_q8, &q16, &k_ws, &v_ws, &ne_pad))
-    return false;
-
   fattn_tune::Call call;
-  call.q16 = q16;
-  call.k_ws = k_ws;
-  call.v_ws = v_ws;
   call.start = start;
   call.n_slots = n_slots;
   call.window = window;
   call.n = n;
   call.n_heads_q = n_heads_q;
   call.n_heads_kv = n_heads_kv;
-  call.ne_pad = ne_pad;
   call.scale = scale;
   call.out = out;
   call.head_dim = HEAD_DIM;
   call.gqa = GQA;
-  // SPANPAD 32 is the row-owning family's staging; every other class stages
-  // for the query-resident kernels.
+  // SPANPAD 32 is the row-owning family's geometry; every other class is
+  // staged for the query-resident kernels.
   call.row_owning = SPANPAD == 32;
+  if constexpr (SPANPAD == 32) {
+    if (fattn_tune::family_for(call) == 1) {
+      // Row-owning: the kernel reads the activation and cache sources itself,
+      // so no gather/qcast workspace is materialized.
+      call.q_f32 = q;
+      call.k_batch = k_batch;
+      call.v_batch = v_batch;
+      call.k_cache = k_cache;
+      call.v_cache = v_cache;
+      call.kv_dtype = kv_q8 ? 2 : (kv_f16 ? 1 : 0);
+      call.ne_pad = 0;
+    } else {
+      // The family gate failed (canonical numerics, FA2 off, no AOT image):
+      // the call stays on the query-resident candidates and needs the staged
+      // workspace, with the row-owning span padding.
+      __half* q16 = nullptr;
+      __half* k_ws = nullptr;
+      __half* v_ws = nullptr;
+      int ne_pad = 0;
+      if (!stage_kv<HEAD_DIM, SPANPAD>(q, k_batch, v_batch, k_cache, v_cache,
+                                       start, n_slots, n, n_heads_q,
+                                       n_heads_kv, window, kv_f16, kv_q8, &q16,
+                                       &k_ws, &v_ws, &ne_pad))
+        return false;
+      call.q16 = q16;
+      call.k_ws = k_ws;
+      call.v_ws = v_ws;
+      call.ne_pad = ne_pad;
+    }
+  } else {
+    __half* q16 = nullptr;
+    __half* k_ws = nullptr;
+    __half* v_ws = nullptr;
+    int ne_pad = 0;
+    if (!stage_kv<HEAD_DIM, SPANPAD>(q, k_batch, v_batch, k_cache, v_cache,
+                                     start, n_slots, n, n_heads_q, n_heads_kv,
+                                     window, kv_f16, kv_q8, &q16, &k_ws, &v_ws,
+                                     &ne_pad))
+      return false;
+    call.q16 = q16;
+    call.k_ws = k_ws;
+    call.v_ws = v_ws;
+    call.ne_pad = ne_pad;
+  }
   if (fattn_tune::run(call)) return true;
   // The tuner already emitted its report; this line is the caller-visible
   // reason the call declines (there is no fallback backend). Once per message.

@@ -290,8 +290,9 @@ Family family(int head_dim, int gqa) {
 Geometry geometry(const Cand& c, int head_dim, int gqa) {
   if (c.family == 1) {
     // The row-owning kernel: BR query rows x all GQA heads of one KV head per
-    // block, 32-key tiles, K rows padded by 8 and V rows by 8 (2 x BC x KS +
-    // 2 x HEAD_DIM x VS halves). BR is the only candidate axis.
+    // block, 32-key tiles, K and V rows both padded by 8 (2 x BC x KS halves
+    // each; V is staged [key][dim] and read with ldmatrix.trans). BR is the
+    // only candidate axis.
     Geometry g;
     g.br = (c.num == 9 || c.num == 11) ? 32 : 16;
     g.bk = 32;
@@ -300,8 +301,7 @@ Geometry geometry(const Cand& c, int head_dim, int gqa) {
     g.bkp = g.bk + 8;
     g.softmax_warps = (g.br / 16) * gqa;
     g.pipeline = false;
-    g.smem = (size_t)(2 * g.bk * g.kstride + 2 * head_dim * g.bkp) *
-             sizeof(__half);
+    g.smem = (size_t)(4 * g.bk * g.kstride) * sizeof(__half);
     return g;
   }
   const Family f = family(head_dim, gqa);
@@ -1203,9 +1203,6 @@ bool resolve_target(const Call& c, const Cand& cand, int jit, Target* t,
 // (the caller's buffer, or the tuning scratch).
 bool launch_target(Target& t, const Call& c, const Geometry& g, float* out) {
   cudaStream_t stream = ::sonicboom::cuda::boom_current_stream();
-  const __half* q = c.q16;
-  const __half* k = c.k_ws;
-  const __half* v = c.v_ws;
   const uint64_t* start = c.start;
   uint64_t n_slots = c.n_slots;
   uint64_t window = c.window;
@@ -1214,8 +1211,22 @@ bool launch_target(Target& t, const Call& c, const Geometry& g, float* out) {
   int nkv = c.n_heads_kv;
   int ne_pad = c.ne_pad;
   float scale = c.scale;
+  // The row-owning kernel takes the activation and cache sources directly; the
+  // query-resident family takes the staged f16 workspace.
+  const __half* q = c.q16;
+  const __half* k = c.k_ws;
+  const __half* v = c.v_ws;
+  const float* qf = c.q_f32;
+  const float* kb = c.k_batch;
+  const float* vb = c.v_batch;
+  const void* kc = c.k_cache;
+  const void* vc = c.v_cache;
+  int kv_dtype = c.kv_dtype;
   void* args[12] = {&q,  &k,   &v,  &start, &n_slots, &window,
                     &n,  &nq,  &nkv, &ne_pad, &scale,  &out};
+  void* args_direct[14] = {&qf, &kb,     &vb,    &kc,   &vc, &start, &n_slots,
+                           &window, &n, &nq, &nkv, &kv_dtype, &scale, &out};
+  void** launch_args = t.family == 1 ? args_direct : args;
 
   const dim3 grid((unsigned)((c.n + g.br - 1) / g.br), (unsigned)c.n_heads_kv);
   if (t.family == 1)
@@ -1224,7 +1235,7 @@ bool launch_target(Target& t, const Call& c, const Geometry& g, float* out) {
     BOOM_NOTE_LAUNCH(boom_fattn_attn_qreg_kernel, grid, g.block, g.smem, stream);
 
   if (t.jit)
-    return fattn_jit::launch(t.spec, grid, args, stream, g.smem, g.block);
+    return fattn_jit::launch(t.spec, grid, launch_args, stream, g.smem, g.block);
 
   if (!t.smem_set) {
     if (cudaFuncSetAttribute(t.fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1234,8 +1245,8 @@ bool launch_target(Target& t, const Call& c, const Geometry& g, float* out) {
     }
     t.smem_set = true;
   }
-  return cudaLaunchKernel(t.fn, grid, dim3((unsigned)g.block), args, g.smem,
-                          stream) == cudaSuccess;
+  return cudaLaunchKernel(t.fn, grid, dim3((unsigned)g.block), launch_args,
+                          g.smem, stream) == cudaSuccess;
 }
 
 // ---------------------------------------------------------------------------
@@ -2054,14 +2065,20 @@ Tuned resolve_class(const Call& c, const Fingerprints& fp) {
     if (cand == nullptr) {
       why = std::string("SONICBOOM_FATTN_CANDIDATE='") + forced +
             "' is not a candidate";
-    } else if (cand->family == 1 && call_family(c) != 1) {
-      // The row-owning kernel is staged for by the caller only when its
-      // family is in effect, so a forced family-1 candidate would read past
-      // the workspace padding. Refuse it rather than run it out of bounds.
-      why = "the row-owning candidate is not in effect for this call "
-            "(SONICBOOM_FATTN_FA2=0, canonical numerics, a forced JIT, "
-            "or no "
-            "AOT image for this device)";
+    } else if (cand->family != call_family(c)) {
+      // The caller stages exactly the sources its call's family runs on: the
+      // query-resident workspace, or (row-owning) the direct cache/batch
+      // pointers. A forced candidate of the other family would read sources
+      // that were not staged. Refuse it rather than run it out of bounds.
+      if (cand->family == 1)
+        why = "the row-owning candidate is not in effect for this call "
+              "(SONICBOOM_FATTN_FA2=0, canonical numerics, a forced JIT, "
+              "or no "
+              "AOT image for this device)";
+      else
+        why = "the query-resident candidate is not in effect for this call "
+              "(the row-owning family runs without the gathered workspace; "
+              "set SONICBOOM_FATTN_FA2=0 to stage it)";
     } else {
       t.cand = cand;
       t.geo = geometry(*cand, c.head_dim, c.gqa);
@@ -2225,6 +2242,8 @@ Tuned resolve_class(const Call& c, const Fingerprints& fp) {
 
 }  // namespace
 
+int family_for(const Call& call) { return call_family(call); }
+
 // Shape classes with a boom_fattn tensor-core instantiation. Every production
 // prefill geometry has one; a shape outside this table is served by the
 // strict-order SIMT path in boom_fattn.cu, which does not go through this
@@ -2240,10 +2259,18 @@ bool supported(int head_dim, int gqa) {
 }
 
 bool run(const Call& call) {
+  // A row-owning call carries the direct-load sources; every other call
+  // carries the staged q16/k_ws/v_ws workspace.
+  const bool direct = call.row_owning && call_family(call) == 1;
+  const bool sources_ok =
+      direct ? (call.q_f32 != nullptr && call.k_batch != nullptr &&
+                call.v_batch != nullptr && call.k_cache != nullptr &&
+                call.v_cache != nullptr)
+             : (call.q16 != nullptr && call.k_ws != nullptr &&
+                call.v_ws != nullptr);
   if (!supported(call.head_dim, call.gqa) || call.n <= 0 ||
-      call.n_heads_q <= 0 || call.n_heads_kv <= 0 || call.q16 == nullptr ||
-      call.k_ws == nullptr || call.v_ws == nullptr || call.start == nullptr ||
-      call.out == nullptr) {
+      call.n_heads_q <= 0 || call.n_heads_kv <= 0 || !sources_ok ||
+      call.start == nullptr || call.out == nullptr) {
     t_last_error = "unsupported shape";
     return false;
   }
