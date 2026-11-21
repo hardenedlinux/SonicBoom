@@ -755,6 +755,30 @@ boom_status boom_llm_detokenize(const boom_llm_model *model, const boom_token *t
                             size_t n, char *out, size_t cap, size_t *len_out,
                             boom_error **err_out);
 
+/* The bytes one token contributes to boom_llm_detokenize's output, before its
+ * cross-token passes: empty for a control/unknown/unused token, one decoded
+ * byte for a byte token, the ▁-unescaped or byte-level-decoded text otherwise.
+ * A caller that renders tokens incrementally concatenates the pieces and applies
+ * the passes itself (see boom_llm_vocab_flags); for any token list the result
+ * is byte for byte boom_llm_detokenize's. Two-call sizing; *len_out excludes
+ * the NUL. */
+boom_status boom_llm_token_piece(const boom_llm_model *model, boom_token token,
+                             char *out, size_t cap, size_t *len_out,
+                             boom_error **err_out);
+
+/* boom_llm_vocab_flags bits: the two passes boom_llm_detokenize applies over
+ * the pieces a token list assembles.
+ *
+ * BOOM_VOCAB_CLEAN_SPACES: apply clean_up_tokenization_spaces (strip a space
+ * before ?!., the space around a lone apostrophe, and the space in front of
+ * contractions like 's/'re/'ve).
+ * BOOM_VOCAB_ADD_SPACE_PREFIX: the first piece emitted loses one leading
+ * space (remove_space). Control/unknown/unused tokens do not use it up. */
+#define BOOM_VOCAB_CLEAN_SPACES 1
+#define BOOM_VOCAB_ADD_SPACE_PREFIX 2
+boom_status boom_llm_vocab_flags(const boom_llm_model *model, int *flags_out,
+                             boom_error **err_out);
+
 /* Create a session (a prompt/token history + n_ctx). The session holds a
  * reference to the model, so the model handle may be freed first.
  *

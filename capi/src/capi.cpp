@@ -2263,6 +2263,37 @@ boom_status boom_llm_detokenize(const boom_llm_model *model, const boom_token *t
       err_out);
 }
 
+boom_status boom_llm_token_piece(const boom_llm_model *model, boom_token token,
+                             char *out, size_t cap, size_t *len_out,
+                             boom_error **err_out) {
+  return guard(
+      [&]() -> boom_status {
+        if (!model || !len_out) return fail_arg(err_out);
+        const std::string s = vocab::token_piece(model->bundle->vocab, token);
+        *len_out = s.size();
+        if (cap <= s.size()) return BOOM_ERR_BINDING;
+        if (!s.empty()) std::memcpy(out, s.data(), s.size());
+        out[s.size()] = '\0';
+        return BOOM_OK;
+      },
+      err_out);
+}
+
+boom_status boom_llm_vocab_flags(const boom_llm_model *model, int *flags_out,
+                             boom_error **err_out) {
+  return guard(
+      [&]() -> boom_status {
+        if (!model || !flags_out) return fail_arg(err_out);
+        const vocab::Vocab &v = model->bundle->vocab;
+        int flags = 0;
+        if (v.clean_spaces) flags |= BOOM_VOCAB_CLEAN_SPACES;
+        if (v.add_space_prefix) flags |= BOOM_VOCAB_ADD_SPACE_PREFIX;
+        *flags_out = flags;
+        return BOOM_OK;
+      },
+      err_out);
+}
+
 boom_status boom_llm_session_new(boom_llm_model *model, uint64_t n_ctx,
                              boom_llm_session **session_out, boom_error **err_out) {
   return guard(

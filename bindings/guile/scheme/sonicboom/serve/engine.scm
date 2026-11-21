@@ -369,10 +369,12 @@ PyTorch: none"
                   (else (lp (1- k))))))
         0 markers))
 
-(define (earliest text markers)
-  ;; -> (index . marker) of the first marker found, or #f
+(define* (earliest text markers #:optional (start 0))
+  ;; -> (index . marker) of the first marker found at or after START, or #f.
+  ;; Text before START was scanned by an earlier call and held no match; only
+  ;; the tail a marker can reach into has to be looked at again.
   (fold (lambda (m best)
-          (match (string-contains text m)
+          (match (string-contains text m (max 0 start))
             (#f best)
             (i (if (or (not best) (< i (car best))) (cons i m) best))))
         #f markers))
@@ -501,6 +503,8 @@ PyTorch: none"
             ;; State of the text filter.
             (define buffer "")             ; undecided text
             (define in-call? #f)
+            (define markers (append stops tool-markers))
+            (define max-marker (fold max 0 (map string-length markers)))
             (define cancelled? #f)
             (define stopped? #f)
             (define (emit-content! text)
@@ -543,34 +547,41 @@ PyTorch: none"
                 (when (> ready (string-length prefix))
                   (feed! (substring text (string-length prefix) ready) #f))))
             (define (feed! text final?)
-              (set! buffer (string-append buffer text))
-              (let lp ()
-                (cond
-                 (in-call?
-                  (match (string-contains buffer tool-call-close)
-                    (#f (when final?
-                          (emit-call! buffer)
-                          (set! buffer "")))
-                    (i (emit-call! (substring buffer 0 i))
-                       (set! buffer (substring buffer (+ i (string-length tool-call-close))))
-                       (set! in-call? #f)
-                       (lp))))
-                 (else
-                  (match (earliest buffer (append stops tool-markers))
-                    ((i . m)
-                     (emit-content! (substring buffer 0 i))
-                     (cond
-                      ((member m stops)
-                       (set! stopped? #t)
-                       (set! buffer ""))
-                      (else
-                       (set! buffer (substring buffer (+ i (string-length m))))
-                       (set! in-call? #t)
-                       (lp))))
-                    (#f
-                     (let ((keep (if final? 0 (held-back buffer (append stops tool-markers)))))
-                       (emit-content! (substring buffer 0 (- (string-length buffer) keep)))
-                       (set! buffer (substring buffer (- (string-length buffer) keep))))))))))
+              ;; A match can only begin in the tail a marker reaches back into:
+              ;; everything before that was scanned when the text arrived and
+              ;; held none. After a match is consumed the remaining text has
+              ;; not been scanned, so the rescan starts at its beginning.
+              (let* ((old-len (string-length buffer))
+                     (scan-from (max 0 (- old-len (- max-marker 1))))
+                     (close-from (max 0 (- old-len (- (string-length tool-call-close) 1)))))
+                (set! buffer (string-append buffer text))
+                (let lp ((from scan-from) (close-from close-from))
+                  (cond
+                   (in-call?
+                    (match (string-contains buffer tool-call-close close-from)
+                      (#f (when final?
+                            (emit-call! buffer)
+                            (set! buffer "")))
+                      (i (emit-call! (substring buffer 0 i))
+                         (set! buffer (substring buffer (+ i (string-length tool-call-close))))
+                         (set! in-call? #f)
+                         (lp 0 0))))
+                   (else
+                    (match (earliest buffer markers from)
+                      ((i . m)
+                       (emit-content! (substring buffer 0 i))
+                       (cond
+                        ((member m stops)
+                         (set! stopped? #t)
+                         (set! buffer ""))
+                        (else
+                         (set! buffer (substring buffer (+ i (string-length m))))
+                         (set! in-call? #t)
+                         (lp 0 0))))
+                      (#f
+                       (let ((keep (if final? 0 (held-back buffer markers))))
+                         (emit-content! (substring buffer 0 (- (string-length buffer) keep)))
+                         (set! buffer (substring buffer (- (string-length buffer) keep)))))))))))
             ;; One token of the reply: bookkeeping, the end-of-turn check and
             ;; the text side. Returns #t to keep decoding and #f when the reply
             ;; is over (an end-of-turn token, a stop string, the client gone, or

@@ -179,4 +179,35 @@ std::string detokenize(const Vocab& v, const int32_t* tokens, size_t n) {
   return ggml_bpe::detokenize(v, tokens, n);
 }
 
+std::string token_piece(const Vocab& v, int32_t t) {
+  if (t < 0 || static_cast<size_t>(t) >= v.tokens.size() ||
+      static_cast<size_t>(t) >= v.type.size()) {
+    return {};
+  }
+  const TokenType ty = v.type[static_cast<size_t>(t)];
+  switch (ty) {
+    case TokenType::Control:
+    case TokenType::Unknown:
+    case TokenType::Unused:
+      return {};
+    case TokenType::Byte:
+      return std::string(1, static_cast<char>(
+          ggml_bpe::token_to_byte(v.tokens[static_cast<size_t>(t)])));
+    case TokenType::UserDefined:
+      return v.tokens[static_cast<size_t>(t)];
+    case TokenType::Normal:
+      break;
+  }
+  std::string piece = v.tokens[static_cast<size_t>(t)];
+  if (v.escape_whitespaces) {
+    ggml_bpe::unescape_whitespace(piece);
+    return piece;
+  }
+  // Byte-level vocabulary: map the stored spelling back through the byte
+  // table, with the placeholder detokenize() prints for a codepoint outside it.
+  std::string decoded;
+  if (ggml_unicode::byte_decode(piece, decoded)) return decoded;
+  return "[UNK_BYTE_0x" + piece + "]";
+}
+
 }  // namespace sonicboom::vocab

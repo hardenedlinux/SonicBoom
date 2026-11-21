@@ -362,6 +362,10 @@ PyTorch: none"
                                                     (list '* '* size_t int '* size_t '* '*)))
                (boom_llm_detokenize . ,(foreign-proc "boom_llm_detokenize" int
                                                    (list '* '* size_t '* size_t '* '*)))
+               (boom_llm_token_piece . ,(foreign-proc "boom_llm_token_piece" int
+                                                     (list '* int '* size_t '* '*)))
+               (boom_llm_vocab_flags . ,(foreign-proc "boom_llm_vocab_flags" int
+                                                     (list '* '* '*)))
                (boom_llm_session_new . ,(foreign-proc "boom_llm_session_new" int
                                                     (list '* uint64 '* '*)))
                (boom_llm_session_free . ,(foreign-proc "boom_llm_session_free" void (list '*)))

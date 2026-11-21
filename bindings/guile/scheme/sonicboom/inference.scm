@@ -469,6 +469,152 @@ PyTorch: none"
             (lp (cdr rest) #f
                 (cons (tokenize-flags model (cdr seg) flags) out)))))))
 
+;; --- detokenization ---------------------------------------------------------
+;;
+;; The C ABI renders a token list in one call (boom_llm_detokenize), but an
+;; incremental decode calls it once or twice per token, and a foreign call's
+;; per-argument pointer conversions dominate that cost. So the text is
+;; assembled here instead: each token id's piece comes from boom_llm_token_piece
+;; once and is cached on the model, and the C detokenizer's two cross-token
+;; passes (leading-space removal, clean_up_tokenization_spaces) run over the
+;; assembled bytes. For any token list the result is byte for byte the C
+;; detokenizer's.
+
+(define %vocab-clean-spaces-bit #x1)     ; BOOM_VOCAB_CLEAN_SPACES
+(define %vocab-add-space-prefix-bit #x2) ; BOOM_VOCAB_ADD_SPACE_PREFIX
+
+;; model handle -> vector: 0 flags, 1 boom_llm_token_piece, 2 piece table
+;; (token id -> bytevector), 3..8 the reusable piece buffers and their
+;; pointers, resolved once so a piece fetch converts no pointers.
+(define %vocab-states (make-weak-key-hash-table))
+
+(define (vocab-state model)
+  (or (hash-ref %vocab-states model)
+      (let* ((flags-bv (make-bytevector (sizeof int) 0))
+             (err (make-slot))
+             (st ((proc 'boom_llm_vocab_flags) model
+                  (bytevector->pointer flags-bv) (slot-ptr err))))
+        (sb-check! st err "vocab flags")
+        (let* ((out (make-bytevector 64 0))
+               (len-slot (make-bytevector 8 0))
+               (state (vector (bytevector-s32-native-ref flags-bv 0)
+                              (proc 'boom_llm_token_piece)
+                              (make-hash-table)
+                              out (bytevector->pointer out)
+                              len-slot (bytevector->pointer len-slot)
+                              err (slot-ptr err))))
+          (hash-set! %vocab-states model state)
+          state))))
+
+;; The piece of one token, from the model cache or the C ABI.
+(define (token-piece model token)
+  (let* ((state (vocab-state model))
+         (table (vector-ref state 2))
+         (cached (hash-ref table token)))
+    (or cached
+        (let* ((out (vector-ref state 3))
+               (len-slot (vector-ref state 5))
+               (err (vector-ref state 7))
+               (cap (bytevector-length out))
+               (call (lambda (o c) ((vector-ref state 1) model token o c
+                                    (vector-ref state 6) (vector-ref state 8))))
+               (status (call (vector-ref state 4) cap))
+               (m (bytevector-u64-native-ref len-slot 0)))
+          (cond
+           ((sb-status-ok? status)
+            (let ((piece (bytevector-range out 0 m)))
+              (hash-set! table token piece)
+              piece))
+           ((= status BOOM_ERR_BINDING)
+            (if (zero? m)
+                ;; a control/unknown/unused token (or an empty piece)
+                (let ((piece (make-bytevector 0 0)))
+                  (hash-set! table token piece)
+                  piece)
+                ;; longer than the reusable buffer: one more call, sized
+                (let* ((big (make-bytevector (+ m 1) 0))
+                       (st2 (call (bytevector->pointer big) (+ m 1))))
+                  (sb-check! st2 err "token piece")
+                  (let ((piece (bytevector-range big 0 m)))
+                    (hash-set! table token piece)
+                    piece))))
+           (else (sb-check! status err "token piece") #f))))))
+
+;; Concatenate pieces; a single piece is returned as is (callers must treat the
+;; result as read-only, as it may be the cached piece itself).
+(define (concat-pieces parts)
+  (cond
+   ((null? parts) (make-bytevector 0 0))
+   ((null? (cdr parts)) (car parts))
+   (else
+    (let* ((n (let loop ((ps parts) (n 0))
+                (if (null? ps) n
+                    (loop (cdr ps) (+ n (bytevector-length (car ps)))))))
+           (out (make-bytevector n 0)))
+      (let loop ((ps parts) (at 0))
+        (if (null? ps)
+            out
+            (let* ((p (car ps)) (len (bytevector-length p)))
+              (bytevector-copy! p 0 out at len)
+              (loop (cdr ps) (+ at len)))))))))
+
+;; clean_up_tokenization_spaces, the three passes of
+;; core/src/vocab/bpe_tokenizer.h over a fresh bytevector (results and the
+;; in-place compaction order are identical).
+(define (clean-spaces-bytes bv)
+  (define (space? x) (= x 32))
+  ;; first pass: a space before ? ! . ,
+  (let* ((n (bytevector-length bv))
+         (p1 (let loop ((i 1) (total (if (zero? n) 0 1)))
+               (if (< i n)
+                   (let* ((x (bytevector-u8-ref bv i))
+                          (total (if (and (space? (bytevector-u8-ref bv (1- i)))
+                                          (memv x '(63 33 46 44)))
+                                     (1- total)
+                                     total)))
+                     (bytevector-u8-set! bv total x)
+                     (loop (1+ i) (1+ total)))
+                   (bytevector-range bv 0 total)))))
+    ;; second pass: a lone apostrophe between two spaces
+    (let* ((n (bytevector-length p1))
+           (p2 (let loop ((i 1) (total (if (zero? n) 0 1)))
+                 (if (< i n)
+                     (let ((x (bytevector-u8-ref p1 i)))
+                       (if (and (= x 39) (< (+ i 1) n)
+                                (space? (bytevector-u8-ref p1 (- i 1)))
+                                (space? (bytevector-u8-ref p1 (+ i 1))))
+                           (let ((total (1- total)))
+                             (bytevector-u8-set! p1 (+ i 1) 0)
+                             (bytevector-u8-set! p1 total x)
+                             (loop (+ i 2) (1+ total)))
+                           (begin
+                             (bytevector-u8-set! p1 total x)
+                             (loop (1+ i) (1+ total)))))
+                     (bytevector-range p1 0 total)))))
+      ;; third pass: the space in front of a contraction
+      (let* ((n (bytevector-length p2))
+             (p3 (let loop ((i 1) (total (if (zero? n) 0 1)))
+                   (if (< i n)
+                       (let* ((x (bytevector-u8-ref p2 i))
+                              (total
+                               (if (and (space? (bytevector-u8-ref p2 (- i 1)))
+                                        (= x 39) (< (+ i 1) n))
+                                   (let ((x1 (bytevector-u8-ref p2 (+ i 1))))
+                                     (cond ((memv x1 '(116 100)) total) ; t d
+                                           ((memv x1 '(115 109)) (1- total)) ; s m
+                                           ((and (< (+ i 2) n)
+                                                 (let ((x2 (bytevector-u8-ref p2 (+ i 2))))
+                                                   (or (and (= x1 108) (= x2 108)) ; ll
+                                                       (and (= x1 114) (= x2 101)) ; re
+                                                       (and (= x1 118) (= x2 101))))) ; ve
+                                            (1- total))
+                                           (else total)))
+                                   total)))
+                         (bytevector-u8-set! p2 total x)
+                         (loop (1+ i) (1+ total)))
+                       (bytevector-range p2 0 total)))))
+        p3))))
+
 (define (detokenize-bytes model tokens)
   "Decode TOKENS (a list of token ids) to its UTF-8 bytes, as a bytevector. The
 bytes are not necessarily a whole number of characters: a token may carry only
@@ -476,25 +622,27 @@ the first bytes of a multi-byte character, which is exactly what streaming has
 to hold back until the rest arrives."
   (if (null? tokens)
       (make-bytevector 0 0)
-      (let* ((n (length tokens))
-             (in (tokens->bv tokens))
-             (len-slot (make-bytevector 8 0))        ; size_t
-             (err-slot (make-slot)))
-        ;; Sizing call (cap 0): fills *len_out (the text length, no NUL).
-        (let ((st ((proc 'boom_llm_detokenize) model (bytevector->pointer in) n
-                   %null-pointer 0 (bytevector->pointer len-slot)
-                   (slot-ptr err-slot))))
-          (unless (or (sb-status-ok? st) (= st BOOM_ERR_BINDING))
-            (sb-check! st err-slot "detokenize")))
-        (let* ((m (bytevector-u64-native-ref len-slot 0))
-               (out (make-bytevector (+ m 1) 0))     ; +1 for the NUL terminator
-               (st ((proc 'boom_llm_detokenize) model (bytevector->pointer in) n
-                     (bytevector->pointer out) (+ m 1) (bytevector->pointer len-slot)
-                     (slot-ptr err-slot))))
-          (sb-check! st err-slot "detokenize")
-          ;; Copy exactly the m text bytes the C ABI wrote (it also NUL-terminated
-          ;; out[m], which is why cap is m+1).
-          (bytevector-range out 0 m)))))
+      (let* ((flags (vector-ref (vocab-state model) 0))
+             (bv (let loop ((ts tokens)
+                            (remove? (not (zero?
+                                           (logand flags
+                                                        %vocab-add-space-prefix-bit))))
+                            (parts '()))
+                   (if (null? ts)
+                       (concat-pieces (reverse parts))
+                       (let ((p (token-piece model (car ts))))
+                         (if (zero? (bytevector-length p))
+                             ;; stripped token: it does not use up remove_space
+                             (loop (cdr ts) remove? parts)
+                             (loop (cdr ts) #f
+                                   (cons (if (and remove?
+                                                  (= (bytevector-u8-ref p 0) 32))
+                                             (bytevector-range p 1)
+                                             p)
+                                         parts))))))))
+        (if (zero? (logand flags %vocab-clean-spaces-bit))
+            bv
+            (clean-spaces-bytes (bytevector-copy bv))))))
 
 (define (detokenize model tokens)
   "Decode a list of token ids back to text.

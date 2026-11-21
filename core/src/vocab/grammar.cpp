@@ -58,7 +58,7 @@ namespace {
 // piece detokenize() applies (▁ -> space, byte tokens expanded, byte-level
 // decode for GPT2-style vocabularies), with control/unknown/unused tokens
 // contributing nothing.
-std::string token_piece(const Vocab& v, int32_t token) {
+std::string grammar_piece(const Vocab& v, int32_t token) {
   if (token < 0 || static_cast<size_t>(token) >= v.tokens.size() ||
       static_cast<size_t>(token) >= v.type.size())
     return {};
@@ -890,7 +890,7 @@ std::expected<std::unique_ptr<Grammar>, std::string> Grammar::parse(
   for (size_t id = 0; id < im.vocab_size; ++id) {
     const int32_t t = static_cast<int32_t>(id);
     if (im.is_stop(t)) continue;
-    std::string piece = token_piece(vocab, t);
+    std::string piece = grammar_piece(vocab, t);
     if (piece.empty()) continue;
     im.pieces[id] = piece;
     int32_t node = 0;

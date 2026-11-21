@@ -153,4 +153,11 @@ std::vector<int32_t> tokenize(const Vocab& v, std::string_view text,
 // text.
 std::string detokenize(const Vocab& v, const int32_t* tokens, size_t n);
 
+// token_piece: the bytes token `t` contributes to detokenize()'s output before
+// its cross-token passes: empty for control/unknown/unused, one decoded byte
+// for a byte token, the ▁-unescaped or byte-level-decoded text otherwise. The
+// leading-space removal and clean_spaces passes stay in detokenize(); a caller
+// that assembles a token stream itself applies them over the assembled text.
+std::string token_piece(const Vocab& v, int32_t t);
+
 }  // namespace sonicboom::vocab
