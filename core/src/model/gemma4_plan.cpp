@@ -7215,6 +7215,24 @@ uint64_t accepted_reuse_len(const Gemma4Model& m,
   return prefix_len;
 }
 
+// The position the session's device recurrent state actually stands at, read
+// from the decode runtime bound to the session's cache. The recorded token
+// history cannot stand in for it: a prefix-cache caller may rewind the history
+// between requests (prefix_cache_bench strips the suffix it added) while the
+// device state stays where the last request left it, so a live continuation is
+// only what the state itself says it is.
+static bool session_state_pos(const Gemma4Model& m,
+                              planner::KvCacheSession& session, uint64_t& pos) {
+  if (!session.caches || session.cache_id == 0 || session.n_ctx == 0)
+    return false;
+  DecodeRuntime* rt = get_decode_runtime(m, session.n_ctx, &session);
+  if (!rt) return false;
+  const std::shared_ptr<planner::StateSetDev>& st = rt->cuda->states();
+  if (!st) return false;
+  pos = st->pos();
+  return true;
+}
+
 } // namespace
 
 uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
@@ -7245,10 +7263,19 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
   // follows the checkpoint rule below, in both modes. A model without recurrent
   // state keeps one behaviour: the live state is the KV cache, whose reuse
   // length is already `common`.
+  // A live continuation also needs the device state to be where the recorded
+  // history says it is. The caller may have rewound the history (the
+  // prefix-cache control does) while the state stayed at the end of the
+  // abandoned continuation; then the request is a checkpoint restore, not a
+  // continuation.
+  uint64_t state_pos = 0;
+  const bool state_pos_known =
+      model_has_recurrent_state(m) && start_pos == 0 && common > 0 &&
+      session_state_pos(m, session, state_pos);
   const bool live_continue =
       !repro_continue_replay() && model_has_recurrent_state(m) &&
       start_pos == 0 && common > 0 && common == session.filled_tokens.size() &&
-      prompt.size() > common;
+      prompt.size() > common && state_pos_known && state_pos == common;
   uint64_t prefix_len =
       live_continue ? common
                     : accepted_reuse_len(m, session, prompt.size(), common);
@@ -7286,7 +7313,8 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
     // must restart its recurrent state, not resume whatever position the old
     // continuation left behind.
     const bool continues_live =
-        prefix_len > 0 && prefix_len == session_len && session_len % chunk == 0;
+        prefix_len > 0 && prefix_len == session_len && session_len % chunk == 0 &&
+        state_pos_known && state_pos == session_len;
     if (live_continue) {
       // Continue the whole recorded session from the live state: it is already
       // at the end of the session, so there is nothing to restore.

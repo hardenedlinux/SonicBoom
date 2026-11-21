@@ -122,7 +122,10 @@ int main(int argc, char** argv) {
                 (unsigned long long)depth);
         return 1;
       }
-      pos = depth + 1;
+      // The prefill consumed prompt positions 0..depth-1 and left the session
+      // at position depth; first[0] is the token sampled there and is fed at
+      // that same position, exactly as the decode-to-depth branch continues.
+      pos = depth;
       token = uint64_t(first[0]);
     } else if (depth > 0) {
       std::vector<int64_t> build(depth, -1);

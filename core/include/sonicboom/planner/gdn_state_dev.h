@@ -134,6 +134,10 @@ class StateSetDev {
   size_t size() const noexcept { return states_.size(); }
   GdnStateDev& state(size_t index) { return states_[index]; }
   const GdnStateDev& state(size_t index) const { return states_[index]; }
+  // The committed position every state in the set stands at (the set advances
+  // as one); 0 for an empty set. A prefix-reuse caller reads it to tell a live
+  // continuation from a history the caller has rewound.
+  uint64_t pos() const noexcept;
   bool valid() const noexcept;  // every state's committed buffers exist
 
   std::expected<void, std::string> commit(

@@ -330,6 +330,10 @@ StateSetDev::StateSetDev(std::vector<nn::GdnDims> dims) {
   for (const nn::GdnDims& d : dims) states_.emplace_back(d);
 }
 
+uint64_t StateSetDev::pos() const noexcept {
+  return states_.empty() ? 0 : states_.front().pos();
+}
+
 bool StateSetDev::valid() const noexcept {
   for (const GdnStateDev& s : states_) {
     if (!s.valid()) return false;
