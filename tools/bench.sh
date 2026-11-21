@@ -18,7 +18,8 @@ export LC_ALL=C LANG=C
 #   d512    decode 64 tokens at KV depth 512        (llama-bench -p 0 -n 64 -d 512)
 #   d512-spec  the same, speculation left to the startup probe (no llama-bench
 #           equivalent: it has no speculative decode)
-#   pp512   prefill a 512-token prompt, marginal    (llama-bench -p 512 -n 0)
+#   pp512   whole-call prefill of 512 tokens from position 0
+#                                               (llama-bench -p 512 -n 0 avg_ts)
 #   reuse   512-token prefix + 64-token continuation, first-token latency
 #           (SonicBoom's prefix cache; llama-bench has no equivalent)
 #
@@ -26,9 +27,10 @@ export LC_ALL=C LANG=C
 # so the one-time graph/plan build + CUDA-graph capture is never counted. That is
 # why tg64 reads the steady-state rate through this harness and not the lower
 # number a warm-up keyed on a different n_ctx used to report (the capture cost
-# leaked into the depth-0 tail). pp512 reports pp_marginal (the per-token prefill
-# cost, the llama-bench `-p n -n 0` semantics); pp_wall is a labelled legacy
-# metric.
+# leaked into the depth-0 tail). pp512 reports pp_whole (the whole N-token
+# prefill from position 0, N / t_N, the same definition as llama-bench
+# `-p n -n 0` avg_ts); pp_marginal stays in the tool's RESULT line as a
+# diagnostic and pp_wall is a labelled legacy metric.
 #
 # Measurement conditions: the GPU clock is pinned for the duration of the run
 # (`nvidia-smi -lgc`, released on exit with `-rgc`) — an unpinned clock drifts by
@@ -638,10 +640,11 @@ boom_d512_spec_stats=$(bench_stats tok_s env -u SONICBOOM_SPEC \
                        "$BASELINE/longctx_bench" --depth 512 --steps 64 \
                        --n-ctx "$D512_NCTX")
 measure_end
-# pp is the steady-state (reused-session) number; the fresh-session lifecycle
-# cost is a separate scenario and is measured by the tool itself, not folded in.
+# pp is the whole-call rate (N / median t_N) on a reused session; the
+# fresh-session lifecycle cost is a separate scenario and is measured by the
+# tool itself, not folded in.
 measure_begin pp512
-boom_pp512_stats=$(bench_stats pp_marginal_tok_s "$BASELINE/prefill_bench" \
+boom_pp512_stats=$(bench_stats pp_whole_tok_s "$BASELINE/prefill_bench" \
                    --prompt 512 --reps 3 --session reused)
 measure_end
 # prefix_cache_bench needs prompt token ids that are valid for the model under
@@ -705,6 +708,7 @@ echo
 [ -z "$LLAMA_WARN" ] || echo "$LLAMA_WARN"
 echo "==== $LABEL ===="
 echo "median ± sd of $RUNS runs, CUDA spine, whole model in VRAM (llama.cpp -ngl 99)"
+echo "pp = whole N-token prefill from position 0, same definition as llama-bench avg_ts"
 echo
 # Rows with no llama.cpp counterpart carry no ratio; under --no-llama every
 # llama.cpp cell and ratio says so rather than looking like a failed measurement.
@@ -717,6 +721,7 @@ row "d512-spec"      "$boom_d512_spec" "$boom_d512_spec_sd" "$RATIO_NONE" "$RATI
 row "pp512"          "$boom_pp512" "$boom_pp512_sd" "$ll_pp512" "$(ratio "$boom_pp512" "$ll_pp512")" "tok/s"
 row "reuse 512+64"   "$boom_reuse" "$boom_reuse_sd" "$RATIO_NONE" "$RATIO_NONE" "ms"
 echo
+echo "pp_marginal_tok_s (per-token cost with the per-call constant removed) is a diagnostic in prefill_bench's RESULT line."
 bench_failures
 echo "RESULT bench model=$LABEL tg64=$boom_tg64 d512=$boom_d512 d512_spec=$boom_d512_spec pp512=$boom_pp512 reuse_ms=$boom_reuse"
 
@@ -752,6 +757,7 @@ if [ "$LONG" = 1 ]; then
   [ -z "$LLAMA_WARN" ] || echo "$LLAMA_WARN"
   echo "==== $LABEL (long context) ===="
   echo "median ± sd of $RUNS runs; decode = $LONG_STEPS tokens at depth"
+  echo "pp = whole N-token prefill from position 0, same definition as llama-bench avg_ts"
   echo
   echo "| tier          | SonicBoom          | llama.cpp      |  ratio |"
   echo "|---------------|--------------------|----------------|--------|"
@@ -768,7 +774,7 @@ if [ "$LONG" = 1 ]; then
   done
   for n in $LONG_DEPTHS; do
     measure_begin "pp$n"
-    st=$(bench_stats pp_marginal_tok_s "$BASELINE/prefill_bench" --prompt "$n" \
+    st=$(bench_stats pp_whole_tok_s "$BASELINE/prefill_bench" --prompt "$n" \
            --reps 1 --session reused)
     sb=${st%% *}; sbsd=${st##* }
     ll=$(lb_long_ts "$n" 0 0)
@@ -778,6 +784,7 @@ if [ "$LONG" = 1 ]; then
     echo "RESULT bench_long model=$LABEL tier=pp$n tok_s=$sb llama_tok_s=$lld"
   done
   echo
+  echo "pp_marginal_tok_s (per-token cost with the per-call constant removed) is a diagnostic in prefill_bench's RESULT line."
   bench_failures
 fi
 

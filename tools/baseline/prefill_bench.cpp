@@ -27,8 +27,13 @@
 //     the runtime and the captured segment are kept. Each repetition therefore
 //     measures the same work: N prompt tokens through the steady-state path.
 //
+//       pp_whole_tok_s    = N / t_N             whole-call prefill throughput
 //       warm_tok_s        = N / t_warm          steady-state prefill throughput
 //       pp_marginal_tok_s = (N - n0) / (t_N - t_n0)
+//
+//     `pp_whole_tok_s` is the whole-call rate: N divided by the timed N-token
+//     prefill from position 0, median over the reps. It is the same definition
+//     as llama-bench's avg_ts (-p N -n 0), so pp cells compare like with like.
 //
 //     `pp_marginal_tok_s` is the per-token prefill cost with the per-call
 //     constant expense removed, and it is measured on the same session as the
@@ -58,11 +63,14 @@
 //       e2e_ms              session_create_ms + first_prefill_ms (what a server
 //                           that creates one session per request actually pays)
 //
-// The canonical `RESULT prefill ... pp_marginal_tok_s=` line is the reused
-// number; `pp_wall_tok_s` is the same steady-state throughput (no session build
-// in the timed region), taken as N / median(cudaEvent elapsed around the call):
-// the device wall time of the prefill itself, synchronized per repetition.
-// Session creation is never folded into it.
+// The `RESULT prefill ...` line is the reused number. `pp_whole_tok_s` is the
+// whole-call rate consumed by the benchmark tables; `pp_marginal_tok_s` stays
+// as the diagnostic (per-token cost with the per-call constant removed) and is
+// the field tools/bench-ab.sh compares across libraries. `pp_wall_tok_s` is the
+// same steady-state throughput (no session build in the timed region), taken as
+// N / median(cudaEvent elapsed around the call): the device wall time of the
+// prefill itself, synchronized per repetition. Session creation is never
+// folded into it.
 //
 // Before either section an untimed warm-up session/prefill initializes
 // process-wide first-use state (CUDA module loading, autotune selection
@@ -433,6 +441,11 @@ int main(int argc, char** argv) {
 
     const double t_warm = sn.best;  // ms
     canonical_pp_warm = t_warm > 0.0 ? 1000.0 * double(n) / t_warm : 0.0;
+    // Whole-call rate: N divided by the timed N-token prefill from position 0,
+    // median over the reps (each rep clears filled_tokens, so every rep is a
+    // full prefill from 0). This is llama-bench's avg_ts definition.
+    const double pp_whole =
+        sn.median > 0.0 ? 1000.0 * double(n) / sn.median : 0.0;
     const double pp_wall =
         wall_median_ms > 0.0 ? 1000.0 * double(n) / wall_median_ms : 0.0;
     double pp_marginal = 0.0;
@@ -441,27 +454,32 @@ int main(int argc, char** argv) {
       pp_marginal = dt > 0.0 ? 1000.0 * double(n - n0) / dt : 0.0;
     }
     printf("prefill --prompt %llu: reused session, %.3f ms warm "
-           "(median %.3f, best of %llu) | pp_marginal %.1f tok/s "
-           "(CANONICAL: full prefill, no session build in the timed region) | "
+           "(median %.3f, best of %llu) | pp_whole %.1f tok/s "
+           "(N/median t_N, llama-bench avg_ts definition) | "
+           "pp_marginal %.1f tok/s (diagnostic: per-token cost with the "
+           "per-call constant removed) | "
            "pp_warm %.1f tok/s (N/t_warm) | first prefill %.3f ms | "
            "session create %.3f ms\n",
            (unsigned long long)n, t_warm, sn.median,
-           (unsigned long long)reps, pp_marginal, canonical_pp_warm,
+           (unsigned long long)reps, pp_whole, pp_marginal, canonical_pp_warm,
            first_prefill_ms, reused_create_ms);
-    printf("RESULT prefill prompt=%llu pp_marginal_tok_s=%.1f "
+    printf("RESULT prefill prompt=%llu pp_whole_tok_s=%.1f "
+           "pp_marginal_tok_s=%.1f "
            "pp_wall_tok_s=%.1f session=reused t_warm_ms=%.3f "
            "t_wall_ms=%.3f t_baseline_ms=%.3f baseline=%llu "
            "first_prefill_ms=%.3f session_create_ms=%.3f\n",
-           (unsigned long long)n, pp_marginal, pp_wall, t_warm, wall_median_ms,
-           have_marginal ? s0.best : 0.0, (unsigned long long)n0,
-           first_prefill_ms, reused_create_ms);
+           (unsigned long long)n, pp_whole, pp_marginal, pp_wall, t_warm,
+           wall_median_ms, have_marginal ? s0.best : 0.0,
+           (unsigned long long)n0, first_prefill_ms, reused_create_ms);
     // Median-of-reps view, alongside the canonical best-of line above.
     printf("RESULT_MEDIAN prefill prompt=%llu t_warm_ms=%.3f "
-           "t_baseline_ms=%.3f pp_marginal_tok_s=%.1f pp_warm_tok_s=%.1f\n",
+           "t_baseline_ms=%.3f pp_marginal_tok_s=%.1f pp_whole_tok_s=%.1f "
+           "pp_warm_tok_s=%.1f\n",
            (unsigned long long)n, sn.median, have_marginal ? s0.median : 0.0,
            (have_marginal && sn.median > s0.median)
                ? 1000.0 * double(n - n0) / (sn.median - s0.median)
                : 0.0,
+           pp_whole,
            sn.median > 0.0 ? 1000.0 * double(n) / sn.median : 0.0);
 
     destroy_session(session);

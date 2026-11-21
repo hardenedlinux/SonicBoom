@@ -17,13 +17,15 @@ comparable. All of it is the CUDA spine with the whole model resident on the GPU
 | `tg64` | decode 64 tokens from position 0 |
 | `d512` | decode 64 tokens at KV depth 512, speculation off |
 | `d512-spec` | the same segment with speculation left to the startup probe |
-| `pp512` | prefill a 512-token prompt, reported *marginal* (per-token prefill cost) |
+| `pp512` | whole-call prefill of a 512-token prompt from position 0 (`N / t_N`, the same definition as llama-bench `avg_ts`) |
 | `reuse` | 512-token prefix + 64-token continuation, first-token latency through the prefix cache |
 
 The decode tools warm the exact `(model, n_ctx)` runtime before the timed
 region, so graph/plan build and CUDA-graph capture are never counted. `pp512`
-uses the llama-bench `-p n -n 0` semantics (per-token marginal cost), not the
-wall time of a first cold prefill.
+is the whole N-token prefill from position 0 (`pp_whole_tok_s`), the same
+definition as llama-bench's `-p n -n 0` `avg_ts`; it is not the wall time of a
+first cold prefill. The per-token marginal rate (`pp_marginal_tok_s`) remains in
+`prefill_bench`'s `RESULT` line as a diagnostic.
 
 ### Prefill session lifecycle
 
@@ -41,9 +43,14 @@ library, so old and new measurements stay comparable.
   only the logical prefill state reset (`filled_tokens` cleared — no KV
   reallocation and no runtime rebuild). The timed region contains prefill
   execution only.
-  - `pp_wall_tok_s` = `N / t_warm`, the steady-state throughput.
-  - `pp_marginal_tok_s` = `(N - n0) / (t_N - t_n0)`, all times from that
-    session. The cancellation baseline `n0` takes the *same execution path*:
+  - `pp_whole_tok_s` = `N / t_N`, where `t_N` is the timed N-token prefill
+    from position 0, median over the repetitions. This is the canonical
+    throughput and llama-bench's `avg_ts` definition.
+  - `pp_wall_tok_s` = `N / t_wall`, the device-walled steady-state throughput.
+  - `pp_marginal_tok_s` = `(N - n0) / (t_N - t_n0)`, the per-token cost with
+    the per-call constant removed; a diagnostic, not the table cell. All times
+    are from that session. The cancellation baseline `n0` takes the *same
+    execution path*:
     `n0 = n/2` for `n <= chunk` (both one uncaptured batched segment) and
     `n0 = n - chunk` for `n > chunk` (the delta is exactly one full chunk,
     with the final partial segment identical in both runs). A one-token call
@@ -108,7 +115,9 @@ GPU, one quant file.
 Two language models are benchmarked: Gemma 4 E4B (d64 dense) and
 Qwen2.5-7B-Instruct-1M (d128 grouped-query attention, GQA-7). The Gemma table
 below was recorded with the Q3_K_M file; the file the tools default to, and the
-model list in [Conditions](#conditions), name Q5_K_M.
+model list in [Conditions](#conditions), name Q5_K_M. The prefill rows in these
+two tables were recorded under the pre-round-14 per-token definition and are
+labelled accordingly; `tools/bench.sh` now reports the whole-call rate.
 
 **Gemma 4 E4B-it Q3_K_M** (RTX 3050 8 GB, sm_86)
 
@@ -116,7 +125,7 @@ model list in [Conditions](#conditions), name Q5_K_M.
 |---|---:|---:|---:|
 | **Decode**, 64-step steady state | **53.3 tok/s** | 44.9 tok/s | **1.19×** |
 | Decode at KV depth 512 | **52.7 tok/s** | 44.3 tok/s | **1.19×** |
-| Prefill, 512-token prompt (marginal) | 2261.7 tok/s | 1998.7 tok/s | 1.13× |
+| Prefill, 512-token prompt (marginal, pre-round-14 definition) | 2261.7 tok/s | 1998.7 tok/s | 1.13× |
 | Prefix reuse, 512-token prefix + 64 new | 51.1 ms to first token | — | — |
 
 **Qwen2.5-7B-Instruct-1M Q4_K_M** (d128/GQA-7, same machine)
@@ -125,7 +134,7 @@ model list in [Conditions](#conditions), name Q5_K_M.
 |---|---:|---:|---:|
 | **Decode**, 64-step steady state | 41.0 tok/s | 43.5 tok/s | 0.94× |
 | Decode at KV depth 512 | 40.6 tok/s | 43.2 tok/s | 0.94× |
-| Prefill, 512-token prompt (marginal) | 1598.2 tok/s | 1589.9 tok/s | 1.01× |
+| Prefill, 512-token prompt (marginal, pre-round-14 definition) | 1598.2 tok/s | 1589.9 tok/s | 1.01× |
 | Prefix reuse, 512-token prefix + 64 new | 62.7 ms to first token | — | — |
 
 Gemma decodes 1.19× ahead of llama.cpp at depth 0, and Qwen2.5-7B is 6%
