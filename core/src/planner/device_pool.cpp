@@ -22,6 +22,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <new>
@@ -87,7 +88,15 @@ uint64_t acquire(uint64_t bytes) {
     return h;
   }
   void* p = nullptr;
-  if (cudaMalloc(&p, size) != cudaSuccess) return 0;
+  if (cudaMalloc(&p, size) != cudaSuccess) {
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    std::fprintf(stderr, "[device-pool] acquire %llu bytes failed: %s "
+                         "(free %llu of %llu)\n",
+                 (unsigned long long)size, cudaGetErrorString(cudaGetLastError()),
+                 (unsigned long long)free_b, (unsigned long long)total_b);
+    return 0;
+  }
   const uint64_t h = reinterpret_cast<uint64_t>(p);
   g_sizes[h] = size;
   g_stats.live_blocks++;
@@ -105,7 +114,15 @@ uint64_t acquire_fresh(uint64_t bytes) {
   const uint64_t size = align_up(bytes);
   std::lock_guard<std::mutex> lk(g_mutex);
   void* p = nullptr;
-  if (cudaMalloc(&p, size) != cudaSuccess) return 0;
+  if (cudaMalloc(&p, size) != cudaSuccess) {
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    std::fprintf(stderr, "[device-pool] acquire_fresh %llu bytes failed: %s "
+                         "(free %llu of %llu)\n",
+                 (unsigned long long)size, cudaGetErrorString(cudaGetLastError()),
+                 (unsigned long long)free_b, (unsigned long long)total_b);
+    return 0;
+  }
   const uint64_t h = reinterpret_cast<uint64_t>(p);
   g_sizes[h] = size;
   g_stats.live_blocks++;

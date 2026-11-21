@@ -1100,7 +1100,15 @@ bool launch_gather_batched(const uint8_t* w, const uint64_t* rows, QuantType typ
     default:
       return false;
   }
-  return cudaGetLastError() == cudaSuccess;
+  const cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    std::fprintf(stderr,
+                 "[gather_batched] launch failed: type=%d n=%d grid=(%u,%u) "
+                 "%s\n",
+                 int(type), n, grid.x, grid.y, cudaGetErrorString(err));
+    return false;
+  }
+  return true;
 }
 
 // --- fp16 dequantization for the cuBLAS batched matmul (C.1) ----------------

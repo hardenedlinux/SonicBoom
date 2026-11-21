@@ -227,6 +227,22 @@ if(SONICBOOM_USE_CUDA)
     ENVIRONMENT "SONICBOOM_TUNE=canonical")
 endif()
 
+# A 32768-token prefill on a session whose decode runtimes are already warm
+# (Qwen2.5-7B, CUDA, default speculation mode). The load-time verify-set warm-up
+# must leave enough device memory for the prefill's own segments; this was the
+# pp32768 "out of memory under the embedding node" failure. Skips (77) without a
+# CUDA device or the model GGUF.
+if(SONICBOOM_USE_CUDA)
+  add_executable(test_prefill_large_ctx test_prefill_large_ctx.cpp)
+  target_link_libraries(test_prefill_large_ctx PRIVATE sonicboom m
+                                                        CUDA::cudart)
+  target_compile_definitions(test_prefill_large_ctx PRIVATE
+    SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+  boom_add_cpp_test(test_prefill_large_ctx)
+  set_tests_properties(test_prefill_large_ctx PROPERTIES
+    SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
+endif()
+
 # Plan recording smoke: the four model/mode cases recorded twice each in one
 # process are identical, and no CUDA error survives a recording. The
 # recordings themselves (device lines, kernel geometry, dispatch decisions) and

@@ -2172,12 +2172,29 @@ constexpr int64_t kSpecCostBand[] = {0, 1, 3, 7, 15, 23, 31, 47, 63};
 // Allowance for a length whose row count has not been built yet: the first
 // pass builds the graph and captures it before it can be timed.
 constexpr double kSpecCostCaptureMs = 300.0;
+// The device memory the load's verify-set warm-up leaves free. Warming every
+// width claims pooled buffers for the life of the process; with a large session
+// cache resident (e.g. a 32k-token prefill) the whole envelope can leave less
+// free memory than one prefill segment needs, and the prefill then fails to
+// allocate its own scratch. The warm stops at this floor, and a price pass that
+// would execute an unwarmed width waits for a later call instead.
+constexpr uint64_t kVerifyWarmHeadroomBytes = 512ull << 20;
 
 // The row buckets and the two bucket lookups are defined with the verify
 // runtime below; the cost curve and the speculative loop ask which bucket a
 // length's launch takes before that definition is in scope.
 static int verify_bucket_of(int rows);
 static int verify_bucket_at_most(int rows);
+// The widest width the session's verify set will serve (0 when no set exists).
+// Defined with the set below; the pricing loop and the speculative loop read it
+// so neither asks for a width the load had to trim under memory pressure.
+static int verify_width_limit(const Gemma4Model& m, uint64_t n_ctx,
+                              const planner::KvCacheSession& session);
+// Whether a price pass may execute a step of `rows` rows right now: true when
+// the load warmed its runtime (a replay allocates nothing) or the device has
+// the headroom an unwarmed runtime would claim.
+static bool verify_priceable(const Gemma4Model& m, uint64_t n_ctx, int rows,
+                             const planner::KvCacheSession& session);
 
 // Fill the lengths the budget did not reach from the ones it did: linear
 // between measured points, and past the deepest measured point the last
@@ -2324,6 +2341,10 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
     // writes).
     const int bucket = verify_bucket_of(int(k) + 1);
     if (bucket == 0 || pos + uint64_t(bucket) > n_ctx) continue;
+    // A length whose runtime the load did not warm allocates its buffers on
+    // this pass. When the warm stopped at the memory floor, that is exactly
+    // the allocation that must not happen: leave the knot to interpolation.
+    if (k != 0 && !verify_priceable(m, n_ctx, int(k) + 1, session)) continue;
     // The budget is checked before a length is started and before its timed
     // passes: a length whose build would overrun it is abandoned rather than
     // priced from a partial sample. The projection stops a whole length from
@@ -2679,10 +2700,16 @@ static uint64_t run_spec_program_steps(
     // not just the k+1 positions the drafts occupy.
     const uint64_t max_rows = std::min<uint64_t>(
         session.n_ctx - L, uint64_t(planner::kMaxVerifyRows));
-    const int fit_bucket = verify_bucket_at_most(int(max_rows));
+    // The cache's room and the set's servable limit both bound the bucket: a
+    // set trimmed under memory pressure has no runtime above its limit, and a
+    // verify there would fail inside the request.
+    int usable_bucket = verify_bucket_at_most(int(max_rows));
+    const int width_limit = verify_width_limit(m, session.n_ctx, session);
+    if (width_limit > 0 && width_limit < usable_bucket)
+      usable_bucket = verify_bucket_at_most(width_limit);
     const uint64_t room =
-        fit_bucket >= 2
-            ? std::min<uint64_t>(uint64_t(cap), uint64_t(fit_bucket - 1))
+        usable_bucket >= 2
+            ? std::min<uint64_t>(uint64_t(cap), uint64_t(usable_bucket - 1))
             : 0;
     size_t k = 0;
     bool warm = false;         // a warm-up iteration (forced k drafts)
@@ -3964,6 +3991,11 @@ struct VerifySet {
   std::shared_ptr<void> cache;
   uint64_t cache_id = 0;
   std::array<std::unique_ptr<VerifyRuntime>, planner::kMaxVerifyRows + 1> rows;
+  // The widest row count this set will serve. It starts at the built envelope
+  // and shrinks when a warm cannot run (see build_verify_set): the policy must
+  // not choose a width whose runtime this device cannot afford, because a
+  // verify that fails ends the generation. 0 when no width is servable.
+  int limit = 0;
 };
 
 static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t>,
@@ -4124,6 +4156,7 @@ static std::unique_ptr<VerifySet> build_verify_set(
   for (int rows : kVerifyBuckets) enqueue(rows, /*anchor=*/false);
 
   int captured = 0, warmed = 0;
+  int limit_rows = build_upto;
   for (int i = 0; graphs && i < n_order; ++i) {
     const int rows = order[i];
     VerifyRuntime* rt = set->rows[size_t(rows)].get();
@@ -4131,11 +4164,42 @@ static std::unique_ptr<VerifySet> build_verify_set(
     // The anchors are always paid; the rest only while the set's share of the
     // load budget lasts (the curve measures in the rest of it).
     if (!anchor_row[rows] && elapsed_ms() >= kSpecVerifySetBudgetMs) break;
+    // The memory floor: a warm claims device memory for the rest of the
+    // process, and a later prefill needs its own working set. Stop paying
+    // (and claiming) once the next warm could push the device under it.
+    uint64_t free_b = 0;
+    const bool have_free = planner::device::free_bytes(&free_b);
+    if (have_free && free_b < kVerifyWarmHeadroomBytes) break;
     if (warm_verify_runtime(*rt, n_ctx, rows, /*capture=*/true)) {
       ++warmed;
       if (rt->prog) ++captured;
+      continue;
+    }
+    // A failed warm under memory pressure means this width cannot run here:
+    // release it so its partial buffers return to the pool, and shrink the
+    // servable limit below it (a verify at that width would fail inside a
+    // request and end the generation). A capture failure without pressure leaves
+    // the runtime in place: it runs the same graph through the executor.
+    if (have_free) {
+      uint64_t after_b = 0;
+      if (planner::device::free_bytes(&after_b) &&
+          after_b >= kVerifyWarmHeadroomBytes)
+        continue;
+    }
+    set->rows[size_t(rows)].reset();
+    limit_rows = std::min(limit_rows, rows - 1);
+    --built;
+  }
+  // Widths above the servable limit are released too: the policy is clamped to
+  // the limit, so nothing can reach them, and their host plans are dead weight.
+  for (int rows : kVerifyBuckets) {
+    if (rows <= limit_rows) continue;
+    if (set->rows[size_t(rows)]) {
+      set->rows[size_t(rows)].reset();
+      --built;
     }
   }
+  set->limit = verify_bucket_at_most(limit_rows);
   if (spec_diag_enabled()) {
     std::fprintf(stderr,
                  "[spec-cost] verify set rows=2..%d (buckets) built=%d "
@@ -4197,6 +4261,27 @@ static VerifyRuntime* get_verify_runtime(const Gemma4Model& m, uint64_t n_ctx,
   VerifySet* set = get_verify_set(m, n_ctx, session);
   if (!set) return nullptr;
   return set->rows[size_t(bucket)].get();
+}
+
+// The widest width the session's set will serve, without building it. 0 when
+// no set exists: a mode that never verifies, or one whose load has not run.
+static int verify_width_limit(const Gemma4Model& m, uint64_t n_ctx,
+                              const planner::KvCacheSession& session) {
+  if (!session.caches || session.cache_id == 0) return 0;
+  const auto key = std::make_tuple(&m, n_ctx, session.cache_id);
+  std::lock_guard<std::mutex> lk(g_registry_mutex);
+  const auto it = g_verify_runtimes.find(key);
+  return it == g_verify_runtimes.end() ? 0 : it->second->limit;
+}
+
+static bool verify_priceable(const Gemma4Model& m, uint64_t n_ctx, int rows,
+                             const planner::KvCacheSession& session) {
+  VerifyRuntime* rt = get_verify_runtime(m, n_ctx, rows, session);
+  if (!rt) return false;
+  if (rt->prog) return true;
+  uint64_t free_b = 0;
+  return !planner::device::free_bytes(&free_b) ||
+         free_b >= kVerifyWarmHeadroomBytes;
 }
 
 // The same row-invariant graph for the opt-in prefill path
