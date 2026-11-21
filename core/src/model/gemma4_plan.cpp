@@ -4156,39 +4156,62 @@ static std::unique_ptr<VerifySet> build_verify_set(
   for (int rows : kVerifyBuckets) enqueue(rows, /*anchor=*/false);
 
   int captured = 0, warmed = 0;
+  bool warmed_bucket[planner::kMaxVerifyRows + 1] = {};
   int limit_rows = build_upto;
+  bool memory_stop = false;
   for (int i = 0; graphs && i < n_order; ++i) {
     const int rows = order[i];
     VerifyRuntime* rt = set->rows[size_t(rows)].get();
     if (!rt) continue;
     // The anchors are always paid; the rest only while the set's share of the
-    // load budget lasts (the curve measures in the rest of it).
+    // load budget lasts (the curve measures in the rest of it). A budget stop
+    // leaves those widths built and usable through the executor (a later call
+    // allocates them), so it does not shrink the envelope.
     if (!anchor_row[rows] && elapsed_ms() >= kSpecVerifySetBudgetMs) break;
     // The memory floor: a warm claims device memory for the rest of the
     // process, and a later prefill needs its own working set. Stop paying
-    // (and claiming) once the next warm could push the device under it.
+    // (and claiming) once the next warm could push the device under it, and
+    // shrink the envelope to the widths that did warm (below).
     uint64_t free_b = 0;
     const bool have_free = planner::device::free_bytes(&free_b);
-    if (have_free && free_b < kVerifyWarmHeadroomBytes) break;
+    if (have_free && free_b < kVerifyWarmHeadroomBytes) {
+      memory_stop = true;
+      break;
+    }
     if (warm_verify_runtime(*rt, n_ctx, rows, /*capture=*/true)) {
       ++warmed;
+      warmed_bucket[rows] = true;
       if (rt->prog) ++captured;
       continue;
     }
     // A failed warm under memory pressure means this width cannot run here:
-    // release it so its partial buffers return to the pool, and shrink the
-    // servable limit below it (a verify at that width would fail inside a
-    // request and end the generation). A capture failure without pressure leaves
-    // the runtime in place: it runs the same graph through the executor.
+    // release it so its partial buffers return to the pool. A capture failure
+    // without pressure leaves the runtime in place: it runs the same graph
+    // through the executor.
     if (have_free) {
       uint64_t after_b = 0;
       if (planner::device::free_bytes(&after_b) &&
           after_b >= kVerifyWarmHeadroomBytes)
         continue;
     }
+    memory_stop = true;
     set->rows[size_t(rows)].reset();
     limit_rows = std::min(limit_rows, rows - 1);
     --built;
+  }
+  // Under memory pressure the envelope is the largest bucket whose whole run
+  // warmed: the warm order pays anchors out of order, so "the widest warmed"
+  // can sit above an unaffordable gap, and a width in that gap would allocate
+  // its runtime inside a request. A width past the gap would be reachable only
+  // by stepping over it, which the bucket lookup never does.
+  if (memory_stop) {
+    int contiguous = 1;
+    for (int rows : kVerifyBuckets) {
+      if (rows > build_upto) break;
+      if (!warmed_bucket[rows] || !set->rows[size_t(rows)]) break;
+      contiguous = rows;
+    }
+    limit_rows = std::min(limit_rows, contiguous);
   }
   // Widths above the servable limit are released too: the policy is clamped to
   // the limit, so nothing can reach them, and their host plans are dead weight.
