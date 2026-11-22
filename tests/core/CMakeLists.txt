@@ -97,6 +97,18 @@ if(SONICBOOM_USE_CUDA)
   set_tests_properties(test_backward_ops PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
 
+# The d128/GQA-7 prefill attention must be a function of the K/V rows it may
+# read: filling the cache tail, the batch-owned cache positions and the batch/Q
+# pad with NaN or a large value must leave the output byte-identical. Runs both
+# prefill families (row-owning FA2 and query-resident staged) over all three
+# cache dtypes. Model-free; needs only a CUDA device.
+if(SONICBOOM_USE_CUDA)
+  add_executable(test_fattn_poison test_fattn_poison.cpp)
+  target_link_libraries(test_fattn_poison PRIVATE sonicboom CUDA::cudart)
+  boom_add_cpp_test(test_fattn_poison)
+  set_tests_properties(test_fattn_poison PROPERTIES RESOURCE_LOCK gpu_vram)
+endif()
+
 # Static execution planner persistence test. It includes only
 # <sonicboom/planner/...> + <sonicboom/sx/...> public headers.
 add_executable(test_persistence test_persistence.cpp)

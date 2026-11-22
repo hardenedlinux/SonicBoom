@@ -7253,7 +7253,7 @@ bool prefix_align_enabled() {
 
 // The reuse length a prefill keeps when `candidate` tokens of the request are
 // already resident. `prompt_size` is the request's full length. This is the
-// prefill's own rule, callable with any candidate boundary: the one-token
+// prefill's own rule, callable with any candidate boundary: the minimum-suffix
 // hold-back, the chunk alignment that keeps every segment off a one-token run,
 // and the sliding-window frontier check. 0 means nothing can be reused.
 uint64_t accepted_reuse_len(const Gemma4Model& m,
@@ -7262,22 +7262,36 @@ uint64_t accepted_reuse_len(const Gemma4Model& m,
   if (prompt_size == 0) return 0;
   uint64_t prefix_len = candidate;
 
+  const uint64_t chunk = (m.config.sliding_window > 0)
+                             ? m.config.sliding_window
+                             : kDefaultPrefillChunk;
+  const uint64_t mmq_min_n = std::max<uint64_t>(
+      uint64_t(quant::cuda::mmq_min_n()), 1);
+
   // A prompt the session already holds in full leaves an empty suffix, and
   // prefilling nothing produces no logits at all (the backend returns 0, which
   // the C ABI reads as a failure). The activation of the *last* prompt token is
   // what yields the next-token logits, so that token always has to be
-  // processed: keep all but it resident and prefill it as a one-token suffix.
-  // The reported reuse count stays honest — this is exactly what was reused.
-  if (prefix_len == prompt_size)
-    prefix_len = prompt_size - 1;
+  // processed. The suffix always keeps at least `mmq_min_n` tokens: a shorter
+  // one takes the single-column kernels, whose arithmetic disagrees with the
+  // batched ones a full prefill uses at the same position, so the reused
+  // suffix writes a different KV row (measured: the layer-0 V row differs by
+  // ~3e-2 at a one-token position, the K row is bit-identical) and produces
+  // different logits than the same prompt prefilled in full. Recomputed with
+  // the batched arithmetic, those rows match the full prefill bit for bit, so
+  // a reused session reproduces the fresh one (attention's FA2 path amplifies
+  // the difference into token flips otherwise). The reported reuse count stays
+  // honest — this is exactly what was reused.
+  if (prefix_len > 0 && prompt_size - prefix_len < mmq_min_n)
+    prefix_len = (prompt_size > mmq_min_n) ? prompt_size - mmq_min_n : 0;
 
   // Prefill lays its segments on absolute multiples of the chunk and a segment
-  // shorter than the mmq threshold (i.e. a single token) takes the
-  // single-column kernels instead of the batched ones. A full prefill of a
-  // longer prompt computes the same position inside a multi-token segment, and
-  // the two disagree in the KV cache (measured: the layer-0 V row differs by
-  // ~3e-2 at a one-token position, the K row is bit-identical). Two boundaries
-  // can put such a segment next to the reuse point:
+  // shorter than the mmq threshold takes the single-column kernels instead of
+  // the batched ones. A full prefill of a longer prompt computes the same
+  // position inside a multi-token segment, and the two disagree in the KV
+  // cache (measured: the layer-0 V row differs by ~3e-2 at a one-token
+  // position, the K row is bit-identical). Two boundaries can put such a
+  // segment next to the reuse point:
   //   - the seed's final segment: prefix_len % chunk is nonzero but shorter
   //     than the mmq threshold. Hold those tokens back so the seed ends on a
   //     chunk boundary (the full prefill's segmentation).
@@ -7287,11 +7301,6 @@ uint64_t accepted_reuse_len(const Gemma4Model& m,
   //     positions in a multi-token one. Hold back just enough tokens to lift
   //     the first segment to the threshold.
   // Both costs are at most threshold-1 recomputed tokens.
-  const uint64_t chunk = (m.config.sliding_window > 0)
-                             ? m.config.sliding_window
-                             : kDefaultPrefillChunk;
-  const uint64_t mmq_min_n = std::max<uint64_t>(
-      uint64_t(quant::cuda::mmq_min_n()), 1);
   if (prefix_align_enabled() && prefix_len > 0) {
     const uint64_t rem = prefix_len % chunk;
     if (rem != 0 && rem < mmq_min_n) {
@@ -7311,7 +7320,7 @@ uint64_t accepted_reuse_len(const Gemma4Model& m,
   // prefix_len`, so the reuse is sound only when that earliest position is at
   // or above the overwritten frontier — or when the prefill restarts at 0 and
   // writes every row it reads before attending. Continuing the recorded
-  // history (the one-token hold-back above included) always lands above the
+  // history (the minimum-suffix hold-back above included) always lands above the
   // frontier.
   if (m.config.sliding_window > 0) {
     const int64_t window = int64_t(m.config.sliding_window);
