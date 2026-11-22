@@ -270,8 +270,11 @@ else
     [ -n "$moe_blocks" ] || moe_blocks=$moe_experts
     bench_help=$("$LLAMA_BENCH" --help 2>&1 || true)
     server_help=$("$LLAMA_SERVER" --help 2>&1 || true)
-    if printf '%s\n' "$bench_help" | grep -q -- '--n-cpu-moe' &&
-       printf '%s\n' "$server_help" | grep -q -- '--n-cpu-moe'; then
+    # A here-string, not `printf | grep -q`: under `set -o pipefail` the
+    # producer gets SIGPIPE once grep finds an early match, the pipeline
+    # reports 141, and the probe flips at random on llama-server's ~58 KB help.
+    if grep -q -- '--n-cpu-moe' <<< "$bench_help" &&
+       grep -q -- '--n-cpu-moe' <<< "$server_help"; then
       # The first count that loads and measures; probing upward in steps of 4
       # starts from the card holding everything and trades layers away only
       # as far as allocation actually requires.
@@ -293,8 +296,8 @@ else
       else
         LLAMA_MOE_INFO="MoE offload: $moe_experts experts over $moe_blocks blocks; no --n-cpu-moe count loaded, llama.cpp arms are left unoffloaded"
       fi
-    elif printf '%s\n' "$bench_help" | grep -q -- '--override-tensor' &&
-         printf '%s\n' "$server_help" | grep -q -- '--override-tensor'; then
+    elif grep -q -- '--override-tensor' <<< "$bench_help" &&
+         grep -q -- '--override-tensor' <<< "$server_help"; then
       LLAMA_MOE_ARGS=(-ot '\.ffn_(up|down|gate)_exps\.=CPU')
       LLAMA_MOE_SERVER='-ot \.ffn_(up|down|gate)_exps\.=CPU'
       LLAMA_MOE_INFO="MoE offload: $moe_experts experts over $moe_blocks blocks; llama.cpp -ot '\.ffn_(up|down|gate)_exps\.=CPU' (no --n-cpu-moe in this build)"
