@@ -28,15 +28,20 @@ Sizes are the local file sizes in bytes.
 | `qwen2.5-7b-instruct-1m-q4_k_m.gguf` | Qwen2.5-7B-Instruct-1M | Q4_K_M | 4,683,073,888 | reference — tests, goldens, benchmarks, serving |
 | `Qwen3.6-35B-A3B-Q4_K_M.gguf` | Qwen3.6-35B-A3B (MoE) | Q4_K_M | 20,542,732,576 | reference — benchmarks; expert-pool and long-context work |
 | `Huihui-Qwen3.6-35B-A3B-abliterated-ggml-model-Q5_K.gguf` | Qwen3.6-35B-A3B (MoE), abliterated | Q5_K | 25,346,479,328 | measured — abliterated Q5_K against the official Q4_K_M |
-| `Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q6_K_P.gguf` | Gemma 4 E4B (uncensored) | Q6_K_P | 6,249,794,528 | measured — uncensored candidate, decode and prefill |
-| `Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf` | Gemma 4 E4B (uncensored) | Q8_K_P | 8,133,226,464 | measured — uncensored candidate, decode and prefill |
+| `Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q6_K_P.gguf` | Gemma 4 E4B (uncensored) | Q6_K_P | 6,249,794,528 | measured — recommended uncensored Gemma file |
+| `Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf` | Gemma 4 E4B (uncensored) | Q8_K_P | 8,133,226,464 | measured 2026-11, file not kept |
 | `DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf` | DeepSeek-R1-Distill-Qwen-1.5B (dense) | Q4_K_M | 1,117,321,312 | measured — decode/prefill attention studies |
 
-The two uncensored Gemma files are candidates: both load and run on the 8 GB
-card, and both were measured; which one stays is an open decision made on the
-numbers, not on loadability. Their `K_P` quantization places the per-layer
-projections in the quantized format, which older SonicBoom loaders rejected;
-the current loader accepts it.
+`Q6_K_P` is the recommended uncensored Gemma file. It decodes 22% faster than
+`Q8_K_P` (tg64 41.291 vs 33.901 tok/s, prefill 2768.4 vs 2727.4 tok/s) and is
+1.9 GB smaller. On five prompts of 256 greedy tokens each (three Chinese
+writing, two English), scoring the same token sequences under both files over
+the full vocabulary gives a per-token KL(Q8‖Q6) of 1.11e-2 mean and 3.38e-1
+max, with top-1 agreement on 1302 of 1372 positions (94.9%): the quality
+difference is negligible for writing, so only `Q6_K_P` is kept. The `Q8_K_P`
+row stays for the record; measured 2026-11, the file was deleted. Their `K_P`
+quantization places the per-layer projections in the quantized format, which
+older SonicBoom loaders rejected; the current loader accepts it.
 
 The Huihui file carries an extra block (40) for its MTP head; it is
 measurement-only and never part of a test or golden.
