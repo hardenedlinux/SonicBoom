@@ -32,7 +32,8 @@
   #:use-module (sonicboom serve sessions)
   #:use-module (sonicboom serve chat-template)
   #:export (make-engine engine? engine-models engine-model-ids engine-model
-            engine-model-families engine-pool engine-queue-limit
+            engine-model-families engine-model-loaded? engine-model-install!
+            engine-model-clear! engine-pool engine-queue-limit
 
             make-chat-request chat-request?
             chat-request-model chat-request-messages chat-request-tools
@@ -41,7 +42,7 @@
             chat-request-seed chat-request-presence-penalty
             chat-request-frequency-penalty chat-request-constraint
 
-            engine-admit! engine-run engine-drop! engine-generate
+            engine-admit! engine-run engine-run-job engine-drop! engine-generate
             engine-stats
 
             result? result-finish-reason result-content result-tool-calls
@@ -156,12 +157,21 @@ PyTorch: none"
 ;;; ---------------------------------------------------------------------------
 ;;; The engine
 
+;; One served model and its session pool. The model may be absent: the serve
+;; layer's residency manager unloads the model of a request that is not running
+;; and installs the next one between jobs, so /v1/models still lists it.
+(define-record-type <model-slot>
+  (make-model-slot model pool)
+  model-slot?
+  (model slot-model set-slot-model!)
+  (pool slot-pool set-slot-pool!))
+
 ;; An engine serves a set of models and runs one request at a time.
 ;;
-;; engine-models is the alist id -> (model . pool); every model has its own
-;; session pool. engine-queue-limit is how many requests may wait for their turn.
-;; The engine is independent of HTTP: a caller hands it a chat request and gets
-;; events back.
+;; engine-models is the alist id -> slot; every loaded model has its own
+;; session pool. engine-queue-limit is how many requests may wait for their
+;; turn. The engine is independent of HTTP: a caller hands it a chat request
+;; and gets events back.
 ;;
 ;; Example:
 ;;   (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
@@ -171,44 +181,56 @@ PyTorch: none"
 ;;   => ("m")
 ;; PyTorch: none
 (define-record-type <engine>
-  (%make-engine models queue-limit lock cv running queue stats counter)
+  (%make-engine models queue-limit lock cv running queue stats counter prepare)
   engine?
-  (models engine-models)               ; alist: id -> (model . pool)
+  (models engine-models)               ; alist: id -> <model-slot>
   (queue-limit engine-queue-limit)
   (lock engine-lock)
   (cv engine-cv)
   (running engine-running set-engine-running!)
   (queue engine-queue set-engine-queue!)
   (stats engine-stats-table)
-  (counter engine-counter set-engine-counter!))
+  (counter engine-counter set-engine-counter!)
+  (prepare engine-prepare))            ; (request) or #f, called with the turn
 
 ;; models: list of models (from load-model). Each gets its own session pool.
+;; ids: models to serve without loading them; their slot starts empty and the
+;; caller installs a model with engine-model-install! (see (sonicboom serve
+;; residency)).
 (define* (make-engine models #:key (queue-limit 8) (max-sessions 4)
-                      (token-budget 32768))
+                      (token-budget 32768) (ids '()) (prepare #f))
   "Create an engine that serves MODELS.
 
-Every model gets its own session pool with the given limits.
+Every model gets its own session pool with the given limits. A model listed in
+IDS is served without a model yet: its slot is empty until engine-model-install!
+fills it, which is how the serve layer's residency manager loads on demand.
 
 Args:
-  models: the list of models to serve.
+  models: the list of models to serve, already loaded.
   queue-limit: keyword; how many requests may wait for their turn
     (default 8).
   max-sessions: keyword; the session pool size per model (default 4).
   token-budget: keyword; the tokens the session pool may hold per model
     (default 32768).
+  ids: keyword; further model ids to serve, with an empty slot (default '()).
+  prepare: keyword; a procedure (request) called after a chat request reaches
+    the front of the queue and before it runs, or #f (default #f).
 Returns: an engine.
 Example:
   (use-modules (sonicboom serve engine))
   (engine? (make-engine '()))
   => #t
 PyTorch: none"
-  (%make-engine (map (lambda (m)
-                       (cons (model-id m)
-                             (cons m (make-session-pool m #:max-sessions max-sessions
-                                                        #:token-budget token-budget))))
-                     models)
+  (%make-engine (append
+                 (map (lambda (m)
+                        (cons (model-id m)
+                              (make-model-slot
+                               m (make-session-pool m #:max-sessions max-sessions
+                                                    #:token-budget token-budget))))
+                      models)
+                 (map (lambda (id) (cons id (make-model-slot #f #f))) ids))
                 queue-limit (make-mutex) (make-condition-variable) #f '()
-                (make-hash-table) 0))
+                (make-hash-table) 0 prepare))
 
 (define (engine-model-ids engine)
   "The ids of the models ENGINE serves, in serving order.
@@ -240,12 +262,69 @@ Example:
              \"m\"))
   => \"m\"
 PyTorch: none"
-  (match (assoc id (engine-models engine)) ((_ . (m . _)) m) (#f #f)))
+  (match (assoc id (engine-models engine)) ((_ . s) (slot-model s)) (#f #f)))
+
+;; Whether the model ENGINE serves as ID is installed (loaded) right now.
+(define (engine-model-loaded? engine id)
+  "True when the model ID currently has a loaded model in ENGINE.
+
+A model the residency manager unloaded is still served (its id and place in
+the list remain), but engine-model returns #f for it until it is installed
+again.
+
+Args:
+  engine: an engine.
+  id: a model id string.
+Returns: a boolean.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+               (sonicboom serve engine))
+  (engine-model-loaded?
+   (make-engine '() #:ids '(\"m\")) \"m\")
+  => #f
+PyTorch: none"
+  (and (engine-model engine id) #t))
+
+;; Install a loaded model and its pool for ID (residency manager).
+(define (engine-model-install! engine id model pool)
+  "Install MODEL and its session POOL as the model served as ID.
+
+Args:
+  engine: an engine.
+  id: a model id string the engine serves.
+  model: the loaded model.
+  pool: its session pool.
+Returns: unspecified.
+PyTorch: none"
+  (with-mutex (engine-lock engine)
+    (match (assoc id (engine-models engine))
+      ((_ . s) (set-slot-model! s model) (set-slot-pool! s pool))
+      (#f (error "the engine does not serve" id)))))
+
+;; Drop the model and pool of ID after they were freed (residency manager).
+(define (engine-model-clear! engine id)
+  "Forget the model and session pool installed as ID.
+
+The caller frees them first (sessions, then the model); the engine keeps only
+the id, so a later engine-model-install! can serve it again.
+
+Args:
+  engine: an engine.
+  id: a model id string the engine serves.
+Returns: unspecified.
+PyTorch: none"
+  (with-mutex (engine-lock engine)
+    (match (assoc id (engine-models engine))
+      ((_ . s) (set-slot-model! s #f) (set-slot-pool! s #f))
+      (#f (error "the engine does not serve" id)))))
 
 ;; (id . family) per served model, in serving order: the family each model
-;; selected from its architecture, for /v1/models.
+;; selected from its architecture, for /v1/models. A model that is unloaded at
+;; the moment has no family to report and is left out.
 (define (engine-model-families engine)
-  "The chat-template family of every model ENGINE serves.
+  "The chat-template family of every loaded model ENGINE serves.
+
+A model the residency manager unloaded is left out until it is loaded again.
 
 Args:
   engine: an engine.
@@ -257,11 +336,15 @@ Example:
    (make-engine (list (load-model (make-mock-backend) '((id . \"m\"))))))
   => ((\"m\" . gemma))
 PyTorch: none"
-  (map (lambda (id) (cons id (model-family (engine-model engine id))))
-       (engine-model-ids engine)))
+  (append-map (lambda (id)
+                (let ((model (engine-model engine id)))
+                  (if model (list (cons id (model-family model))) '())))
+              (engine-model-ids engine)))
 
 (define (engine-pool engine id)
   "The session pool of the model ENGINE serves as ID, or #f.
+
+#f when the model is not loaded at the moment either.
 
 Args:
   engine: an engine.
@@ -276,7 +359,7 @@ Example:
                   \"m\"))
   => #t
 PyTorch: none"
-  (match (assoc id (engine-models engine)) ((_ . (_ . p)) p) (#f #f)))
+  (match (assoc id (engine-models engine)) ((_ . s) (slot-pool s)) (#f #f)))
 
 (define (bump! engine key n)
   (with-mutex (engine-lock engine)
@@ -441,7 +524,35 @@ PyTorch: none"
     (lambda () #t)
     (lambda ()
       (wait-turn! engine ticket)
+      ;; The device is idle now: the serve layer's residency manager makes the
+      ;; request's model the one on it (unloading another model first).
+      (let ((prepare (engine-prepare engine)))
+        (when prepare (prepare request)))
       (run-request engine request on-event))
+    (lambda () (engine-drop! engine ticket))))
+
+;; Run an arbitrary job under the same queue: the image pipeline and the
+;; serve layer's load/unload endpoints share the FIFO with chat.
+(define (engine-run-job engine ticket thunk)
+  "Wait for TICKET's turn, call THUNK, and leave the queue however it returns.
+
+The job runs with the device to itself, exactly like a chat request: the
+caller's THUNK does its own model switch and device work.
+
+Args:
+  engine: an engine.
+  ticket: a ticket from engine-admit!.
+  thunk: a procedure of no arguments.
+Returns: whatever THUNK returns.
+Example:
+  (use-modules (sonicboom serve engine))
+  (let ((engine (make-engine '())))
+    (engine-run-job engine (engine-admit! engine) (lambda () 'done)))
+  => done
+PyTorch: none"
+  (dynamic-wind
+    (lambda () #t)
+    (lambda () (wait-turn! engine ticket) (thunk))
     (lambda () (engine-drop! engine ticket))))
 
 (define (run-request engine request on-event)

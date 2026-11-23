@@ -19,7 +19,9 @@
              (sonicboom serve mock-backend)
              (sonicboom serve chat-template)
              (sonicboom serve sessions)
-             (sonicboom serve engine))
+             (sonicboom serve engine)
+             (sonicboom serve residency)
+             (sonicboom serve openai))
 
 (define (msg role content) `(("role" . ,role) ("content" . ,content)))
 
@@ -385,6 +387,78 @@
   (test-equal "the step path streams the same text"
     "Hello world中"
     (apply string-append (reverse pieces))))
+
+;;; --- residency -------------------------------------------------------------
+
+(let* ((catalog (list (make-residency-entry "g" 'chat '((id . "g") (family . gemma)))
+                      (make-residency-entry "q" 'chat '((id . "q") (family . qwen)))))
+       (r-engine (make-engine '() #:ids '("g" "q")))
+       (resid (make-residency r-engine catalog #:backend backend)))
+  (test-assert "residency: nothing is resident before the first load"
+    (and (not (residency-active resid)) (not (residency-loaded? resid "g"))))
+  (residency-load! resid "g")
+  (test-assert "residency: a load makes the model resident"
+    (and (residency-loaded? resid "g")
+         (engine-model-loaded? r-engine "g")
+         (eq? 'gemma (residency-family resid "g"))))
+  (test-equal "residency: the info of a loaded model"
+    '(#t "chat" "mock")
+    (let ((info (residency-info resid "g")))
+      (list (assq-ref info 'loaded) (assq-ref info 'kind) (assq-ref info 'arch))))
+  (test-assert "residency: the load and its timing are reported"
+    (let ((info (residency-info resid "g")))
+      (and (integer? (assq-ref info 'last_load_ms))
+           (integer? (assq-ref info 'last_switch_ms))
+           (integer? (assq-ref info 'vram_mib)))))
+  (residency-ensure! resid "q")
+  (test-assert "residency: a switch unloads the previous model"
+    (and (not (residency-loaded? resid "g"))
+         (not (engine-model r-engine "g"))
+         (residency-loaded? resid "q")
+         (= (length (engine-model-families r-engine)) 1)))
+  (test-equal "residency: the engine serves the resident model"
+    "q" (model-id (engine-model r-engine "q")))
+  (test-assert "residency: an unloaded model's pool is gone"
+    (not (engine-pool r-engine "g")))
+  (residency-unload! resid "q")
+  (test-equal "residency: an unloaded model still reports its family"
+    '(#f qwen)
+    (list (residency-loaded? resid "q") (residency-family resid "q")))
+  (test-assert "residency: an unload frees the device"
+    (and (not (residency-active resid))
+         (= 0 (assq-ref (residency-info resid "q") 'vram_mib))))
+  (test-equal "residency: an unknown model has no info" #f
+    (residency-info resid "nope")))
+
+;; A chat request switches the device inside the engine queue: the engine's
+;; prepare hook makes the request's model resident after its turn comes.
+(letrec* ((catalog (list (make-residency-entry "g" 'chat '((id . "g") (family . gemma)))
+                         (make-residency-entry "q" 'chat '((id . "q") (family . qwen)))))
+          (r-engine (make-engine
+                     '() #:ids '("g" "q")
+                     #:prepare (lambda (request)
+                                 (residency-ensure!
+                                  resid (chat-request-model request)))))
+          (resid (make-residency r-engine catalog #:backend backend)))
+  (residency-load! resid "g")
+  (test-equal "residency: a request for another model is served after a switch"
+    "You said: hi"
+    (result-content
+     (engine-generate r-engine
+                      (make-chat-request #:model "q"
+                                         #:messages (list (msg "user" "hi")))
+                      (lambda (kind . args) #t))))
+  (test-assert "residency: the request's model is resident afterwards"
+    (and (residency-loaded? resid "q") (not (residency-loaded? resid "g")))))
+
+(test-equal "model-object: an unloaded model has no family yet"
+  (list 'null #f)
+  (let ((obj (model-object "q" #f 0 #:loaded #f)))
+    (list (assoc-ref obj "family") (assoc-ref obj "loaded"))))
+(test-equal "model-object: a resident model reports its family"
+  (list "gemma" #t)
+  (let ((obj (model-object "g" 'gemma 0)))
+    (list (assoc-ref obj "family") (assoc-ref obj "loaded"))))
 
 (define failures (test-runner-fail-count (test-runner-current)))
 (test-end "sonicboom-serve-units")

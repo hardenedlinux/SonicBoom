@@ -688,17 +688,20 @@ PyTorch: none"
 ;; family-for-arch). It is not part of the OpenAI schema, but it tells a client
 ;; which prompt format and which stop tokens this model expects instead of
 ;; leaving it to infer the family from the file name.
-(define (model-object id family created)
+(define* (model-object id family created #:key (loaded #t))
   "One entry of the model list.
 
 Besides the OpenAI fields it carries family, the chat-template family the
 loaded model selected, so a client knows which prompt format and stop tokens
-the model expects.
+the model expects, and loaded, whether the model is on the device right now.
+A model that has not been loaded yet has no family to report: family is null
+until its first load.
 
 Args:
   id: the model id.
-  family: the model's family symbol.
+  family: the model's family symbol, or #f when not known yet.
   created: the creation time.
+  loaded: keyword; whether the model is resident on the device (default #t).
 Returns: a JSON object alist.
 Example:
   (use-modules (sonicboom serve openai))
@@ -706,7 +709,9 @@ Example:
   => \"gemma\"
 PyTorch: none"
   `(("id" . ,id) ("object" . "model") ("created" . ,created)
-    ("owned_by" . "sonicboom") ("family" . ,(symbol->string family))))
+    ("owned_by" . "sonicboom")
+    ("family" . ,(if family (symbol->string family) 'null))
+    ("loaded" . ,loaded)))
 
 ;; `models` is an (id . family) alist, in serving order.
 (define (models-object models created)

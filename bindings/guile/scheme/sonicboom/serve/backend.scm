@@ -10,6 +10,7 @@
 ;;; procedure to the C ABI the libsonicboom backend will call.
 ;;;
 ;;;   load-model   config alist           -> model
+;;;   unload-model model                  -> release its device memory (optional)
 ;;;   tokenize     model string           -> list of token ids
 ;;;   detokenize   model token-ids        -> string
 ;;;   render-chat  model messages tools tool-choice -> prompt segments
@@ -54,9 +55,10 @@
   #:use-module (sonicboom serve chat-template)
   #:export (make-backend backend? backend-name
 
-            load-model model? model-backend model-handle
-            model-id model-family model-context-length model-eos-tokens
-            model-info model-sampling?
+            load-model unload-model
+            model? model-backend model-handle
+            model-id model-family model-arch model-context-length model-eos-tokens
+            model-info model-sampling? backend-sampling?
             tokenize detokenize render-chat render-chat-segments tokenize-chat
             create-session free-session fork-session can-fork?
             session? session-model session-handle
@@ -88,13 +90,14 @@
 ;;   => #t
 ;; PyTorch: none
 (define-record-type <backend>
-  (%make-backend name load-model model-info tokenize detokenize render-chat
-                 tokenize-chat
+  (%make-backend name load-model unload-model model-info tokenize detokenize
+                 render-chat tokenize-chat
                  create-session free-session fork-session prefill step
                  generate stats sampling?)
   backend?
   (name backend-name)
   (load-model %backend-load-model)
+  (unload-model %backend-unload-model)
   (model-info %backend-model-info)
   (tokenize %backend-tokenize)
   (detokenize %backend-detokenize)
@@ -147,6 +150,7 @@
 ;; greedily.
 (define* (make-backend #:key (name "backend")
                        (load-model (required 'load-model))
+                       (unload-model #f)
                        (model-info (required 'model-info))
                        (tokenize (required 'tokenize))
                        (detokenize (required 'detokenize))
@@ -170,6 +174,9 @@ does not is driven token by token through step.
 Args:
   name: keyword; the backend's name (default \"backend\").
   load-model: keyword; (config) -> a model handle.
+  unload-model: keyword; (handle) -> unspecified, releasing the handle so its
+    device memory goes back to the driver; the default does nothing (default
+    #f).
   model-info: keyword; (handle) -> an info alist (see the model record).
   tokenize: keyword; (handle string) -> a list of token ids.
   detokenize: keyword; (handle token-ids) -> a string.
@@ -207,8 +214,8 @@ Example:
                  #:step (lambda (session sampler constraint) 0)))
   => \"demo\"
 PyTorch: none"
-  (%make-backend name load-model model-info tokenize detokenize render-chat
-                 tokenize-chat
+  (%make-backend name load-model unload-model model-info tokenize detokenize
+                 render-chat tokenize-chat
                  create-session free-session fork-session prefill step
                  generate stats sampling?))
 
@@ -265,6 +272,21 @@ Example:
   => gemma
 PyTorch: none"
   (info-ref model 'family))
+
+;; The architecture the loader reported, e.g. "qwen2". A backend whose models
+;; have none may omit arch or provide #f.
+(define (model-arch model)
+  "The architecture name of MODEL, or #f when the backend has none.
+
+Args:
+  model: a model.
+Returns: a string such as \"qwen2\", or #f.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (model-arch (load-model (make-mock-backend) '()))
+  => \"mock\"
+PyTorch: none"
+  (match (assq 'arch (model-info model)) ((_ . v) v) (#f #f)))
 (define (model-context-length model)
   "The maximum number of tokens MODEL holds.
 
@@ -323,6 +345,23 @@ Example:
 PyTorch: none"
   (let ((handle ((%backend-load-model backend) config)))
     (%make-model backend handle ((%backend-model-info backend) handle))))
+
+(define (unload-model model)
+  "Release MODEL's handle so its device memory returns to the driver.
+
+A backend without an unload procedure does nothing; the handle then goes away
+with its record. The model must have no live session: free them first.
+
+Args:
+  model: a model.
+Returns: unspecified.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (begin (unload-model (load-model (make-mock-backend) '())) #t)
+  => #t
+PyTorch: none"
+  (when (%backend-unload-model (model-backend model))
+    ((%backend-unload-model (model-backend model)) (model-handle model))))
 
 (define (tokenize model text)
   "Tokenize TEXT with MODEL's tokenizer.

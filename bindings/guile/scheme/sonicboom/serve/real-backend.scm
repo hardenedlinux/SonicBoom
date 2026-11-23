@@ -23,10 +23,11 @@
   #:export (make-real-backend))
 
 (define-record-type <real-model>
-  (make-real-model id handle context-length family eos-tokens)
+  (make-real-model id handle arch context-length family eos-tokens)
   real-model?
   (id real-model-id)
   (handle real-model-handle)
+  (arch real-model-arch)
   (context-length real-model-context-length)
   (family real-model-family)
   (eos-tokens real-model-eos-tokens))
@@ -83,12 +84,13 @@
                    (append-map (lambda (s)
                                  (cdr (inference:tokenize handle s #:special? #t)))
                                (template-eos-strings family)))))
-        (make-real-model id handle context-length family
+        (make-real-model id handle arch context-length family
                          (delete-duplicates eos))))))
 
 (define (real-model-info model)
   `((id . ,(real-model-id model))
     (family . ,(real-model-family model))
+    (arch . ,(real-model-arch model))
     (context-length . ,(real-model-context-length model))
     (eos-tokens . ,(real-model-eos-tokens model))))
 
@@ -246,6 +248,10 @@ Note: the libsonicboom shared library must be loadable by the process."
   (make-backend
    #:name "libsonicboom"
    #:load-model load-real-model
+   ;; The model is reference counted inside the library, so the weights go only
+   ;; when its last session is gone: the residency manager frees the sessions
+   ;; first.
+   #:unload-model (lambda (model) (inference:free-model! (real-model-handle model)))
    #:model-info real-model-info
    #:tokenize (lambda (model text)
                 (inference:tokenize (real-model-handle model) text))

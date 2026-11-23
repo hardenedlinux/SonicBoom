@@ -19,6 +19,7 @@ bindings/guile/scheme/sonicboom/serve/
 ├── chat-template.scm  hand-written chat templates: gemma, qwen; tool-call text
 ├── sessions.scm       session pool: prefix matching, fork, LRU, token budget
 ├── engine.scm         FIFO request queue (one device) + the generation loop
+├── residency.scm      the model catalog and the one-model-on-the-device switch
 ├── openai.scm         request validation, response / chunk / error objects
 ├── sse.scm            a minimal SSE writer on Artanis (no Artanis change)
 └── app.scm            the single-file Artanis app: the HTTP layer only
@@ -30,8 +31,8 @@ bindings/guile/tests/serve/
 └── test-openai-sdk.py      the official openai Python SDK against the app
 ```
 
-Dependencies point down: `app.scm` → `openai`, `engine`, `sse` → `sessions` →
-`backend` ← `mock-backend`, `real-backend`. Only `app.scm` and `sse.scm` import
+Dependencies point down: `app.scm` → `openai`, `engine`, `residency`, `sse` →
+`sessions` → `backend` ← `mock-backend`, `real-backend`. Only `app.scm` and `sse.scm` import
 Artanis; the other modules need Guile and guile-json (4.7.3, built from
 upstream source) only. `real-backend.scm` reaches libsonicboom through
 `(sonicboom inference)`, which sits on the C ABI; it never touches the core or
@@ -151,7 +152,9 @@ next turn's prompt starts with the tokens the session already holds.
 ## 4. Sessions and the prefix cache
 
 `(sonicboom serve sessions)`, one pool per model, `--max-sessions` sessions
-and a `--token-budget` of held tokens. The pool mirrors each session's tokens.
+and a `--token-budget` of held tokens. There is one pool per model, and only
+the model resident on the device (section 6) has one: switching models drops
+the pool it left, so prefix caches do not survive a switch. The pool mirrors each session's tokens.
 For a prompt, the idle session with the longest common prefix (least recently
 used on ties) is the best match:
 
@@ -172,11 +175,17 @@ fit the budget. `usage.prompt_tokens_details.cached_tokens` is the backend's
 
 `(sonicboom serve engine)`:
 
-- **Queue.** One device: one request generates at a time, in arrival order.
+- **Queue.** One device: one unit of work runs at a time, in arrival order —
+  a chat completion, an image generation, or an explicit model load/unload.
   `engine-admit!` (in the HTTP handler, before any response is written) takes
   a place or raises `queue-full` → HTTP 429 `rate_limit_error` / `queue_full`
   when `--queue` requests already wait. `engine-run` waits for the turn and
   always leaves the queue; `engine-drop!` releases a place never run.
+- **Prepare.** When a request's turn comes, its model is made resident
+  (`engine`'s prepare hook calls `residency-ensure!`) before it runs, so a
+  switch never happens under a running generation. Chat requests name the
+  model they need; image requests and the load/unload endpoints run as jobs
+  on the same FIFO (`engine-run-job`).
 - **Loop.** Render, tokenize (a prompt at the context length → 400
   `context_length_exceeded`), take a session, prefill, then step until an
   end-of-turn token, `max_tokens`, the context length, a stop string, or
@@ -205,7 +214,9 @@ Endpoints:
 
 | endpoint | |
 |---|---|
-| `GET /v1/models`, `GET /v1/models/:id` | the served models: one real model (default `qwen2.5-7b`), or under `--backend mock` the two mock models (`sonicboom-mock-gemma`, `sonicboom-mock-qwen`) |
+| `GET /v1/models`, `GET /v1/models/:id` | the served chat models: one real model (default `qwen2.5-7b`), or under `--backend mock` the two mock models (`sonicboom-mock-gemma`, `sonicboom-mock-qwen`). Each object carries `loaded`; `family` is `null` until the model has been loaded once, and stays known after it is unloaded |
+| `GET /sonicboom/models` | the whole catalog, chat and image: per entry `id`, `kind` (`chat`/`image`), `arch`, `loaded`, `vram_mib`, `last_load_ms`, `last_switch_ms` (not OpenAI) |
+| `POST /sonicboom/models/:id/load`, `POST /sonicboom/models/:id/unload` | make a catalog model resident, or free it; queued like a generation, 404 `model_not_found` for an unknown id (not OpenAI) |
 | `POST /v1/chat/completions` | `stream: false` → `chat.completion`; `stream: true` → SSE of `chat.completion.chunk`, then `data: [DONE]` |
 | `POST /v1/images/generations` | MOSS-Image: `{"created", "data": [{"b64_json": …}]}`, each entry a PNG |
 | `GET /v1/ws/chat` | WebSocket: one request (the same JSON body) per text message; the reply is the chunk objects as text messages, then `[DONE]`; a bad request gets an `error` object |
@@ -262,15 +273,37 @@ A tool-call envelope is exact on both sides. Greedy decoding is unchanged
 wherever the unconstrained token is allowed, so a model that answers with
 valid JSON produces the same tokens it would have produced anyway.
 
+### One model on the device
+
+The server keeps a catalog of the models it can serve — the chat model(s) and
+the image model — and only one of them is on the device at a time (the KV
+cache and the DiT's buffers do not fit together). The first chat model in the
+catalog is loaded at startup; anything else loads on demand.
+
+A request names its chat model; when that request reaches the front of the
+queue the server unloads the resident model (its session pool, then the model
+itself, then a device trim) and loads the requested one, measuring the switch.
+A model that is not resident can still be requested: `/v1/models` lists it with
+`loaded: false` and keeps reporting its `family` once it has been loaded once.
+`POST /sonicboom/models/:id/load` and `.../unload` do the same switch
+explicitly; both return the entry's info. `/sonicboom/models` shows the
+catalog, what is loaded, how much VRAM the loaded model holds (`memory.free`
+delta around the load, 0 when it cannot be measured), and the times of the
+last load and last switch.
+
+The queue is shared by chat, image and load/unload jobs, so a switch is never
+made while another unit of work runs, and `--queue` bounds the whole device.
+
 ### Image generation
 
 `POST /v1/images/generations` runs the MOSS-Image pipeline through
 `(sonicboom image)` (C ABI `boom_image_*`). The model directory is
-`--image-model` (default `models/MOSS-Image-SFT`) and is loaded on the first
-image request, so a chat-only server never claims the DiT's device memory.
-Generations run in a runner thread, one at a time (the pipeline's device
-buffers are reused in place); they do not use the chat engine's queue or
-session pool.
+`--image-model` (default `models/MOSS-Image-SFT`); the image model is the
+catalog entry `moss-image`, listed from startup, and loaded by the switch when
+an image request reaches the front of the queue — so a chat-only run never
+claims the DiT's device memory. The generation runs under the same queue as a
+chat completion, one at a time (the pipeline's device buffers are reused in
+place); it does not use a chat session pool.
 
 | field | |
 |---|---|
@@ -345,7 +378,8 @@ guile -L bindings/guile/scheme bindings/guile/tests/serve/test-serve-http.scm
 python3 bindings/guile/tests/serve/test-openai-sdk.py      # pip install openai
 ```
 
-Results: units 47/47, HTTP 86/86, openai SDK (3.29.0) 24/24.
+Results: units 70/70, HTTP 113/113, images 16/16; openai SDK (3.29.0) 24/24
+when last run.
 
 ## 8. Limits of the prototype
 
@@ -357,6 +391,8 @@ Results: units 47/47, HTTP 86/86, openai SDK (3.29.0) 24/24.
 - The queue does not notice a client that leaves while waiting; it is
   cancelled at its first token.
 - No authentication; the `Authorization` header is ignored.
-- `/v1/images/generations` is not queued and not cancellable: it holds the
-  image model for the whole generation, and a client that goes away waits for
-  it to finish. `response_format` `url` is not implemented (no storage).
+- `/v1/images/generations` is queued but not cancellable: it holds the image
+  model for the whole generation, and a client that goes away waits for it to
+  finish. `response_format` `url` is not implemented (no storage).
+- A model switch drops the session pool it leaves; the prefix cache of a
+  model is rebuilt after it comes back.

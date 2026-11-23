@@ -261,12 +261,40 @@
    (test-equal "GET /v1/models" 200 status)
    (test-equal "models list" (list gemma qwen)
      (map (lambda (m) (jref m "id")) (vector->list (jref body "data"))))
-   (test-equal "list object" "list" (jref body "object"))))
+   (test-equal "list object" "list" (jref body "object"))
+   ;; Only the first chat model is loaded at startup; the others are listed
+   ;; as unloaded and load when a request for them comes.
+   (test-equal "models list: loaded" (list #t #f)
+     (map (lambda (m) (jref m "loaded")) (vector->list (jref body "data"))))
+   (test-equal "models list: the unloaded model has no family yet" 'null
+     (jref body "data" 1 "family"))))
 
 (match (http 'GET "/v1/models/nope")
   ((status . body)
    (test-equal "unknown model: 404" 404 status)
    (test-equal "unknown model: code" "model_not_found" (jref body "error" "code"))))
+
+(match (http 'GET (string-append "/v1/models/" qwen))
+  ((status . body)
+   (test-equal "a listed but unloaded model: 200" 200 status)
+   (test-equal "a listed but unloaded model: loaded false" #f (jref body "loaded"))))
+
+;; The residency view: every served model, chat and image, and its state.
+(match (http 'GET "/sonicboom/models")
+  ((status . body)
+   (test-equal "GET /sonicboom/models" 200 status)
+   (test-equal "residency list: the catalog" (list gemma qwen "moss-image")
+     (map (lambda (m) (jref m "id")) (vector->list (jref body "data"))))
+   (test-equal "residency list: one model is loaded" (list #t #f #f)
+     (map (lambda (m) (jref m "loaded")) (vector->list (jref body "data"))))
+   (test-equal "residency list: kinds" (list "chat" "chat" "image")
+     (map (lambda (m) (jref m "kind")) (vector->list (jref body "data"))))
+   (test-equal "residency list: the image model's architecture" "moss-image"
+     (jref body "data" 2 "arch"))
+   (test-assert "residency list: the loaded model's timings"
+     (and (integer? (jref body "data" 0 "last_load_ms"))
+          (integer? (jref body "data" 0 "last_switch_ms"))
+          (integer? (jref body "data" 0 "vram_mib"))))))
 
 ;;; --- non-streaming -------------------------------------------------------------------
 
@@ -490,6 +518,10 @@
           ((status . body)
            (test-equal "queue: full -> 429" 429 status)
            (test-equal "queue: code" "queue_full" (jref body "error" "code"))))
+        (let ((r (http 'POST (string-append "/sonicboom/models/" qwen "/load"))))
+          (test-equal "load: a full queue -> 429" 429 (car r))
+          (test-equal "load: a full queue -> code" "queue_full"
+            (jref (cdr r) "error" "code")))
         (call-with-values (lambda () (read-all-events pa))
           (lambda (chunks-a done-a?)
             (let ((a-done (get-internal-real-time)))
@@ -507,6 +539,58 @@
   (test-assert "queue: stats" (and (>= (stats "engine" "rejected") 1)
                                    (= (stats "engine" "max-waiting") 1)
                                    (= 0 (stats "engine" "running")))))
+
+;;; --- one model on the device -------------------------------------------------------
+
+;; Requests move the device between models; the others stay listed, unloaded.
+(match (chat (request gemma (list (msg "user" "back to gemma"))))
+  ((status . _)
+   (test-equal "switch: a chat request brings its model back" 200 status)))
+
+(match (http 'GET "/v1/models")
+  ((status . body)
+   (test-equal "switch: GET /v1/models" 200 status)
+   (test-equal "switch: the requested model is loaded" (list #t #f)
+     (map (lambda (m) (jref m "loaded")) (vector->list (jref body "data"))))
+   (test-equal "switch: a model remembers its family" "qwen"
+     (jref body "data" 1 "family"))))
+
+(match (http 'GET "/sonicboom/models")
+  ((_ . body)
+   (test-assert "switch: the switch is timed" (integer? (jref body "data" 0 "last_switch_ms")))
+   (test-equal "switch: the unloaded model holds no VRAM" 0
+     (jref body "data" 1 "vram_mib"))))
+
+(match (http 'POST (string-append "/sonicboom/models/" gemma "/unload"))
+  ((status . body)
+   (test-equal "unload: 200" 200 status)
+   (test-equal "unload: loaded false" #f (jref body "loaded"))))
+
+(match (http 'GET "/sonicboom/models")
+  ((_ . body)
+   (test-equal "unload: nothing on the device" (list #f #f #f)
+     (map (lambda (m) (jref m "loaded")) (vector->list (jref body "data"))))))
+
+(match (chat (request gemma (list (msg "user" "still answering"))))
+  ((_ . body)
+   (test-equal "unload: a chat request loads again" "You said: still answering"
+     (jref body "choices" 0 "message" "content"))))
+
+(match (http 'POST (string-append "/sonicboom/models/" qwen "/load"))
+  ((status . body)
+   (test-equal "load: 200" 200 status)
+   (test-equal "load: loaded true" #t (jref body "loaded"))
+   (test-equal "load: kind" "chat" (jref body "kind"))))
+
+(match (http 'GET "/sonicboom/models")
+  ((_ . body)
+   (test-equal "load: the previous model made room" (list #f #t #f)
+     (map (lambda (m) (jref m "loaded")) (vector->list (jref body "data"))))))
+
+(match (http 'POST "/sonicboom/models/nope/load")
+  ((status . body)
+   (test-equal "load: unknown -> 404" 404 status)
+   (test-equal "load: unknown code" "model_not_found" (jref body "error" "code"))))
 
 ;;; --- WebSocket ------------------------------------------------------------------------
 
