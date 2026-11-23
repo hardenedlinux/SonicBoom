@@ -218,7 +218,8 @@ Endpoints:
 | `GET /sonicboom/models` | the whole catalog, chat and image: per entry `id`, `kind` (`chat`/`image`), `arch`, `loaded`, `vram_mib`, `last_load_ms`, `last_switch_ms` (not OpenAI) |
 | `POST /sonicboom/models/:id/load`, `POST /sonicboom/models/:id/unload` | make a catalog model resident, or free it; queued like a generation, 404 `model_not_found` for an unknown id (not OpenAI) |
 | `POST /v1/chat/completions` | `stream: false` → `chat.completion`; `stream: true` → SSE of `chat.completion.chunk`, then `data: [DONE]` |
-| `POST /v1/images/generations` | MOSS-Image: `{"created", "data": [{"b64_json": …}]}`, each entry a PNG |
+| `POST /v1/images/generations` | MOSS-Image: `{"created", "data": [{"b64_json": …}]}`, each entry a PNG; the header `sonicboom-job-id` names the generation, `stream: true` answers with SSE progress instead |
+| `DELETE /sonicboom/jobs/:id` | cancel a generation by job id: `{"id", "status": "cancelled"}`; 404 `job_not_found` for an unknown or finished job (not OpenAI) |
 | `GET /v1/ws/chat` | WebSocket: one request (the same JSON body) per text message; the reply is the chunk objects as text messages, then `[DONE]`; a bad request gets an `error` object |
 | `GET /sonicboom/stats` | engine, pool and backend counters (not OpenAI) |
 | `GET /health` | `ok` |
@@ -325,14 +326,44 @@ place); it does not use a chat session pool.
 | `size` | `"WIDTHxHEIGHT"`, both multiples of 16 (default `512x512`) |
 | `response_format` | `"b64_json"` only (the default); anything else is a 400 |
 | `seed`, `steps`, `guidance_scale`, `negative_prompt` | extensions (defaults 0, 50, 3.0, none) |
+| `stream` | extension (default false): SSE progress, see below |
 
 The response is `{"created": <unix time>, "data": [{"b64_json": <PNG>}, …]}`.
 Each PNG is written by the C ABI's own writer (8-bit RGB, stored deflate
 blocks) and base64-encoded in Scheme — Guile 3.0.9 has no `(ice-9 base64)`.
 The same request twice returns the same pixels, because both the noise and
 the sampler are seeded. A model that cannot be loaded, and a generation
-failure, are 500s (`server_error`); a cancelled generation would be
-`BOOM_ERR_CANCELLED`, but the server never cancels one.
+failure, are 500s (`server_error`).
+
+Every image reply, streamed or not, carries the header `sonicboom-job-id:
+job-<16 hex digits>`, the id under which the generation can be cancelled (the
+id is registered when the request is parsed, so it also names a request still
+waiting in the queue). `stream: true` answers with Server-Sent Events:
+
+```
+data: {"step": 1, "total": 2, "image": 0}
+
+data: {"created": 1795416250, "data": [{"b64_json": "…"}]}
+
+data: [DONE]
+```
+
+One event per denoising step (the 1-based step, the total, and the image's
+index in the batch), then the same images object the non-streamed reply holds
+(a byte-identical `data` array for the same request), then `[DONE]`.
+
+Cancellation stops a generation after the current denoising step; the C ABI's
+progress callback returns the stop, so the pipeline's device buffers are
+released before the request ends. Two ways to cancel:
+
+- `DELETE /sonicboom/jobs/<id>` from any connection: 200
+  `{"id": "<id>", "status": "cancelled"}`, or 404 `job_not_found` once the
+  job has ended. A cancelled non-streamed request answers 409
+  `invalid_request_error` / code `cancelled`; a cancelled stream ends with
+  `data: {"id": "<id>", "status": "cancelled"}` and then `[DONE]`.
+- The client of a streamed request goes away: the next event write fails and
+  the generation is cancelled the same way (there is no one left to answer).
+  A non-streamed request is not watched while it generates; cancel it by id.
 
 Streaming: the first chunk carries `delta.role`, then content deltas (one per
 token here), the tool-call deltas (a header with `index`, `id`, `type`, `name`
@@ -343,13 +374,16 @@ once its closing tag is generated (its arguments are not parsed while still
 open).
 
 Errors use the OpenAI shape `{"error": {"message", "type", "param", "code"}}`:
-400 `invalid_request_error`, 404 `model_not_found`, 429 `queue_full`, 500
-`server_error`. In a stream that already started, an error is sent as an
-`error` event followed by `[DONE]`.
+400 `invalid_request_error`, 404 `model_not_found` / `job_not_found`, 409
+`cancelled`, 429 `queue_full`, 500 `server_error`. In a stream that already
+started, a chat error is sent as an `error` event followed by `[DONE]` (an
+image stream ends with the cancelled object instead).
 
-Cancellation: a streamed reply (SSE or WebSocket) stops at the next token
-after the client goes away. A non-streamed request is not watched while it
-generates.
+Cancellation: a streamed chat reply (SSE or WebSocket) stops at the next token
+after the client goes away; a chat request is not cancellable by id. An image
+generation is cancellable by id, and a streamed one also stops when its client
+goes away (see "Image generation"). A non-streamed request is not watched
+while it generates.
 
 Streaming over Artanis: Artanis has no streaming body; `sse.scm` streams by
 switching the connection to its own Ragnarok protocol for one response, and
@@ -391,7 +425,7 @@ guile -L bindings/guile/scheme bindings/guile/tests/serve/test-serve-http.scm
 python3 bindings/guile/tests/serve/test-openai-sdk.py      # pip install openai
 ```
 
-Results: units 80/80, HTTP 133/133, images 16/16; openai SDK (3.29.0) 24/24
+Results: units 80/80, HTTP 133/133, images 36/36; openai SDK (3.29.0) 24/24
 when last run.
 
 ## 8. Limits of the prototype
@@ -404,8 +438,9 @@ when last run.
 - The queue does not notice a client that leaves while waiting; it is
   cancelled at its first token.
 - No authentication; the `Authorization` header is ignored.
-- `/v1/images/generations` is queued but not cancellable: it holds the image
-  model for the whole generation, and a client that goes away waits for it to
-  finish. `response_format` `url` is not implemented (no storage).
+- `/v1/images/generations` is queued behind other device work and cancellable,
+  but it holds the image model for the whole generation; a non-streamed
+  request keeps the device until it finishes unless it is cancelled by id.
+  `response_format` `url` is not implemented (no storage).
 - A model switch drops the session pool it leaves; the prefix cache of a
   model is rebuilt after it comes back.

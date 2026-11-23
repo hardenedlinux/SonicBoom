@@ -22,7 +22,10 @@
 ;;;   GET  /v1/models, /v1/models/:id  chat models; loaded says which one is
 ;;;                                   on the device
 ;;;   POST /v1/chat/completions       stream=false: JSON; stream=true: SSE
-;;;   POST /v1/images/generations     MOSS-Image, PNG as base64 (b64_json)
+;;;   POST /v1/images/generations     MOSS-Image, PNG as base64 (b64_json);
+;;;                                   stream=true: SSE progress; the response
+;;;                                   header sonicboom-job-id names the job
+;;;   DELETE /sonicboom/jobs/:id      cancel a generation by job id
 ;;;   GET  /v1/ws/chat                WebSocket: a request per text message,
 ;;;                                   answered by chunk JSON messages, "[DONE]"
 ;;;   GET  /sonicboom/models          every served model and its residency
@@ -58,6 +61,7 @@
              ((artanis env) #:select (%current-toplevel))
              (rnrs bytevectors)
              (srfi srfi-1)
+             (srfi srfi-9)
              (ice-9 getopt-long)
              (ice-9 threads)
              (ice-9 binary-ports)
@@ -103,6 +107,8 @@
 (%current-toplevel runtime-dir)
 
 (init-server #:statics '())
+;; The job-cancel route is DELETE; Artanis' default leaves that method out.
+(conf-set! '(server allowedmethods) '(HEAD GET POST PUT DELETE))
 (conf-set! '(server websocket) #t)
 ;; Generation runs in runner threads; waiting requests hold one each.
 (conf-set! '(server runners) (+ queue-limit 2))
@@ -195,6 +201,54 @@
 (define (now) (car (gettimeofday)))
 
 ;;; ---------------------------------------------------------------------------
+;;; Generation jobs
+;;;
+;;; An image generation can be long, and a client may leave (an SSE write then
+;;; fails) or cancel it by id. A job is registered before it takes its place in
+;;; the queue, so the id — returned in the response header sonicboom-job-id —
+;;; is known from the start. Cancelling sets a flag that the generation's
+;;; progress callback reads after every denoising step; the C ABI then stops
+;;; the generation and releases the buffers it had allocated. A job is
+;;; unregistered when its request ends, so a later DELETE is a 404.
+
+(define jobs (make-hash-table))
+(define jobs-lock (make-mutex))
+
+(define-record-type <job>
+  (make-job* id cancelled?)
+  job?
+  (id job-id)
+  (cancelled? job-cancelled? set-job-cancelled?!))
+
+(define (new-job-id)
+  (format #f "job-~8,'0x~8,'0x"
+          (random (expt 2 32)) (random (expt 2 32))))
+
+(define (job-register!)
+  (let ((job (make-job* (new-job-id) #f)))
+    (with-mutex jobs-lock (hash-set! jobs (job-id job) job))
+    job))
+
+(define (job-unregister! job)
+  (with-mutex jobs-lock (hash-remove! jobs (job-id job))))
+
+;; The job with this id, marked cancelled, or #f when there is no such job.
+(define (job-cancel! id)
+  (with-mutex jobs-lock
+    (match (hash-ref jobs id)
+      (#f #f)
+      (job (set-job-cancelled?! job #t) job))))
+
+(define (job-cancelled-now? job)
+  (with-mutex jobs-lock (job-cancelled? job)))
+
+(define (cancelled-condition? key args)
+  (and (eq? key '%exception)
+       (let ((c (car args)))
+         (and (sonicboom-error? c)
+              (eq? 'cancelled (sonicboom-error-kind c))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; The image model joins the same catalog and queue: a generation switches the
 ;;; device to MOSS-Image (unloading the chat model first) and switches back on
 ;;; the next chat request.
@@ -215,8 +269,9 @@
 
 ;; REQUEST is the alist parse-image-request returns; the caller made the image
 ;; model resident. The result is the list of base64 PNGs for the response's
-;; data array.
-(define (render-images request)
+;; data array. PROGRESS (image step total) is the generation's progress
+;; callback, called after each denoising step; #f means no callback.
+(define* (render-images request #:key (progress #f))
   (let ((images (generate-images
                  (residency-model residency image-model-id)
                  #:prompt (assoc-ref request "prompt")
@@ -226,18 +281,57 @@
                  #:steps (assoc-ref request "steps")
                  #:guidance (assoc-ref request "guidance_scale")
                  #:seed (assoc-ref request "seed")
-                 #:batch (assoc-ref request "n"))))
+                 #:batch (assoc-ref request "n")
+                 #:progress progress)))
     (map (lambda (image)
            (base64-encode-bytevector
             (png-bytes (car image) (cadr image) (caddr image))))
          images)))
 
+;; One SSE progress event: the step just completed, the total, and the image
+;; of the batch it belongs to.
+(define (progress-object image step total)
+  `(("step" . ,step) ("total" . ,total) ("image" . ,image)))
+
+;; The generation's progress callback. It returns #f — stopping the generation
+;; after the current step — when the job was cancelled by DELETE, or when SEND
+;; (the SSE writer) failed because the client is gone; otherwise a streaming
+;; request sends one event per denoising step. SEND is #f for a non-streaming
+;; request, whose cancellation is only by id.
+(define (image-progress job send)
+  (lambda (image step total)
+    (and (not (job-cancelled-now? job))
+         (or (not send)
+             (send (json-ascii-string (progress-object image step total)))))))
+
+;; The body of a streaming image request, run by the SSE producer. The final
+;; event is the same images object the non-stream reply holds (the same PNGs);
+;; a cancellation ends it with {"id", "status": "cancelled"} instead, and
+;; "[DONE]" ends the stream either way.
+(define (stream-images job request send)
+  (catch #t
+    (lambda ()
+      (send (json-ascii-string
+             (images-object
+              (now)
+              (run-job
+               (lambda ()
+                 (residency-ensure! residency image-model-id)
+                 (render-images request
+                                #:progress (image-progress job send))))))))
+    (lambda (key . args)
+      (send (json-ascii-string
+             (if (cancelled-condition? key args)
+                 `(("id" . ,(job-id job)) ("status" . "cancelled"))
+                 (error-object-of key args))))))
+  (send "[DONE]"))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Helpers
 
-(define (json-emit status obj)
+(define* (json-emit status obj #:key (headers '()))
   (response-emit (scm->json-string obj) #:status status
-                 #:headers '((content-type . (application/json)))))
+                 #:headers (append headers '((content-type . (application/json))))))
 
 ;; An SSE event body must be one byte per character: the event writer counts
 ;; characters for its chunk headers and the socket port it writes through is
@@ -282,6 +376,9 @@
     (('model-not-found id)
      (list 404 "invalid_request_error"
            (format #f "The model `~a' does not exist" id) "model" "model_not_found"))
+    (('job-not-found id)
+     (list 404 "invalid_request_error"
+           (format #f "The job `~a' does not exist" id) 'null "job_not_found"))
     (('context-length-exceeded n ctx)
      (list 400 "invalid_request_error"
            (format #f "the prompt has ~a tokens, the context length is ~a" n ctx)
@@ -290,16 +387,20 @@
      (list 400 "invalid_request_error" message param "invalid_constraint"))
     ;; A Guile 3 condition raised by a binding module. `catch #t` reports the
     ;; condition itself with the key `%exception`. A &sonicboom-error carries
-    ;; the C ABI's message (a failed model load, a generation failure, a
-    ;; cancelled generation; the server never cancels one).
+    ;; the C ABI's message (a failed model load, a generation failure). A
+    ;; generation the client cancelled is not a server error: it is a 409.
     (('%exception c)
-     (if (sonicboom-error? c)
-         (let ((message (sonicboom-error-message c)))
-           (list 500 "server_error"
-                 (if (string-null? message) "SonicBoom error" message)
-                 'null 'null))
-         (list 500 "server_error" (format #f "internal error: ~a" c)
-               'null 'null)))
+     (cond
+      ((not (sonicboom-error? c))
+       (list 500 "server_error" (format #f "internal error: ~a" c) 'null 'null))
+      ((eq? 'cancelled (sonicboom-error-kind c))
+       (list 409 "invalid_request_error" "the generation was cancelled"
+             'null "cancelled"))
+      (else
+       (let ((message (sonicboom-error-message c)))
+         (list 500 "server_error"
+               (if (string-null? message) "SonicBoom error" message)
+               'null 'null)))))
     (_ (list 500 "server_error" (format #f "~a: ~s" key args) 'null 'null))))
 
 (define (error-object-of key args)
@@ -477,23 +578,62 @@
         (apply error-emit (classify key args))))))
 
 ;; Image generation is blocking and long, so it runs in a runner thread like a
-;; chat completion (same NOTE as above: no dynamic-wind), and it takes the
-;; same queue: the job switches the device to the image model before it
-;; renders and leaves it resident until another job switches away.
+;; chat completion (same NOTE as above: no dynamic-wind around the runner),
+;; and it takes the same queue: the job switches the device to the image model
+;; before it renders and leaves it resident until another job switches away.
+;;
+;; stream=false answers with the images object, as before, plus the
+;; sonicboom-job-id header. stream=true answers with SSE: one
+;; {"step","total","image"} event per denoising step, then the images object,
+;; then "[DONE]". Either way the job can be cancelled by id; a cancellation
+;; answers 409 (non-stream) or {"id","status":"cancelled"} (stream).
 (post "/v1/images/generations"
   (lambda (rc)
     (catch #t
       (lambda ()
-        (let ((request (parse-image-request (read-json-body rc))))
-          (json-emit 200
-                     (images-object
-                      (now)
-                      (run-job
-                       (lambda ()
-                         (residency-ensure! residency image-model-id)
-                         (render-images request)))))))
+        (let* ((body (read-json-body rc))
+               (stream? (eq? #t (assoc-ref body "stream")))
+               (request (parse-image-request body))
+               (job (job-register!))
+               (headers `((sonicboom-job-id . ,(job-id job)))))
+          (if stream?
+              (sse-response
+               (lambda (send)
+                 ;; The producer always runs, even when the client is already
+                 ;; gone, so the job is unregistered either way.
+                 (dynamic-wind
+                   (lambda () #t)
+                   (lambda () (stream-images job request send))
+                   (lambda () (job-unregister! job))))
+               #:headers headers)
+              (catch #t
+                (lambda ()
+                  (let ((b64s (run-job
+                               (lambda ()
+                                 (residency-ensure! residency image-model-id)
+                                 (render-images request
+                                                #:progress
+                                                (image-progress job #f))))))
+                    (job-unregister! job)
+                    (json-emit 200 (images-object (now) b64s)
+                               #:headers headers)))
+                (lambda (key . args)
+                  (job-unregister! job)
+                  (apply throw key args))))))
       (lambda (key . args)
         (apply error-emit (classify key args))))))
+
+;; Cancel a running or queued generation. The device work stops after the
+;; current denoising step and its buffers are released; the response names the
+;; job and its status. An unknown id (a finished job included) is a 404.
+;; NOTE: Artanis exports the DELETE route as page-delete; its usual name,
+;;       delete, is the (srfi srfi-1) procedure here.
+(page-delete "/sonicboom/jobs/:id"
+  (lambda (rc)
+    (let ((id (params rc "id")))
+      (if (job-cancel! id)
+          (json-emit 200 `(("id" . ,id) ("status" . "cancelled")))
+          (apply error-emit (classify 'job-not-found (list id)))))))
 
 ;; Threads for WebSocket replies run in the dynamic state of the app at load
 ;; time, like Artanis' runners, not in the one of the Ragnarok task that

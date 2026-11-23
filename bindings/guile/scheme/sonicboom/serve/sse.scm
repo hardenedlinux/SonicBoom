@@ -12,11 +12,13 @@
 ;;;   1. sse-install! adds the protocol `sonicboom-sse': open, read and close
 ;;;      are those of HTTP; write is sse-write below.
 ;;;   2. A route handler calls sse-response with a producer. It switches the
-;;;      connection to `sonicboom-sse' (with the producer as the state) and
-;;;      returns an empty response for Artanis' handler-render.
+;;;      connection to `sonicboom-sse' (with the producer and any extra
+;;;      response headers as the state) and returns an empty response for
+;;;      Artanis' handler-render.
 ;;;   3. Ragnarok calls sse-write instead of http-write. It switches the
-;;;      connection back to HTTP, writes its own status line and headers
-;;;      (text/event-stream, Transfer-Encoding: chunked, no Content-Length),
+;;;      connection back to HTTP, writes its own status line and headers (the
+;;;      route's extra headers, text/event-stream, Transfer-Encoding: chunked,
+;;;      no Content-Length),
 ;;;      and runs the producer in a runner thread (call-with-runner, no
 ;;;      timeout), like Artanis does for a file-sender. Each event is one
 ;;;      chunk, flushed to the socket at once.
@@ -90,14 +92,20 @@
         (lambda _ #f)))))
 
 (define (sse-write server client response body method-is-head?)
-  (let ((producer (proto-conn-state client))
-        (port (client-sockport client)))
+  ;; The connection state is (producer . extra-headers), so a route can add
+  ;; headers of its own (the image job id) to the ones SSE needs.
+  (let* ((state (proto-conn-state client))
+         (producer (car state))
+         (extra (cdr state))
+         (port (client-sockport client)))
     ;; Back to HTTP first: the next request on this connection is plain HTTP.
     (unregister-proto! client)
     (let ((alive? (catch #t
                     (lambda ()
-                      (write-response (build-response #:code 200 #:headers sse-headers)
-                                      port)
+                      (write-response
+                       (build-response #:code 200
+                                       #:headers (append extra sse-headers))
+                       port)
                       (force-output port)
                       (not method-is-head?))
                     (lambda _ #f))))
@@ -128,7 +136,7 @@ sse-response."
 
 ;; In a route handler: stream the events of producer. The handler returns
 ;; what this returns.
-(define (sse-response producer)
+(define* (sse-response producer #:key (headers '()))
   "Stream the events PRODUCER sends on the current connection.
 
 The connection switches to the sonicboom-sse protocol; the producer receives a
@@ -137,9 +145,11 @@ once the client is gone.
 
 Args:
   producer: a procedure of one argument (the send procedure).
+  headers: keyword; extra headers for the streamed response, in front of the
+    SSE ones (default: none).
 Returns: an empty response for Artanis' handler-render.
 PyTorch: none
 Note: use it as the body of a route handler, with the SSE protocol installed
 by sse-install!."
-  (register-proto! (current-client) protocol-name producer)
+  (register-proto! (current-client) protocol-name (cons producer headers))
   (response-emit "" #:headers '((content-type . (text/event-stream)))))
