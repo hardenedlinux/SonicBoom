@@ -103,9 +103,11 @@ class ExpertPool {
   const int32_t* selection_host() const noexcept { return sel_host_.data(); }
 
   // Steps 2-4 of a node: bring every selected expert resident (evicting the
-  // lowest-stamped slot this node does not need), stamp every slot this node
-  // uses, and write the selection buffer. `block` indexes the weights' blocks;
-  // `ids` is the node's rows*used selected experts in node order. Thread-safe.
+  // slot this node does not need whose aging use count is lowest), stamp every
+  // slot this node uses, and write the selection buffer. `block` indexes the
+  // weights' blocks; `ids` is the node's rows*used selected experts in node
+  // order. Thread-safe and deterministic: counts are per key, halved every
+  // kAgePeriod nodes, and ties fall back to the stamp, then the lowest slot.
   std::expected<void, std::string> select(uint32_t block,
                                           std::span<const int64_t> ids);
 
@@ -142,6 +144,9 @@ class ExpertPool {
   // Per slot: the global key it holds (-1 empty) and its use stamp.
   std::vector<int64_t> owner_;
   std::vector<uint64_t> stamp_;
+  // Per global key: node-uses since the count last halved. Kept across an
+  // eviction, so a key that leaves and comes back returns with its history.
+  std::vector<uint32_t> uses_;
 
   uint64_t handles_[3] = {0, 0, 0};
   uint64_t stride_[3] = {0, 0, 0};

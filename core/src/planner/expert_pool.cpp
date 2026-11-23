@@ -119,6 +119,16 @@ std::FILE* trace_file() {
   return f;
 }
 
+// How many selection nodes a use count survives before it halves. A decode
+// step is one node per block; 1280 nodes is 32 steps at 40 blocks. This is a
+// deterministic constant, not a timing measurement: the offline simulator
+// priced the periods (512..8192) over the recorded traces at the pool sizes
+// this card reaches. 1280 keeps the deep-context trace level with LRU while
+// the prompt-heavy traces gain 2-4 hit points; a longer period wins on short
+// generations and loses on a long prefix, whose prefill churn then stays
+// counted for too many steps.
+constexpr uint64_t kAgePeriod = 1280;
+
 // One process-wide pool, keyed by the weights object it belongs to.
 struct Registry {
   std::mutex mutex;
@@ -288,6 +298,7 @@ std::expected<std::unique_ptr<ExpertPool>, std::string> ExpertPool::create(
   pool->owner_.assign(pool->n_slots_, -1);
   pool->stamp_.assign(pool->n_slots_, 0);
   pool->slot_of_.assign(pool->total_keys_, -1);
+  pool->uses_.assign(pool->total_keys_, 0);
   pool->handles_[kGate] = device::acquire(pool->n_slots_ * pool->stride_[kGate]);
   pool->handles_[kUp] = device::acquire(pool->n_slots_ * pool->stride_[kUp]);
   pool->handles_[kDown] =
@@ -356,6 +367,11 @@ std::expected<void, std::string> ExpertPool::select(
   }
 
   const uint64_t node = ++stats_.nodes;
+  // Aging LFU: every kAgePeriod nodes the per-key counts halve, so one burst
+  // of use fades while a set that keeps returning holds its place. A decode
+  // step is one node per block, so the counts age roughly every 26 steps.
+  if (node % kAgePeriod == 0)
+    for (uint32_t& u : uses_) u >>= 1;
 
   // The distinct keys this node needs; a slot holding one of them may not be
   // evicted.
@@ -397,16 +413,21 @@ std::expected<void, std::string> ExpertPool::select(
     if (slot >= 0) {
       ++stats_.hits;
     } else {
-      // Evict the least recently used slot this node does not need; lowest
-      // slot index on ties.
+      // Evict the least-used slot this node does not need; a tie goes to the
+      // older stamp, then the lowest slot index. An empty slot has no key, so
+      // it counts as unused and is taken first.
       int32_t victim = -1;
-      uint64_t victim_stamp = 0;
+      uint64_t victim_use = 0, victim_stamp = 0;
       for (uint64_t s = 0; s < n_slots_; ++s) {
         if (owner_[s] >= 0 &&
             std::find(needed.begin(), needed.end(), owner_[s]) != needed.end())
           continue;
-        if (victim < 0 || stamp_[s] < victim_stamp) {
+        const uint64_t use =
+            owner_[s] >= 0 ? uses_[size_t(owner_[s])] : uint64_t{0};
+        if (victim < 0 || use < victim_use ||
+            (use == victim_use && stamp_[s] < victim_stamp)) {
           victim = int32_t(s);
+          victim_use = use;
           victim_stamp = stamp_[s];
         }
       }
@@ -447,8 +468,11 @@ std::expected<void, std::string> ExpertPool::select(
     sel_host_[j] = slot;
   }
 
-  // Stamp every slot this node uses, once.
-  for (int64_t key : needed) stamp_[size_t(slot_of_[key])] = node;
+  // Stamp every slot this node uses, once, and count the use of its key.
+  for (int64_t key : needed) {
+    stamp_[size_t(slot_of_[key])] = node;
+    ++uses_[size_t(key)];
+  }
 
   if (!put(sel_host_.data(), sel_handle_,
            uint64_t(ids.size()) * sizeof(int32_t)))
@@ -465,6 +489,7 @@ void ExpertPool::clear() {
   std::fill(owner_.begin(), owner_.end(), -1);
   std::fill(stamp_.begin(), stamp_.end(), 0);
   std::fill(slot_of_.begin(), slot_of_.end(), -1);
+  std::fill(uses_.begin(), uses_.end(), 0);
   stats_ = Stats{};
 }
 
