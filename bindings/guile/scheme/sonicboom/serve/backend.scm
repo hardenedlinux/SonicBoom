@@ -65,7 +65,8 @@
             prefill step generate can-generate? backend-stats
 
             make-sampler sampler? sampler-temperature sampler-top-p
-            sampler-top-k sampler-seed sampler-greedy? sampler-random-state
+            sampler-top-k sampler-min-p sampler-seed sampler-repeat-penalty
+            sampler-greedy? sampler-random-state
             sampler-presence-penalty sampler-frequency-penalty
             sample-from-logits
 
@@ -745,9 +746,10 @@ PyTorch: none"
 
 ;; One request's sampling parameters and its random state.
 ;;
-;; The fields are temperature, top-p, top-k, seed, greedy?, random-state,
-;; presence-penalty and frequency-penalty, with an accessor named after each.
-;; make-sampler creates one; sample-from-logits draws with it.
+;; The fields are temperature, top-p, top-k, min-p, seed, repeat-penalty,
+;; greedy?, random-state, presence-penalty and frequency-penalty, with an
+;; accessor named after each. make-sampler creates one; sample-from-logits
+;; draws with it.
 ;;
 ;; Example:
 ;;   (use-modules (sonicboom serve backend))
@@ -755,13 +757,15 @@ PyTorch: none"
 ;;   => #t
 ;; PyTorch: none
 (define-record-type <sampler>
-  (%make-sampler temperature top-p top-k seed greedy? random-state
-                 presence-penalty frequency-penalty)
+  (%make-sampler temperature top-p top-k min-p seed repeat-penalty greedy?
+                 random-state presence-penalty frequency-penalty)
   sampler?
   (temperature sampler-temperature)
   (top-p sampler-top-p)
   (top-k sampler-top-k)
+  (min-p sampler-min-p)
   (seed sampler-seed)
+  (repeat-penalty sampler-repeat-penalty)
   (greedy? sampler-greedy?)
   (random-state sampler-random-state)
   (presence-penalty sampler-presence-penalty)
@@ -770,18 +774,24 @@ PyTorch: none"
 ;; temperature 0 means greedy, like the OpenAI API. top-k 0 means no top-k.
 ;; Without a seed the random state is seeded from the clock.
 (define* (make-sampler #:key (temperature 1.0) (top-p 1.0) (top-k 0)
-                       (seed #f) (greedy? #f)
+                       (min-p 0.0) (seed #f) (repeat-penalty 1.0) (greedy? #f)
                        (presence-penalty 0.0) (frequency-penalty 0.0))
   "Create a sampler.
 
 A temperature of 0 means greedy, as in the OpenAI API; top-k 0 means no top-k
-limit. Without a seed the random state is seeded from the clock.
+limit and min-p 0 no min-p cutoff. Without a seed the random state is seeded
+from the clock.
 
 Args:
   temperature: keyword; the sampling temperature (default 1.0).
   top-p: keyword; the nucleus mass to keep (default 1.0).
   top-k: keyword; how many candidates to keep, 0 for all (default 0).
+  min-p: keyword; minimum relative probability, 0 to keep everything (default
+    0.0).
   seed: keyword; the random seed, or #f for one from the clock (default #f).
+  repeat-penalty: keyword; the repetition penalty, 1 for off (default 1.0).
+    The reference sampler has no token history to penalize; the device
+    backends apply it.
   greedy?: keyword; force greedy decoding (default #f).
   presence-penalty: keyword; the presence penalty (default 0.0).
   frequency-penalty: keyword; the frequency penalty (default 0.0).
@@ -791,7 +801,7 @@ Example:
   (sampler-greedy? (make-sampler #:temperature 0))
   => #t
 PyTorch: none"
-  (%make-sampler temperature top-p top-k seed
+  (%make-sampler temperature top-p top-k min-p seed repeat-penalty
                  (or greedy? (<= temperature 0))
                  (seed->random-state
                   (or seed (+ (* 1000000 (car (gettimeofday)))
@@ -800,14 +810,15 @@ PyTorch: none"
 
 ;; The reference sampler for backends that produce logits on the host.
 ;; logits: list of (token . logit). constraint: #f or a token filter.
-;; Order: constraint, then greedy, else temperature, top-k, top-p, draw.
+;; Order: constraint, then greedy, else temperature, top-k, min-p, top-p, draw.
 (define (sample-from-logits sampler logits constraint)
   "Draw one token from LOGITS with SAMPLER.
 
 LOGITS is a list of (token . logit). The constraint is applied first, then a
 greedy sampler takes the highest logit; otherwise the candidates are ordered by
-logit, limited by top-k, reweighted by temperature and cut to the top-p mass
-before one is drawn from the random state.
+logit, limited by top-k, reweighted by temperature, cut below min-p (a
+candidate under min-p of the top probability is dropped) and cut to the top-p
+mass before one is drawn from the random state.
 
 Args:
   sampler: a sampler.
@@ -840,6 +851,15 @@ PyTorch: none"
                          sorted))
                (t (sampler-temperature sampler))
                (top (cdar kept))
+               ;; min-p drops every candidate whose probability is under
+               ;; min-p of the top one. With softmax the top probability is
+               ;; 1 after reweighting, so the logit difference decides.
+               (kept (let ((m (sampler-min-p sampler)))
+                       (if (> m 0)
+                           (let ((cutoff (* t (log m))))
+                             (filter (lambda (p) (>= (- (cdr p) top) cutoff))
+                                     kept))
+                           kept)))
                (weights (map (lambda (p) (exp (/ (- (cdr p) top) t))) kept))
                (total (apply + weights))
                (probs (map (lambda (w) (/ w total)) weights))

@@ -227,22 +227,35 @@ Request fields: `model`, `messages` (string or text-part content; roles
 `system`, `developer`, `user`, `assistant` with `tool_calls`, `tool`), `stream`,
 `stream_options.include_usage`, `max_tokens` / `max_completion_tokens`,
 `stop` (string or up to 4), `temperature`, `top_p`, `top_k` (extension),
-`seed`, `presence_penalty`, `frequency_penalty`, `n` (1 only), `tools`,
-`tool_choice`, `response_format`. Unknown fields are ignored.
+`min_p` (extension), `seed`, `repeat_penalty` (extension), `presence_penalty`,
+`frequency_penalty`, `n` (1 only), `tools`, `tool_choice`,
+`response_format`. Unknown fields are ignored; a sampling value out of range
+is a 400 naming the parameter.
 
 Omitted sampling defaults differ from the OpenAI service: **an omitted
-`temperature` is 0 (greedy, not 1.0)** and **an omitted `seed` is 0 (not a
-clock seed)**, so a request that says nothing samples nothing and repeats
-exactly. `top_p` defaults to 1 and `top_k` to 0; `presence_penalty` and
-`frequency_penalty` default to 0 and are validated to [-2, 2].
+`temperature` is 0 (greedy, not 1.0)**, so a request that says nothing samples
+nothing and repeats exactly. `top_p` defaults to 1, `top_k` and `min_p` to 0
+(off) and `repeat_penalty` to 1 (off); `presence_penalty` and
+`frequency_penalty` default to 0 and are validated to [-2, 2]. Accepted
+ranges: `temperature` [0, 2], `top_p` and `min_p` [0, 1], `top_k` a
+non-negative integer, `repeat_penalty` ≥ 0 (0 is read as its 1 default).
 
-With the real backend, `temperature`, `top_p`, `top_k`, `seed` and the two
-penalties are passed to `boom_llm_decode` on every step. A request with
-`temperature` > 0 therefore samples, and repeating the same body repeats the
-reply exactly; the penalties are part of the C ABI's sampled path, so they take
-effect only when `temperature` > 0 — the greedy default is a plain argmax and
-ignores them. The mock backend ignores the penalties (it has no penalty
-model).
+A seed is only meaningful when `temperature` > 0. A sampling request that
+omits `seed` gets a fresh one, and the reply carries it as `sonicboom_seed`
+(a non-OpenAI field on the completion object, and on the first chunk of a
+streamed reply); replaying the request with that `seed` reproduces the reply,
+including across a restart of the server. A greedy request reports
+`sonicboom_seed` 0 and ignores it.
+
+With the real backend, `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
+`repeat_penalty` and the two penalties are passed to `boom_llm_decode` on
+every step (in the C ABI's order: penalties, then top-k / min-p / top-p, then
+the draw). A request with `temperature` > 0 therefore samples; the penalties
+and `repeat_penalty` are part of the C ABI's sampled path, so they take effect
+only when `temperature` > 0 — the greedy default is a plain argmax and ignores
+them. The mock backend honors `temperature`, `top_p`, `top_k` and `min_p`; it
+has no penalty or repetition model, so `repeat_penalty` and the two penalties
+are accepted and ignored there.
 
 ### Constrained replies
 
@@ -378,7 +391,7 @@ guile -L bindings/guile/scheme bindings/guile/tests/serve/test-serve-http.scm
 python3 bindings/guile/tests/serve/test-openai-sdk.py      # pip install openai
 ```
 
-Results: units 70/70, HTTP 113/113, images 16/16; openai SDK (3.29.0) 24/24
+Results: units 80/80, HTTP 133/133, images 16/16; openai SDK (3.29.0) 24/24
 when last run.
 
 ## 8. Limits of the prototype

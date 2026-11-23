@@ -337,7 +337,46 @@
     (jref (cdr (chat `(("model" . ,gemma)
                        ("messages" . #((("role" . "user") ("content" . "the quick brown fox"))))
                        ("temperature" . 2.0) ("top_p" . 0.01) ("seed" . 3))))
-          "choices" 0 "message" "content")))
+          "choices" 0 "message" "content"))
+  (test-equal "min_p: 1 is greedy" "You said: the quick brown fox"
+    (jref (cdr (chat `(("model" . ,gemma)
+                       ("messages" . #((("role" . "user") ("content" . "the quick brown fox"))))
+                       ("temperature" . 2.0) ("min_p" . 1.0) ("seed" . 3))))
+          "choices" 0 "message" "content"))
+  (let ((r (chat `(("model" . ,gemma)
+                   ("messages" . #((("role" . "user") ("content" . "the quick brown fox"))))
+                   ("temperature" . 2.0) ("repeat_penalty" . 1.2) ("seed" . 3)))))
+    (test-equal "repeat_penalty: accepted" 200 (car r))
+    (test-equal "repeat_penalty: the seed is echoed" 3
+      (jref (cdr r) "sonicboom_seed"))))
+
+;; A sampling request that names no seed gets one, and the reply reports it;
+;; replaying it reproduces the reply.
+(let* ((body `(("model" . ,gemma)
+               ("messages" . #((("role" . "user") ("content" . "a seedless sample"))))
+               ("temperature" . 2.0)))
+       (first (cdr (chat body)))
+       (seed (jref first "sonicboom_seed")))
+  (test-assert "seed: a sampling request without one gets a seed"
+    (integer? seed))
+  (test-equal "seed: the reply reports it" seed
+    (jref (cdr (chat `(,@body ("seed" . ,seed)))) "sonicboom_seed"))
+  (test-equal "seed: replaying it reproduces the reply"
+    (jref first "choices" 0 "message" "content")
+    (jref (cdr (chat `(,@body ("seed" . ,seed)))) "choices" 0 "message" "content"))
+  (test-equal "seed: a greedy reply reports 0" 0
+    (jref (cdr (chat (request gemma (list (msg "user" "greedy seed")))))
+          "sonicboom_seed")))
+
+(match (stream `(("model" . ,gemma)
+                 ("messages" . #((("role" . "user") ("content" . "the seed over the wire"))))
+                 ("temperature" . 0.8) ("seed" . 5) ("stream" . #t)))
+  ((_ chunks done?)
+   (test-assert "stream seed: [DONE]" done?)
+   (test-equal "stream seed: the first chunk carries it" 5
+     (jref (car chunks) "sonicboom_seed"))
+   (test-equal "stream seed: later chunks do not repeat it" #f
+     (jref (cadr chunks) "sonicboom_seed"))))
 
 ;;; --- errors ------------------------------------------------------------------------
 
@@ -351,6 +390,17 @@
   ((status . body)
    (test-equal "unknown model in a chat: 404" 404 status)
    (test-equal "unknown model in a chat: type" "invalid_request_error" (jref body "error" "type"))))
+
+;; Out-of-range sampling values are 400s naming the parameter.
+(for-each (lambda (field value)
+            (match (chat (request gemma (list (msg "user" "x"))
+                                  (cons field value)))
+              ((status . body)
+               (test-equal (string-append "bad " field ": 400") 400 status)
+               (test-equal (string-append "bad " field ": param") field
+                 (jref body "error" "param")))))
+          '("temperature" "top_p" "top_k" "min_p" "repeat_penalty")
+          '(3 -1 -1 2 -1))
 
 ;;; --- prefix reuse --------------------------------------------------------------------
 

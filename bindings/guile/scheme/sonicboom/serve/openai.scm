@@ -199,6 +199,11 @@ PyTorch: none"
        l))
     (_ (invalid "stop must be a string or an array of up to 4 strings" "stop"))))
 
+;; A seed for a sampling request that did not ask for one. It is reported back
+;; in the reply (sonicboom_seed), so a client that keeps it replays the reply.
+(define (pick-seed)
+  (random (expt 2 32) (random-state-from-platform)))
+
 ;; body: the decoded request object (key order restored by json-normalize).
 ;; -> (values chat-request stream? include-usage?); include-usage? is
 ;; stream_options.include_usage, which only streaming replies look at.
@@ -207,7 +212,9 @@ PyTorch: none"
 
 JSON values are the guile-json ones: objects are alists with string keys,
 arrays are vectors and null is the symbol null. An omitted temperature is 0
-(greedy), an omitted seed is 0, and only n=1 is supported.
+(greedy). An omitted seed is 0 for a greedy request and a fresh random seed
+for a sampling one (the reply's sonicboom_seed tells the client which). Only
+n=1 is supported.
 
 Args:
   body: the decoded request object.
@@ -254,12 +261,23 @@ Note: a bad body raises (openai-error status type message param)."
                   (v (unless (and (integer? v) (exact? v) (>= v 0))
                        (invalid "top_k must be a non-negative integer" "top_k"))
                      v)))
-         ;; An omitted seed is 0, so a request is reproducible by default.
+         (min-p (match (ref body "min_p")             ; not OpenAI, common extension
+                  (#f 0.0)
+                  (v (number-in "min_p" v 0 1))))
+         ;; A seed is only meaningful when sampling. A request that omits it
+         ;; gets a fresh one, returned as sonicboom_seed, so the client can
+         ;; replay the reply; a greedy request keeps 0.
          (seed (match (ref body "seed")
-                 (#f 0)
+                 (#f (if (> temperature 0) (pick-seed) 0))
                  (v (unless (and (integer? v) (exact? v))
                       (invalid "seed must be an integer" "seed"))
                     (abs v))))
+         (repeat-penalty (match (ref body "repeat_penalty") ; not OpenAI, common extension
+                           (#f 1.0)
+                           (v (if (and (number? v) (>= v 0))
+                                  (exact->inexact v)
+                                  (invalid "repeat_penalty must be a non-negative number"
+                                           "repeat_penalty")))))
          (presence-penalty (match (ref body "presence_penalty")
                              (#f 0.0)
                              (v (number-in "presence_penalty" v -2 2))))
@@ -276,7 +294,8 @@ Note: a bad body raises (openai-error status type message param)."
                                #:tools tools #:tool-choice tool-choice
                                #:max-tokens max-tokens #:stop (check-stop (ref body "stop"))
                                #:temperature temperature #:top-p top-p #:top-k top-k
-                               #:seed seed
+                               #:min-p min-p #:seed seed
+                               #:repeat-penalty repeat-penalty
                                #:presence-penalty presence-penalty
                                #:frequency-penalty frequency-penalty
                                #:constraint constraint)
@@ -310,13 +329,19 @@ Example:
 PyTorch: none"
   (let ((t (ref body "temperature"))
         (p (ref body "top_p"))
-        (k (ref body "top_k")))
+        (k (ref body "top_k"))
+        (m (ref body "min_p"))
+        (r (ref body "repeat_penalty")))
     (when (and (number? t) (not (zero? t)))
       (invalid "this backend decodes greedily; temperature must be 0" "temperature"))
     (when (and (number? p) (not (= p 1)))
       (invalid "this backend decodes greedily; top_p must be 1" "top_p"))
     (when (and (number? k) (not (zero? k)))
-      (invalid "this backend decodes greedily; top_k must be 0" "top_k"))))
+      (invalid "this backend decodes greedily; top_k must be 0" "top_k"))
+    (when (and (number? m) (not (zero? m)))
+      (invalid "this backend decodes greedily; min_p must be 0" "min_p"))
+    (when (and (number? r) (not (= r 1)))
+      (invalid "this backend decodes greedily; repeat_penalty must be 1" "repeat_penalty"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Images
@@ -509,17 +534,21 @@ PyTorch: none"
        ("type" . "function")
        ("function" . (("name" . ,name) ("arguments" . ,args)))))))
 
-(define (completion-object id created model result)
+(define* (completion-object id created model result #:key (seed 0))
   "The chat-completion object for RESULT.
 
 A reply that consists only of tool calls has a null content, as the OpenAI
 schema expects.
+
+Besides the OpenAI fields it carries sonicboom_seed, the sampling seed the
+reply was drawn with (0 for greedy), so a sampling client can replay it.
 
 Args:
   id: the completion id.
   created: the creation time.
   model: the model id.
   result: a result.
+  seed: keyword; the request's sampling seed (default 0).
 Returns: a JSON object alist.
 Example:
   (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
@@ -545,6 +574,7 @@ PyTorch: none"
       ("object" . "chat.completion")
       ("created" . ,created)
       ("model" . ,model)
+      ("sonicboom_seed" . ,seed)
       ("choices"
        . #((("index" . 0)
             ("message"
@@ -557,7 +587,8 @@ PyTorch: none"
             ("finish_reason" . ,(result-finish-reason result)))))
       ("usage" . ,(usage-object result)))))
 
-(define* (chunk-object id created model delta #:optional (finish-reason 'null))
+(define* (chunk-object id created model delta #:optional (finish-reason 'null)
+                      #:key seed)
   "One streaming chat-completion chunk.
 
 Args:
@@ -567,6 +598,8 @@ Args:
   delta: the delta alist.
   finish-reason: optional; the finish reason, null while streaming is under
     way (default null).
+  seed: keyword; the request's sampling seed, carried on the first chunk
+    (default: no sonicboom_seed field).
 Returns: a JSON object alist.
 Example:
   (use-modules (sonicboom serve openai))
@@ -577,6 +610,7 @@ PyTorch: none"
     ("object" . "chat.completion.chunk")
     ("created" . ,created)
     ("model" . ,model)
+    ,@(if seed `(("sonicboom_seed" . ,seed)) '())
     ("choices" . #((("index" . 0)
                     ("delta" . ,delta)
                     ("logprobs" . null)

@@ -331,7 +331,10 @@
         (model (chat-request-model request)))
     (define (chunk delta . finish)
       (send-obj (apply chunk-object id created model delta finish)))
-    (if (not (chunk (role-delta)))
+    ;; The first chunk carries the request's seed (sonicboom_seed) so a
+    ;; streaming client can replay the reply.
+    (if (not (send-obj (chunk-object id created model (role-delta)
+                                     #:seed (chat-request-seed request))))
         (engine-drop! engine ticket)    ; gone before the first chunk
         (catch #t
           (lambda ()
@@ -466,9 +469,10 @@
                                 (lambda (key . args)
                                   (engine-drop! engine ticket)
                                   (apply throw key args)))))
-                  (json-emit 200 (completion-object (new-completion-id) (now)
-                                                    (chat-request-model request)
-                                                    result)))))))
+                  (json-emit 200 (completion-object
+                                  (new-completion-id) (now)
+                                  (chat-request-model request) result
+                                  #:seed (chat-request-seed request))))))))
       (lambda (key . args)
         (apply error-emit (classify key args))))))
 

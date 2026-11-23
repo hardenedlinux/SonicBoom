@@ -39,7 +39,8 @@
             chat-request-model chat-request-messages chat-request-tools
             chat-request-tool-choice chat-request-max-tokens chat-request-stop
             chat-request-temperature chat-request-top-p chat-request-top-k
-            chat-request-seed chat-request-presence-penalty
+            chat-request-min-p chat-request-seed chat-request-repeat-penalty
+            chat-request-presence-penalty
             chat-request-frequency-penalty chat-request-constraint
 
             engine-admit! engine-run engine-run-job engine-drop! engine-generate
@@ -55,9 +56,10 @@
 ;;
 ;; The fields are model (a model id), messages, tools, tool-choice, max-tokens
 ;; (#f: up to the context length), stop (a list of strings), temperature, top-p,
-;; top-k, seed, presence-penalty, frequency-penalty and constraint, with an
-;; accessor named after each. An omitted sampling parameter is neutral:
-;; temperature 0 (greedy), top-p 1, no top-k, seed 0 and no penalties.
+;; top-k, min-p, seed, repeat-penalty, presence-penalty, frequency-penalty and
+;; constraint, with an accessor named after each. An omitted sampling parameter
+;; is neutral: temperature 0 (greedy), top-p 1, no top-k, no min-p, seed 0,
+;; repeat-penalty 1 (off) and no penalties.
 ;;
 ;; Example:
 ;;   (use-modules (sonicboom serve engine))
@@ -66,8 +68,8 @@
 ;; PyTorch: none
 (define-record-type <chat-request>
   (%make-chat-request model messages tools tool-choice max-tokens stop
-                      temperature top-p top-k seed presence-penalty
-                      frequency-penalty constraint)
+                      temperature top-p top-k min-p seed repeat-penalty
+                      presence-penalty frequency-penalty constraint)
   chat-request?
   (model chat-request-model)                ; model id
   (messages chat-request-messages)          ; list of message alists
@@ -78,17 +80,21 @@
   (temperature chat-request-temperature)    ; 0: greedy (the default)
   (top-p chat-request-top-p)
   (top-k chat-request-top-k)
-  (seed chat-request-seed)                  ; 0 when the request omits it
+  (min-p chat-request-min-p)                ; 0: off
+  (seed chat-request-seed)                  ; #f only for a direct caller; the
+                                            ; HTTP layer always resolves one
+  (repeat-penalty chat-request-repeat-penalty) ; 1: off
   (presence-penalty chat-request-presence-penalty)
   (frequency-penalty chat-request-frequency-penalty)
   (constraint chat-request-constraint))     ; #f or a token filter
 
 ;; Omitted sampling parameters are neutral: temperature 0 (greedy), top-p 1,
-;; no top-k, seed 0, no penalties. A request is thus greedy unless it asks for
-;; sampling, and reproducible when it does.
+;; no top-k, no min-p, repeat-penalty 1 and no penalties. A request is thus
+;; greedy unless it asks for sampling, and reproducible when it does.
 (define* (make-chat-request #:key model messages (tools '()) (tool-choice "auto")
                             (max-tokens #f) (stop '()) (temperature 0.0)
-                            (top-p 1.0) (top-k 0) (seed 0)
+                            (top-p 1.0) (top-k 0) (min-p 0.0) (seed 0)
+                            (repeat-penalty 1.0)
                             (presence-penalty 0.0) (frequency-penalty 0.0)
                             (constraint #f))
   "Create a chat request.
@@ -108,7 +114,9 @@ Args:
   temperature: keyword; the sampling temperature, 0 for greedy (default 0.0).
   top-p: keyword; the nucleus mass (default 1.0).
   top-k: keyword; the candidate count, 0 for no limit (default 0).
+  min-p: keyword; minimum relative probability, 0 for off (default 0.0).
   seed: keyword; the sampling seed (default 0).
+  repeat-penalty: keyword; the repetition penalty, 1 for off (default 1.0).
   presence-penalty: keyword; the presence penalty (default 0.0).
   frequency-penalty: keyword; the frequency penalty (default 0.0).
   constraint: keyword; a constrained-decoding constraint or #f (default #f).
@@ -119,8 +127,8 @@ Example:
   => 0.0
 PyTorch: none"
   (%make-chat-request model messages tools tool-choice max-tokens stop
-                      temperature top-p top-k seed presence-penalty
-                      frequency-penalty constraint))
+                      temperature top-p top-k min-p seed repeat-penalty
+                      presence-penalty frequency-penalty constraint))
 
 ;; The result of one request.
 ;;
@@ -580,7 +588,9 @@ PyTorch: none"
          (sampler (make-sampler #:temperature (chat-request-temperature request)
                                 #:top-p (chat-request-top-p request)
                                 #:top-k (chat-request-top-k request)
+                                #:min-p (chat-request-min-p request)
                                 #:seed (chat-request-seed request)
+                                #:repeat-penalty (chat-request-repeat-penalty request)
                                 #:presence-penalty (chat-request-presence-penalty request)
                                 #:frequency-penalty (chat-request-frequency-penalty request))))
     (when (>= n-prompt ctx)

@@ -171,6 +171,16 @@
 (test-assert "the constraint hook filters candidates"
   (let ((no-y (lambda (cands) (remove (lambda (t) (equal? (tokenize gemma "Y") (list t))) cands))))
     (not (string-prefix? "Y" (generate gemma hot-prompt #:constraint no-y)))))
+(test-equal "min_p 1 is greedy"
+  "You said: the quick brown fox"
+  (generate gemma hot-prompt #:sampler (make-sampler #:temperature 2.0 #:min-p 1.0 #:seed 7)))
+(test-equal "min_p 0 keeps the distribution"
+  (generate gemma hot-prompt #:sampler (make-sampler #:temperature 2.0 #:seed 7))
+  (generate gemma hot-prompt #:sampler (make-sampler #:temperature 2.0 #:min-p 0 #:seed 7)))
+(test-equal "the sampler carries min_p and repeat_penalty"
+  (list 0.5 1.5)
+  (let ((s (make-sampler #:min-p 0.5 #:repeat-penalty 1.5)))
+    (list (sampler-min-p s) (sampler-repeat-penalty s))))
 
 ;;; --- prefill and the session pool --------------------------------------------------
 
@@ -450,6 +460,50 @@
                       (lambda (kind . args) #t))))
   (test-assert "residency: the request's model is resident afterwards"
     (and (residency-loaded? resid "q") (not (residency-loaded? resid "g")))))
+
+;;; --- HTTP sampling parameters and the seed -----------------------------------------
+
+(define (parse-body body)
+  (call-with-values (lambda () (parse-chat-request body))
+    (lambda (request stream? include-usage?) request)))
+
+(define (sampling-body . pairs)
+  `(("model" . "g")
+    ("messages" . #((("role" . "user") ("content" . "hi"))))
+    ,@pairs))
+
+(test-equal "an explicit seed passes through"
+  42 (chat-request-seed (parse-body (sampling-body '("seed" . 42)))))
+(test-equal "a greedy request without a seed keeps 0"
+  0 (chat-request-seed (parse-body (sampling-body '("temperature" . 0)))))
+(let ((req (parse-body (sampling-body '("temperature" . 1.0)))))
+  (test-assert "a sampling request without a seed gets one"
+    (and (integer? (chat-request-seed req)) (>= (chat-request-seed req) 0))))
+(test-equal "min_p and repeat_penalty are parsed"
+  (list 0.25 1.2)
+  (let ((req (parse-body (sampling-body '("min_p" . 0.25)
+                                        '("repeat_penalty" . 1.2)))))
+    (list (chat-request-min-p req) (chat-request-repeat-penalty req))))
+(test-equal "the request defaults are neutral"
+  (list 0.0 0 0 1.0 0.0 0.0)
+  (let ((req (parse-body (sampling-body))))
+    (list (chat-request-temperature req) (chat-request-top-k req)
+          (chat-request-seed req) (chat-request-repeat-penalty req)
+          (chat-request-min-p req) (chat-request-presence-penalty req))))
+
+;; A fresh engine is a fresh process for the sampler: the same seed must replay
+;; the same reply without any clock state.
+(let ((run (lambda ()
+             (result-content
+              (engine-generate
+               (make-engine (list gemma))
+               (make-chat-request #:model "g"
+                                  #:messages (list (msg "user" "hello"))
+                                  #:temperature 2.0 #:seed 12345)
+               (lambda (kind . args) #t))))))
+  (test-equal "the same seed replays a reply in a fresh engine" (run) (run))
+  (test-assert "a hot request strays from the plan"
+    (not (equal? (run) "You said: hello"))))
 
 (test-equal "model-object: an unloaded model has no family yet"
   (list 'null #f)
