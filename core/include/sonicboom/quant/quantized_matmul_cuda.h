@@ -163,4 +163,17 @@ void unregister_weight_device(const QuantizedTensor& W);
 // address so stale device buffers are not reused).
 void clear_cache();
 
+// Drop only the device copies first uploaded under `owner` (device_pool.h),
+// plus the pinned host mapping when it belongs to that owner. Called when a
+// model goes away while another one may still be live.
+void clear_cache_owner(uint64_t owner);
+
+// Drop the process-lifetime kernel scratch buffers. Retained while a CUDA
+// graph capture is live (the graph has baked their pointers in); a no-op then.
+void clear_scratch();
+
+// Free the imported MMQ split-K scratch, including buffers retired because a
+// capture had their pointers baked in. No-op while a capture is live.
+void mmq_release_scratch();
+
 } // namespace sonicboom::quant::cuda

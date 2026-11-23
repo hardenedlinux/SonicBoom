@@ -16,6 +16,7 @@
 
 #include <sonicboom/nn/cuda_elementwise.h>
 
+#include <sonicboom/nn/cuda_moe.h>
 #include <sonicboom/runtime_features.h>
 
 #include "cuda_resident.h"
@@ -29,8 +30,10 @@
 #include "../planner/mlir_autotune.h"  // Q3: prefill attention shape classes
 #include "../planner/plan_hook.h"  // BOOM_NOTE_LAUNCH (plan record; no-op when off)
 #include "../planner/reduce_mode.h"  // ReduceMode selection (f64 / df32 / f32)
+#include "../planner/device_pool.h"  // owner tag on cached device weights
 
 #include "boom_fdec_device.cuh"  // tensor-core decode/verify attention
+#include "fattn_jit.h"           // prepared prefill candidate modules (clear)
 
 #include <cuda_fp16.h>
 #include <type_traits>
@@ -1785,6 +1788,7 @@ __global__ void __launch_bounds__(NW * GQA * (QB / 16) * 32)
 struct DeviceWeight {
   void* ptr = nullptr;
   size_t bytes = 0;
+  uint64_t owner = 0;  // model that first uploaded it (see device_pool.h)
 };
 
 // Key the weight cache by (host pointer, byte size) rather than pointer alone:
@@ -1839,6 +1843,13 @@ void* g_xb = nullptr;           // bf16-rounded position-major activation ([n, c
 size_t g_xb_bytes = 0;
 double* g_sum = nullptr;        // device-resident rms_norm sum (double, matches CPU)
 
+// Scratch a growth replaced while a capture was live. It cannot be freed then
+// (the recorded graph may keep launching against its pointer) and must not be
+// dropped either: dropping the pointer leaks the block until the process exits.
+// It is parked here and freed by clear_scratch() once no capture is live — the
+// same point that frees the current buffers.
+std::vector<std::pair<void*, size_t>> g_retired_scratch;
+
 bool g_available_checked = false;
 bool g_available = false;
 
@@ -1863,6 +1874,10 @@ void* grow_scratch(void*& buf, size_t& have, size_t need) {
     have = old ? old_have : 0;
     return nullptr;
   }
+  // The growth succeeded, so the old buffer is no longer reachable through the
+  // static. Park it for clear_scratch(); when freeing was allowed above it is
+  // already gone.
+  if (old) g_retired_scratch.emplace_back(old, old_have);
   have = need;
   return buf;
 }
@@ -1876,6 +1891,9 @@ void* grow_scratch_keep(void*& buf, size_t& have, size_t need) {
   sonicboom::cuda::scratch_epoch_bump();
   void* nb = nullptr;
   if (cudaMalloc(&nb, need) != cudaSuccess) return nullptr;
+  // The replaced buffer is never freed here (that is the point of "keep"); it
+  // is parked so clear_scratch() can free it at model teardown.
+  if (buf) g_retired_scratch.emplace_back(buf, have);
   buf = nb;
   have = need;
   return buf;
@@ -1896,7 +1914,8 @@ const void* upload_bytes(const void* host, size_t bytes) {
     cudaFree(dptr);
     return nullptr;
   }
-  g_cache.emplace(key, DeviceWeight{dptr, bytes});
+  g_cache.emplace(key, DeviceWeight{dptr, bytes,
+                                      planner::device::current_owner()});
   return dptr;
 }
 
@@ -6019,8 +6038,13 @@ bool ensure_full_scratch(size_t bytes) {
 void release_full_scratch() {
   if (g_full_scratch == nullptr) return;
   sonicboom::cuda::scratch_epoch_bump();
-  // A live capture may still launch against this buffer: retain it then.
-  if (sonicboom::cuda::scratch_may_free()) cudaFree(g_full_scratch);
+  // A live capture may still launch against this buffer: retain it then, parked
+  // so clear_scratch() frees it once no capture is live.
+  if (sonicboom::cuda::scratch_may_free()) {
+    cudaFree(g_full_scratch);
+  } else {
+    g_retired_scratch.emplace_back(g_full_scratch, g_full_scratch_bytes);
+  }
   g_full_scratch = nullptr;
   g_full_scratch_bytes = 0;
 }
@@ -8406,6 +8430,60 @@ bool kv_append_batched_dev_pos(float* dst_k, float* dst_v, const float* src_k,
         dst_k, dst_v, src_k, src_v, start_pos, n_slots, row_elems, n);
   }
   return cudaGetLastError() == cudaSuccess;
+}
+
+void clear_cache_owner(uint64_t owner) {
+  if (owner == 0) return;
+  std::lock_guard<std::mutex> lk(g_cache_mutex);
+  for (auto it = g_cache.begin(); it != g_cache.end();) {
+    if (it->second.owner == owner) {
+      cudaFree(it->second.ptr);
+      it = g_cache.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void clear_scratch() {
+  // A live capture has baked these pointers into its graph; retain them until
+  // no capture exists (the same rule grow_scratch follows).
+  if (!sonicboom::cuda::scratch_may_free()) return;
+  auto drop = [](void*& p, size_t& have) {
+    if (p) cudaFree(p);
+    p = nullptr;
+    have = 0;
+  };
+  drop(g_dx, g_dx_bytes);
+  drop(g_db, g_db_bytes);
+  drop(g_dy, g_dy_bytes);
+  drop(g_dff, g_dff_bytes);
+  drop(g_partial, g_partial_bytes);
+  drop(g_attn_partial, g_attn_partial_bytes);
+  drop(g_attn_partial_mq, g_attn_partial_mq_bytes);
+  drop(g_argmax_keys, g_argmax_keys_bytes);
+  drop(g_select_keys, g_select_keys_bytes);
+  drop(g_xpack, g_xpack_bytes);
+  drop(g_outpack, g_outpack_bytes);
+  drop(g_xb, g_xb_bytes);
+  // float*, not void*: the drop helper takes void*&.
+  if (g_full_scratch) cudaFree(g_full_scratch);
+  g_full_scratch = nullptr;
+  g_full_scratch_bytes = 0;
+  if (g_sum) cudaFree(g_sum);
+  g_sum = nullptr;
+  // Scratch a capture forced us to retain while it was live. No capture is
+  // live here (the guard at the top), so it goes now.
+  for (auto& r : g_retired_scratch) cudaFree(r.first);
+  g_retired_scratch.clear();
+  // Neighbouring device modules own their own process-lifetime scratch; it
+  // follows the same rule (no-op while a capture is live).
+  moe_release_scratch();
+  boom_fattn_release_workspace();
+  // The prefill candidate modules the tuner prepared for this model's shapes.
+  // Their code is context memory that otherwise stays loaded for the process;
+  // a later prepare() reloads it from the PTX cache.
+  fattn_jit::clear_modules();
 }
 
 } // namespace sonicboom::nn::cuda

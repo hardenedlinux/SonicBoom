@@ -136,36 +136,54 @@ int pick_J(ggml_type type, bool fallback, int64_t ncols_opt, const boom_cuda_pro
 // growth after a capture exists retains the old allocation (the capture keeps
 // its baked pointer) and bumps the scratch epoch, as the shared scratch
 // contract requires.
-float * split_scratch_get(size_t bytes) {
-    static std::mutex mutex;
-    static float * ptr = nullptr;
-    static size_t capacity = 0;
-    static std::vector<float *> retired;
+// The live split buffer and the ones a capture forced us to retain. The latter
+// are freed by mmq_release_scratch() once no capture is live; freeing them at
+// the growth point would pull memory out from under a recorded graph.
+std::mutex g_split_mutex;
+float * g_split_ptr = nullptr;
+size_t g_split_capacity = 0;
+std::vector<float *> g_split_retired;
 
-    std::lock_guard<std::mutex> lock(mutex);
-    if (bytes > capacity) {
-        if (ptr != nullptr) {
+float * split_scratch_get(size_t bytes) {
+    std::lock_guard<std::mutex> lock(g_split_mutex);
+    if (bytes > g_split_capacity) {
+        if (g_split_ptr != nullptr) {
             if (sonicboom::cuda::scratch_may_free() &&
-                cudaFree(ptr) == cudaSuccess) {
-                ptr = nullptr;
+                cudaFree(g_split_ptr) == cudaSuccess) {
+                g_split_ptr = nullptr;
             } else {
-                // A free that failed leaves the pointer live: retire it rather
-                // than lose the allocation.
+                // A free that was not allowed, or that failed, leaves the
+                // pointer live: retire it rather than lose the allocation.
                 (void)cudaGetLastError();
-                retired.push_back(ptr);
-                ptr = nullptr;
+                g_split_retired.push_back(g_split_ptr);
+                g_split_ptr = nullptr;
             }
         }
-        if (!mmq_probe_alloc(&ptr, bytes)) {
+        if (!mmq_probe_alloc(&g_split_ptr, bytes)) {
             // No scratch, no split path: the caller returns false instead of
             // launching a kernel whose partial buffer is null.
-            capacity = 0;
+            g_split_capacity = 0;
             return nullptr;
         }
-        capacity = bytes;
+        g_split_capacity = bytes;
         sonicboom::cuda::scratch_epoch_bump();
     }
-    return ptr;
+    return g_split_ptr;
+}
+
+// Free the split scratch and every retired buffer. Called at model teardown,
+// when no capture is live (the caller checks scratch_may_free first).
+void split_scratch_release() {
+    std::lock_guard<std::mutex> lock(g_split_mutex);
+    if (g_split_ptr != nullptr) {
+        cudaFree(g_split_ptr);
+        g_split_ptr = nullptr;
+    }
+    for (float * p : g_split_retired) {
+        if (p != nullptr) cudaFree(p);
+    }
+    g_split_retired.clear();
+    g_split_capacity = 0;
 }
 
 // SonicBoom: build the 2-D, non-MoE mmq_args mapping used by upstream
@@ -1729,5 +1747,9 @@ void mmq_up_group_warm_use(const MmqUpType * types, const int64_t * rows,
     g_mmq_group_use[mmq_group_use_key(types, rows, n_members, cols, false)] =
         use[1];
 }
+
+// Free the imported MMQ split-K scratch (live and retired). The caller
+// (clear_scratch) has already established that no capture is live.
+void mmq_release_scratch() { split_scratch_release(); }
 
 }  // namespace sonicboom::quant::cuda

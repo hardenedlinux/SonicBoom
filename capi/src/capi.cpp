@@ -67,6 +67,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -150,9 +151,18 @@ struct boom_llm_bundle {
   // gguf::Reader is move-only with a private default constructor, so the
   // bundle takes the reader in and owns it for the model's lifetime.
   explicit boom_llm_bundle(gguf::Reader&& r) : reader(std::move(r)) {}
+  // The bundle's last reference is the model's last reference (every session
+  // holds one), so this is the one point where the model's device memory can
+  // go back to the driver: block by block, the pool's free list would keep it
+  // for the next model. Runs before the members are destroyed, so the reader's
+  // weight buffer (and the pinned mapping into it) is still valid.
+  ~boom_llm_bundle() { model::release_device_owner(owner); }
   gguf::Reader reader;
   model::Gemma4Model model;
   vocab::Vocab vocab;  // loaded from tokenizer.ggml.* on model load
+  // Device-resource owner id (0 without CUDA). Everything this model's load
+  // and sessions allocate on the device is tagged with it.
+  uint64_t owner = model::device_owner_create();
 };
 
 struct boom_llm_model {
@@ -229,6 +239,11 @@ class SessionRef {
     if (g_sessions.count(h) == 0) return;
     ++h->refs;
     h_ = h;
+    // Every session call that can allocate runs under the session's model
+    // owner, so the block it allocates is returned when that model goes. The
+    // scope is per call (the thread may serve several models in turn) and
+    // nests with the ones the core installs internally.
+    scope_.emplace(h->bundle->owner);
   }
   ~SessionRef() {
     if (!h_) return;
@@ -241,6 +256,9 @@ class SessionRef {
 
  private:
   boom_llm_session *h_ = nullptr;
+  // Destroyed after the reference counts down: either order is safe (the
+  // owner tag is the session state's, not this call's).
+  std::optional<model::DeviceOwnerScope> scope_;
 };
 
 boom_status fail_arg(boom_error **err_out) {
@@ -2081,6 +2099,10 @@ boom_status boom_llm_model_load(const char *gguf_path, boom_llm_model **model_ou
         // stable), then bind the model against it so every weight span borrows
         // the bundle's buffer.
         auto bundle = std::make_shared<boom_llm_bundle>(std::move(*reader));
+        // The device comes up below (ensure_device_ready uploads any weight
+        // the loader left on the host); everything it allocates is tagged with
+        // this model's owner, so a later boom_llm_model_free returns it.
+        model::DeviceOwnerScope owner_scope(bundle->owner);
 
         // The architectures SonicBoom models (Gemma 4, Qwen2) load through the
         // same arch-generic loader; `detect_arch` rejects anything else, so the
@@ -2141,6 +2163,8 @@ boom_status boom_llm_model_load_ex(const char *gguf_path, uint32_t flags,
 }
 
 void boom_llm_model_free(boom_llm_model *model) { delete model; }
+
+void boom_device_trim(void) { model::device_trim(); }
 
 boom_status boom_llm_model_arch(const boom_llm_model *model, char *out, size_t cap,
                             size_t *len_out, boom_error **err_out) {
@@ -2318,6 +2342,9 @@ boom_status boom_llm_session_new(boom_llm_model *model, uint64_t n_ctx,
         }
         h->bundle = model->bundle;  // keep the model (and its buffer) alive
         h->n_ctx = n_ctx;
+        // The KV cache and the warmed decode runtime allocate device blocks;
+        // they belong to the model, so the model's free returns them.
+        model::DeviceOwnerScope owner_scope(h->bundle->owner);
         // The session owns its KV cache exclusively, allocated at construction
         // so every runtime built for it can bind the cache from the start. A
         // failure leaves no half-initialized session: the handle is discarded

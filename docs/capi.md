@@ -117,6 +117,9 @@ typedef struct boom_llm_stats {
 boom_status boom_llm_model_load(const char *gguf_path, const boom_llm_model_config *config,
                             boom_llm_model **model_out, boom_error **err_out);
 void boom_llm_model_free(boom_llm_model *model);
+/* Return the device buffers kept for reuse (a released session's free list) to
+ * the driver. Live weights and KV caches are untouched. */
+void boom_device_trim(void);
 boom_status boom_llm_model_get_info(const boom_llm_model *model, boom_llm_model_info *info_out,
                                 boom_error **err_out);
 boom_status boom_llm_model_get_stats(const boom_llm_model *model, boom_llm_stats *stats_out,
@@ -216,6 +219,12 @@ boom_status boom_llm_step(boom_llm_session *session, boom_llm_sampler *sampler,
   and the weights go when the last session is freed too. Garbage-collected
   bindings (Guile guardians / finalizers) do not free in a guaranteed order, so
   the ABI must not require "sessions before the model".
+- **Device memory follows the model.** When a model's last reference goes, its
+  device buffers — weights, the session's KV cache, and the pool's retained
+  free-list blocks — return to the driver, so a different model can take the
+  VRAM. `boom_device_trim` returns a still-loaded model's retained blocks on
+  demand without touching anything live. Only the CUDA context and the kernel
+  images loaded on first use stay resident for the process.
 - Strings and arrays in `boom_llm_model_info` belong to the model and stay valid
   until it is destroyed. Input buffers are borrowed for the duration of the
   call; outputs go to caller buffers.

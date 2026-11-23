@@ -22,11 +22,13 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <new>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace sonicboom::planner::device {
@@ -47,11 +49,51 @@ bool g_checked = false;
 bool g_available = false;
 // Free buffers keyed by aligned size.
 std::unordered_map<uint64_t, std::vector<uint64_t>> g_free;
-// The aligned size each live handle was acquired at, so release() accounts it
-// exactly even when the caller passes a size that does not match the acquire
-// (the executor has one release path that passes 0).
-std::unordered_map<uint64_t, uint64_t> g_sizes;
+
+// One record per block the pool owns, live or parked in the free list. `size`
+// is the aligned acquire-time size, so release() accounts a block exactly even
+// when the caller passes a size that does not match the acquire (the executor
+// has one release path that passes 0). `owner` is the owner active at acquire;
+// reusing a free block retags it. `live` distinguishes held from retained and
+// makes a second release of the same handle a no-op.
+struct Block {
+  uint64_t size = 0;
+  uint64_t owner = 0;
+  bool live = false;
+};
+std::unordered_map<uint64_t, Block> g_blocks;
 Stats g_stats;
+
+thread_local uint64_t t_owner = 0;
+std::atomic<uint64_t> g_next_owner{1};
+std::atomic<uint32_t> g_live_owners{0};
+
+// Return the doomed blocks to the driver, first unhooking each from its free
+// list. The caller holds g_mutex. Accounting follows the block's state: a live
+// block leaves the live figures, a retained one the retained figures.
+void free_blocks_locked(const std::unordered_set<uint64_t>& doomed) {
+  if (doomed.empty()) return;
+  for (auto& kv : g_free) {
+    auto& v = kv.second;
+    v.erase(std::remove_if(v.begin(), v.end(),
+                           [&](uint64_t h) { return doomed.count(h) != 0; }),
+            v.end());
+  }
+  for (uint64_t h : doomed) {
+    auto it = g_blocks.find(h);
+    if (it == g_blocks.end()) continue;
+    const Block b = it->second;
+    if (b.live) {
+      g_stats.live_blocks--;
+      g_stats.live_bytes -= b.size;
+    } else {
+      g_stats.retained_blocks--;
+      g_stats.retained_bytes -= b.size;
+    }
+    cudaFree(reinterpret_cast<void*>(h));
+    g_blocks.erase(it);
+  }
+}
 
 #endif
 
@@ -84,7 +126,10 @@ uint64_t acquire(uint64_t bytes) {
     g_stats.retained_bytes -= size;
     g_stats.live_blocks++;
     g_stats.live_bytes += size;
-    g_sizes[h] = size;
+    Block &b = g_blocks[h];
+    b.size = size;
+    b.owner = t_owner;  // reuse retags the block to the acquiring owner
+    b.live = true;
     return h;
   }
   void* p = nullptr;
@@ -98,7 +143,7 @@ uint64_t acquire(uint64_t bytes) {
     return 0;
   }
   const uint64_t h = reinterpret_cast<uint64_t>(p);
-  g_sizes[h] = size;
+  g_blocks[h] = Block{size, t_owner, true};
   g_stats.live_blocks++;
   g_stats.live_bytes += size;
   return h;
@@ -124,7 +169,7 @@ uint64_t acquire_fresh(uint64_t bytes) {
     return 0;
   }
   const uint64_t h = reinterpret_cast<uint64_t>(p);
-  g_sizes[h] = size;
+  g_blocks[h] = Block{size, t_owner, true};
   g_stats.live_blocks++;
   g_stats.live_bytes += size;
   return h;
@@ -139,11 +184,12 @@ void release(uint64_t handle, uint64_t bytes) {
   if (handle == 0) return;
   std::lock_guard<std::mutex> lk(g_mutex);
   // The acquire-time size is authoritative: one executor path releases with 0.
-  auto sit = g_sizes.find(handle);
-  if (sit == g_sizes.end()) return;  // unknown or already released
-  const uint64_t size = sit->second;
+  auto it = g_blocks.find(handle);
+  if (it == g_blocks.end() || !it->second.live)
+    return;  // unknown or already released
+  const uint64_t size = it->second.size;
   (void)bytes;
-  g_sizes.erase(sit);
+  it->second.live = false;
   g_free[size].push_back(handle);
   g_stats.live_blocks--;
   g_stats.live_bytes -= size;
@@ -369,17 +415,83 @@ Stats stats() noexcept {
 #endif
 }
 
-void clear_all() {
+void clear_all() { trim(); }
+
+void trim() {
 #ifdef SONICBOOM_USE_CUDA
   std::lock_guard<std::mutex> lk(g_mutex);
-  for (auto& kv : g_free)
-    for (uint64_t h : kv.second) {
-      cudaFree(reinterpret_cast<void*>(h));
-      g_sizes.erase(h);
-    }
-  g_free.clear();
-  g_stats.retained_blocks = 0;
-  g_stats.retained_bytes = 0;
+  std::unordered_set<uint64_t> doomed;
+  for (const auto& kv : g_blocks)
+    if (!kv.second.live) doomed.insert(kv.first);
+  free_blocks_locked(doomed);
+#endif
+}
+
+uint64_t create_owner() {
+#ifdef SONICBOOM_USE_CUDA
+  g_live_owners.fetch_add(1);
+  return g_next_owner.fetch_add(1);
+#else
+  return 0;
+#endif
+}
+
+uint64_t current_owner() noexcept {
+#ifdef SONICBOOM_USE_CUDA
+  return t_owner;
+#else
+  return 0;
+#endif
+}
+
+uint64_t set_current_owner(uint64_t owner) noexcept {
+#ifdef SONICBOOM_USE_CUDA
+  const uint64_t prev = t_owner;
+  t_owner = owner;
+  return prev;
+#else
+  (void)owner;
+  return 0;
+#endif
+}
+
+uint32_t live_owners() noexcept {
+#ifdef SONICBOOM_USE_CUDA
+  return g_live_owners.load();
+#else
+  return 0;
+#endif
+}
+
+OwnerScope::OwnerScope(uint64_t owner) noexcept : prev_(current_owner()) {
+#ifdef SONICBOOM_USE_CUDA
+  t_owner = owner;
+#else
+  (void)owner;
+#endif
+}
+
+OwnerScope::~OwnerScope() {
+#ifdef SONICBOOM_USE_CUDA
+  t_owner = prev_;
+#endif
+}
+
+void release_owner(uint64_t owner) {
+#ifdef SONICBOOM_USE_CUDA
+  if (owner == 0) return;
+  // The owner's runtime is gone, so nothing should be executing against its
+  // blocks; synchronize anyway so a launch that outlived its handle cannot read
+  // memory the driver is about to reuse.
+  cudaDeviceSynchronize();
+  std::lock_guard<std::mutex> lk(g_mutex);
+  std::unordered_set<uint64_t> doomed;
+  for (const auto& kv : g_blocks)
+    if (kv.second.owner == owner) doomed.insert(kv.first);
+  free_blocks_locked(doomed);
+  g_live_owners.fetch_sub(1);
+#else
+  (void)owner;
 #endif
 }
 

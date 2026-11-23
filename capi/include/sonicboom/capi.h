@@ -710,6 +710,18 @@ boom_status boom_llm_model_load_ex(const char *gguf_path, uint32_t flags,
 
 void boom_llm_model_free(boom_llm_model *model);
 
+/* Return every device buffer the runtime is holding for reuse to the driver.
+ *
+ * A model's own memory goes back to the driver by itself when the model is
+ * freed (boom_llm_model_free / boom_image_model_free, after its last session).
+ * This call is for the leftovers: the free-list buffers a released session
+ * left behind, which keep VRAM resident so that the next session on the same
+ * model does not have to allocate again. Live buffers (a loaded model's
+ * weights, a session's KV cache) are untouched, so a model can keep serving
+ * across the call; it simply allocates on demand afterwards. A no-op without
+ * a CUDA device. Cheap and safe to call repeatedly. */
+void boom_device_trim(void);
+
 /* The loaded model's architecture, exactly as its GGUF declares it in
  * `general.architecture` ("gemma4", "qwen2", ...). A caller that must format
  * prompts, pick turn markers or otherwise behave differently per family reads

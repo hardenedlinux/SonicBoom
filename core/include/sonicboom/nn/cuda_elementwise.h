@@ -132,4 +132,16 @@ bool flash_attention_full(std::span<const float> q, std::span<const float> k,
 // address so stale device buffers are not reused).
 void clear_cache();
 
+// Drop only the device copies first uploaded under `owner` (device_pool.h).
+void clear_cache_owner(uint64_t owner);
+
+// Drop the process-lifetime kernel scratch buffers. Retained while a CUDA
+// graph capture is live (the graph has baked their pointers in); a no-op then.
+void clear_scratch();
+
+// Free the boom_fattn KV/Q gather workspace (core/src/nn/boom_fattn.cu). It is
+// sized for the largest shape run so far and must go with the model that ran
+// it. A no-op while a capture is live.
+void boom_fattn_release_workspace();
+
 } // namespace sonicboom::nn::cuda

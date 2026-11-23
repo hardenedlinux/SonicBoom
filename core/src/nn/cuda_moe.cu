@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace sonicboom::nn::cuda {
@@ -128,6 +129,11 @@ struct Scratch {
 };
 Scratch g_scratch[kScratchSlots];
 
+// Old buffers a growth replaced while a capture was live. They cannot be freed
+// then (a recorded graph may launch against them) and must not be dropped
+// either; moe_release_scratch() frees them at model teardown.
+std::vector<std::pair<void*, size_t>> g_retired;
+
 void* scratch(int slot, size_t need) {
   Scratch& s = g_scratch[slot];
   if (s.bytes >= need) return s.ptr;
@@ -142,9 +148,21 @@ void* scratch(int slot, size_t need) {
     s.ptr = old;
     return nullptr;
   }
+  if (old) g_retired.emplace_back(old, s.bytes);
   s.ptr = p;
   s.bytes = need;
   return p;
+}
+
+void moe_release_scratch_impl() {
+  if (!sonicboom::cuda::scratch_may_free()) return;
+  for (auto& s : g_scratch) {
+    if (s.ptr) cudaFree(s.ptr);
+    s.ptr = nullptr;
+    s.bytes = 0;
+  }
+  for (auto& r : g_retired) cudaFree(r.first);
+  g_retired.clear();
 }
 
 __device__ inline float moe_half_roundtrip(float v) {
@@ -692,5 +710,10 @@ bool moe_experts_dev(const float* x, const int64_t* ids_host,
   }
   return true;
 }
+
+// Free the MoE scratch (live slots and buffers retired for a capture). The
+// caller has established that the model is going away; the function itself is
+// a no-op while any capture is live.
+void moe_release_scratch() { moe_release_scratch_impl(); }
 
 } // namespace sonicboom::nn::cuda

@@ -27,7 +27,7 @@
   #:use-module (rnrs bytevectors)
   #:use-module (ice-9 optargs)
   #:export (load-model free-model! model-arch model-eos
-            make-session free-session!
+            make-session free-session! device-trim!
             set-grammar! set-json-schema! clear-grammar! constraint-state
             json-schema->gbnf
             prefill! tokenize tokenize-segments detokenize
@@ -288,6 +288,31 @@ Args:
 Returns: unspecified.
 PyTorch: none"
   ((proc 'boom_llm_session_free) session))
+
+;;; --- device memory ----------------------------------------------------------
+
+;;; A model's device memory already returns to the driver when the model is
+;;; freed, after its last session. This call is for the free-list buffers a
+;;; released session leaves behind so the next session on the same model starts
+;;; without an allocation: they keep VRAM resident while nothing uses them. A
+;;; loaded model and a live session are untouched, so a server can keep serving
+;;; and simply allocate again on demand. It is the C ABI's boom_device_trim.
+
+(define (device-trim!)
+  "Return the device buffers the runtime keeps for reuse to the driver.
+
+Live buffers (a loaded model's weights, a session's KV cache) are untouched;
+the runtime allocates them again on demand afterwards. A model's own memory
+already returns when the model is freed, so this is for the free-list
+leftovers a released session holds. A no-op without a CUDA device.
+Args:
+Returns: unspecified.
+Example:
+  (use-modules (sonicboom inference))
+  (device-trim!)
+PyTorch: none
+Note: Cheap and safe to call repeatedly; a live model keeps serving across it."
+  ((proc 'boom_device_trim)))
 
 ;;; --- constrained decoding ---------------------------------------------------
 

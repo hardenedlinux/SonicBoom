@@ -23,6 +23,7 @@
 
 #include <sonicboom/model/moss_pipeline.h>
 #include <sonicboom/model/moss_text.h>
+#include <sonicboom/model/plan.h>
 #include <sonicboom/vocab/vocab.h>
 
 #include "capi_private.h"
@@ -50,6 +51,16 @@ namespace moss = sonicboom::moss;
 }  // namespace
 
 struct boom_image_model {
+  // Device-resource owner (see <sonicboom/model/plan.h>). The guard is declared
+  // first, so it is destroyed last: the pipeline's destructor unregisters its
+  // resident DiT tiles (and frees its raw VAE buffers), then the guard returns
+  // whatever else this model's load and generations allocated to the driver.
+  // 0 without CUDA, where release is a no-op.
+  struct OwnerRelease {
+    uint64_t owner;
+    ~OwnerRelease() { sonicboom::model::release_device_owner(owner); }
+  };
+  OwnerRelease owner{sonicboom::model::device_owner_create()};
   std::filesystem::path root;
   std::unique_ptr<moss::MossPipeline> pipeline;
   sonicboom::vocab::Vocab vocab;
@@ -161,6 +172,11 @@ boom_status boom_image_model_load(const char *dir, boom_image_model **out,
           return BOOM_ERR_INTERNAL;
         *out = nullptr;
         const std::filesystem::path root(dir);
+        auto model = std::make_unique<boom_image_model>();
+        model->root = root;
+        // The pipeline uploads its DiT weights (and may keep some resident);
+        // those device copies belong to this image model.
+        sonicboom::model::DeviceOwnerScope owner_scope(model->owner.owner);
         auto pipeline = moss::MossPipeline::load(root, /*with_text=*/true);
         if (!pipeline) {
           set_error(err_out, BOOM_ERRKIND_WEIGHT, pipeline.error().c_str());
@@ -173,8 +189,6 @@ boom_status boom_image_model_load(const char *dir, boom_image_model **out,
           set_error(err_out, BOOM_ERRKIND_WEIGHT, vocab.error().c_str());
           return BOOM_ERR_UNSUPPORTED;
         }
-        auto model = std::make_unique<boom_image_model>();
-        model->root = root;
         model->pipeline = std::move(*pipeline);
         model->vocab = std::move(*vocab);
         *out = model.release();
@@ -217,6 +231,9 @@ boom_status boom_image_generate(boom_image_model *model, const boom_image_reques
       [&]() -> boom_status {
         if (model == nullptr || req == nullptr || bytes_out == nullptr)
           return BOOM_ERR_INTERNAL;
+        // A generation may lazily load resident weight tiles; they belong to
+        // this image model, so its free returns them.
+        sonicboom::model::DeviceOwnerScope owner_scope(model->owner.owner);
 
         const char *prompt = field<const char *>(req, offsetof(boom_image_request, prompt), nullptr);
         const char *negative =

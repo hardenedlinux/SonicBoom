@@ -352,6 +352,7 @@ PyTorch: none"
                (boom_llm_model_load . ,(foreign-proc "boom_llm_model_load" int
                                                    (list '* '* '*)))
                (boom_llm_model_free . ,(foreign-proc "boom_llm_model_free" void (list '*)))
+               (boom_device_trim . ,(foreign-proc "boom_device_trim" void (list)))
                (boom_llm_model_arch . ,(foreign-proc "boom_llm_model_arch" int
                                                    (list '* '* size_t '* '*)))
                (boom_llm_model_eos . ,(foreign-proc "boom_llm_model_eos" int

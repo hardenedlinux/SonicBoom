@@ -90,6 +90,7 @@
 
 #include "cuda_resident.h"
 
+#include "cuda_scratch_epoch.h"
 #include "cuda_stream.h"
 #include "fattn_tune.h"
 
@@ -840,6 +841,21 @@ void* fattn_tune::aot_kernel(int candidate, int head_dim, int gqa) {
   if (head_dim == 64 && gqa == 7)
     return qreg_aot_candidate<64, 7, 16, 16, 1>(candidate);
   return nullptr;
+}
+
+// Free the KV/Q gather workspace. It is sized for the largest shape the last
+// model ran, so it must go with that model rather than stay for the process. A
+// no-op while a capture is live: its graph may have the pointers baked in.
+void boom_fattn_release_workspace() {
+  if (!sonicboom::cuda::scratch_may_free()) return;
+  auto drop = [](void*& p, size_t& have) {
+    if (p) cudaFree(p);
+    p = nullptr;
+    have = 0;
+  };
+  drop(g_q16, g_q16_bytes);
+  drop(g_kv_k, g_kv_k_bytes);
+  drop(g_kv_v, g_kv_v_bytes);
 }
 
 }  // namespace sonicboom::nn::cuda

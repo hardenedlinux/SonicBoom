@@ -29,6 +29,17 @@
 // Buffers are pooled by aligned byte size and returned to the free list rather
 // than freed, so a single-token decode's working set is reused across steps
 // instead of being re-malloc'd per node. clear_all() returns them to the driver.
+//
+// Ownership. A model's device memory has to go back to the driver when the
+// model does -- the free-list retention that makes one session cheap makes a
+// second, different model OOM. Every block therefore records the owner active
+// when it was acquired: a target installs an OwnerScope for the duration of its
+// load and of each of its session/execution calls, and blocks acquired before
+// any model exists stay unowned (0). release_owner() hands every block tagged
+// with that owner -- live or parked in the free list -- back to the driver, so
+// call it only when the owner's last session is gone (the C API ties it to the
+// model bundle's last reference). trim() returns every retained block
+// regardless of owner without touching anything live.
 
 namespace sonicboom::planner::device {
 
@@ -107,5 +118,43 @@ Stats stats() noexcept;
 
 // Free every pooled buffer (used at teardown / model reload).
 void clear_all();
+
+// --- Ownership --------------------------------------------------------------
+
+// A new nonzero owner id. Ids are never reused, so a released owner's blocks
+// cannot be confused with a later model's.
+uint64_t create_owner();
+
+// The owner acquire()/acquire_fresh() will tag a block with; 0 means unowned.
+uint64_t current_owner() noexcept;
+
+// Install `owner` as the current owner and return the previous one (the
+// building block behind the RAII scope in <sonicboom/model/plan.h>).
+uint64_t set_current_owner(uint64_t owner) noexcept;
+
+// How many owners have been created and not yet released.
+uint32_t live_owners() noexcept;
+
+// Installs `owner` as the current owner for its lifetime (nesting restores the
+// previous owner). Every model load and every session call that can allocate
+// runs under one.
+class OwnerScope {
+ public:
+  explicit OwnerScope(uint64_t owner) noexcept;
+  ~OwnerScope();
+  OwnerScope(const OwnerScope &) = delete;
+  OwnerScope &operator=(const OwnerScope &) = delete;
+
+ private:
+  uint64_t prev_;
+};
+
+// Return every block tagged with `owner` -- live or in the free list -- to the
+// driver, after synchronizing the device. Invalid (0) is a no-op.
+void release_owner(uint64_t owner);
+
+// Return every retained (free-list) block to the driver now. Live blocks are
+// untouched; a model still using the device simply allocates again on demand.
+void trim();
 
 } // namespace sonicboom::planner::device

@@ -269,6 +269,45 @@ bool resolve_tune_for_model(const Gemma4Model& m);
 // and fails the runtime build. Returns true when the build has no CUDA support.
 bool ensure_device_ready(const Gemma4Model& m);
 
+// --- Device-resource ownership (device_pool.h) ------------------------------
+//
+// The device pool retains a freed block for reuse, which is what makes a
+// second session on the same model cheap and a second, different model OOM.
+// Every model therefore has an owner id; its load and each of its session calls
+// run inside a DeviceOwnerScope, so every block (and cached device weight) they
+// allocate is tagged with that id. release_device_owner() returns everything
+// the owner accumulated to the driver and must run only after its last session
+// is gone. The C API ties it to the model bundle's last reference.
+
+// A fresh, never-reused owner id (0 without CUDA).
+uint64_t device_owner_create();
+
+// Set the thread's current owner and return the previous one.
+uint64_t device_set_current_owner(uint64_t owner) noexcept;
+
+// Installs `owner` for its lifetime; nesting restores the previous owner.
+class DeviceOwnerScope {
+ public:
+  explicit DeviceOwnerScope(uint64_t owner) noexcept
+      : prev_(device_set_current_owner(owner)) {}
+  ~DeviceOwnerScope() { device_set_current_owner(prev_); }
+  DeviceOwnerScope(const DeviceOwnerScope &) = delete;
+  DeviceOwnerScope &operator=(const DeviceOwnerScope &) = delete;
+
+ private:
+  uint64_t prev_;
+};
+
+// Return every pool block and cached device weight tagged with `owner` to the
+// driver (live or retained); when it was the process's last owner, also drop
+// the shared kernel scratch, the resident activation pool and the cuBLAS
+// workspace. Serialized against execution by the core's execution lock.
+void release_device_owner(uint64_t owner);
+
+// Return every retained (free-list) pool block to the driver now. Live blocks
+// are untouched. This is boom_device_trim().
+void device_trim();
+
 // ---------------------------------------------------------------------------
 // Speculative verification (Part B). A draft of k tokens is checked by running
 // the model over the k+1 query positions 0..k at once and taking each row's

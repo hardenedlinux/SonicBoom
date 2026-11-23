@@ -118,4 +118,9 @@ bool moe_experts_dev(const float* x, const int64_t* ids_host,
                      bool group_by_expert, const MoeExpertPool& pool,
                      void* stream = nullptr);
 
+// Drop the MoE kernel scratch buffers (live slots and any retired because a CUDA
+// graph capture had their pointers baked in). A no-op while a capture is live;
+// called when the last model goes away.
+void moe_release_scratch();
+
 } // namespace sonicboom::nn::cuda

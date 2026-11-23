@@ -243,6 +243,16 @@ std::unordered_map<std::string, Loaded>& modules() {
 
 int g_compiles = 0;
 
+// Unload every module and forget its entry. The caller (nn::cuda::clear_scratch)
+// runs only when no capture is live, so no recorded graph holds a function.
+void clear_modules_impl() {
+  std::lock_guard<std::mutex> lock(mu());
+  for (auto& kv : modules()) {
+    if (kv.second.module != nullptr) ::cuModuleUnload(kv.second.module);
+  }
+  modules().clear();
+}
+
 // NVRTC has no default search path. The build bakes in the toolkit it was
 // configured against (FATTN_JIT_CUDA_INCLUDE); the standard locations are
 // probed as well so a library moved to a machine with a differently installed
@@ -488,5 +498,7 @@ int compile_count() {
   std::lock_guard<std::mutex> lock(mu());
   return g_compiles;
 }
+
+void clear_modules() { clear_modules_impl(); }
 
 }  // namespace sonicboom::nn::cuda::fattn_jit

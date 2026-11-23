@@ -106,4 +106,9 @@ std::string cache_path(const Spec& spec);
 // Number of JIT compiles this process performed (cache hits excluded).
 int compile_count();
 
+// Unload every prepared module, returning its code to the driver. The caller
+// must ensure no capture is live: a recorded graph may hold the entry point.
+// A later prepare() reloads from the PTX cache.
+void clear_modules();
+
 }  // namespace sonicboom::nn::cuda::fattn_jit

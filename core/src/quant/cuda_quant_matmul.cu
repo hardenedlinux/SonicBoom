@@ -31,6 +31,7 @@
 #include "../planner/glue_jit.h"  // the generated MMQ1 tensor-core kernel
 #include "../planner/mlir_autotune.h"  // Q1 tile-config cache (opt-in)
 #include "../planner/plan_hook.h"  // BOOM_NOTE_LAUNCH (plan record; no-op when off)
+#include "../planner/device_pool.h"  // owner tag on cached device weights
 
 #include "mmvq_q8_1.cuh"
 #include "mmq.cuh"
@@ -529,6 +530,7 @@ __global__ void gemv_q6_K_coop(const uint8_t* __restrict__ w, const float* __res
 struct DeviceWeight {
   void* ptr = nullptr;
   size_t bytes = 0;
+  uint64_t owner = 0;  // model that first uploaded it (see device_pool.h)
 };
 
 struct CacheKey {
@@ -585,10 +587,16 @@ size_t g_mmq_q8_bytes = 0;
 void* g_rms_inv = nullptr;
 size_t g_rms_inv_bytes = 0;
 
+// Scratch a growth replaced while a capture was live. It cannot be freed then
+// (the recorded graph may keep launching against its pointer) and must not be
+// dropped either: dropping the pointer leaks the block until the process exits.
+// It is parked here and freed by clear_scratch() once no capture is live.
+std::vector<std::pair<void*, size_t>> g_retired_scratch;
+
 // Process-wide cuBLAS handle + stream-capture workspace (C.1). The handle is
 // created lazily and the workspace is set so cublasGemmEx is stream-capturable
-// into the prefill CUDA Graph (B.1). The handle is never destroyed (lives for
-// the process lifetime, like g_cache); the workspace is freed by clear_cache().
+// into the prefill CUDA Graph (B.1). Both live with the process's models: the
+// handle and workspace are destroyed by clear_cache() when the last model goes.
 std::mutex g_cublas_mutex;
 cublasHandle_t g_cublas_handle = nullptr;
 void* g_cublas_workspace = nullptr;
@@ -603,6 +611,7 @@ struct MappedEmbedding {
   void* dev = nullptr;         // device-visible pointer (cudaHostGetDevicePointer)
   const void* host = nullptr;  // the registered host pointer (== W.data().data())
   size_t bytes = 0;
+  uint64_t owner = 0;          // model whose host buffer is pinned
 };
 MappedEmbedding g_ple_mapped;
 
@@ -630,6 +639,10 @@ void* grow_scratch(void*& buf, size_t& have, size_t need) {
     have = old ? old_have : 0;
     return nullptr;
   }
+  // The growth succeeded, so the old buffer is no longer reachable through the
+  // static. Park it for clear_scratch(); when freeing was allowed above it is
+  // already gone.
+  if (old) g_retired_scratch.emplace_back(old, old_have);
   have = need;
   return buf;
 }
@@ -659,7 +672,7 @@ const void* upload_weight(const QuantizedTensor& W) {
     cudaFree(dptr);
     return nullptr;
   }
-  g_cache.emplace(key, DeviceWeight{dptr, bytes});
+  g_cache.emplace(key, DeviceWeight{dptr, bytes, planner::device::current_owner()});
   return dptr;
 }
 
@@ -679,7 +692,7 @@ const void* upload_bytes(const void* host, size_t bytes) {
     cudaFree(dptr);
     return nullptr;
   }
-  g_cache.emplace(key, DeviceWeight{dptr, bytes});
+  g_cache.emplace(key, DeviceWeight{dptr, bytes, planner::device::current_owner()});
   return dptr;
 }
 
@@ -699,6 +712,7 @@ struct TcWeight {
   void* q = nullptr;  // int8 [rows][cols]
   void* s = nullptr;  // f32 [rows][cols/32]
   size_t bytes = 0;
+  uint64_t owner = 0;
 };
 
 std::unordered_map<CacheKey, TcWeight, CacheKeyHash> g_tc_cache;
@@ -744,7 +758,7 @@ TcWeight upload_tc_weight(const QuantizedTensor& W, int rows, int cols) {
     cudaFree(dq);
     return {};
   }
-  TcWeight w{dq, ds, qbytes + sbytes};
+  TcWeight w{dq, ds, qbytes + sbytes, planner::device::current_owner()};
   g_tc_cache.emplace(key, w);
   return w;
 }
@@ -1236,7 +1250,8 @@ bool register_weight_device(const QuantizedTensor& W, const void* dptr) {
   CacheKey key{W.data().data(), W.byte_size()};
   auto it = g_cache.find(key);
   if (it != g_cache.end()) return it->second.ptr == dptr;
-  g_cache.emplace(key, DeviceWeight{const_cast<void*>(dptr), W.byte_size()});
+  g_cache.emplace(key, DeviceWeight{const_cast<void*>(dptr), W.byte_size(),
+                                      planner::device::current_owner()});
   return true;
 }
 
@@ -1277,6 +1292,62 @@ void clear_cache() {
       g_cublas_workspace = nullptr;
     }
   }
+}
+
+void clear_cache_owner(uint64_t owner) {
+  if (owner == 0) return;
+  std::lock_guard<std::mutex> lk(g_cache_mutex);
+  for (auto it = g_cache.begin(); it != g_cache.end();) {
+    if (it->second.owner == owner) {
+      cudaFree(it->second.ptr);
+      it = g_cache.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = g_tc_cache.begin(); it != g_tc_cache.end();) {
+    if (it->second.owner == owner) {
+      cudaFree(it->second.q);  // s is inside the same allocation
+      it = g_tc_cache.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  // The pinned host mapping points into the model's (about to be unmapped)
+  // weight buffer; it must go with that model, not stay for the next one.
+  if (g_ple_mapped.host && g_ple_mapped.owner == owner) {
+    cudaHostUnregister(const_cast<void*>(g_ple_mapped.host));
+    g_ple_mapped = {};
+  }
+}
+
+void clear_scratch() {
+  // A live capture has baked these pointers into its graph; retain them until
+  // no capture exists (the same rule grow_scratch follows).
+  if (!sonicboom::cuda::scratch_may_free()) return;
+  auto drop = [](void*& p, size_t& have) {
+    if (p) cudaFree(p);
+    p = nullptr;
+    have = 0;
+  };
+  drop(g_dx, g_dx_bytes);
+  drop(g_dy, g_dy_bytes);
+  drop(g_q8, g_q8_bytes);
+  drop(g_row, g_row_bytes);
+  drop(g_gather, g_gather_bytes);
+  drop(g_gather_out, g_gather_out_bytes);
+  drop(g_tokens, g_tokens_bytes);
+  drop(g_wf16, g_wf16_bytes);
+  drop(g_xf16, g_xf16_bytes);
+  drop(g_xf16_tail, g_xf16_tail_bytes);
+  drop(g_ytail, g_ytail_bytes);
+  drop(g_mmq_q8, g_mmq_q8_bytes);
+  drop(g_rms_inv, g_rms_inv_bytes);
+  // Scratch a capture forced us to retain while it was live. No capture is
+  // live here (the guard at the top), so it goes now.
+  for (auto& r : g_retired_scratch) cudaFree(r.first);
+  g_retired_scratch.clear();
+  mmq_release_scratch();
 }
 
 // Blocks-per-row threshold above which the cooperative warp-per-row (_coop)
@@ -5703,7 +5774,7 @@ bool gather_f32_mapped_dev(const QuantizedTensor& W, int64_t token, float* out) 
         cudaHostUnregister(h);
         return false;
       }
-      g_ple_mapped = {dev, src, bytes};
+      g_ple_mapped = {dev, src, bytes, planner::device::current_owner()};
     }
     d_w = g_ple_mapped.dev;
   }
@@ -5740,7 +5811,7 @@ bool gather_f32_mapped_dev_row(const QuantizedTensor& W, const float* token_dev,
         cudaHostUnregister(h);
         return false;
       }
-      g_ple_mapped = {dev, src, bytes};
+      g_ple_mapped = {dev, src, bytes, planner::device::current_owner()};
     }
     d_w = g_ple_mapped.dev;
   }
@@ -5812,7 +5883,7 @@ bool gather_f32_mapped_dev_batched(const QuantizedTensor& W,
         cudaHostUnregister(h);
         return false;
       }
-      g_ple_mapped = {dev, src, bytes};
+      g_ple_mapped = {dev, src, bytes, planner::device::current_owner()};
     }
     d_w = g_ple_mapped.dev;
   }
@@ -5873,7 +5944,7 @@ bool gather_f32_mapped_dev_batched_ids(const QuantizedTensor& W,
         cudaHostUnregister(h);
         return false;
       }
-      g_ple_mapped = {dev, src, bytes};
+      g_ple_mapped = {dev, src, bytes, planner::device::current_owner()};
     }
     d_w = g_ple_mapped.dev;
   }
