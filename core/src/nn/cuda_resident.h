@@ -218,6 +218,14 @@ uint64_t attn_decode_plan_chunk(int head_dim, int gqa, int n_heads_q,
                                 uint64_t capacity, bool kv_f16,
                                 bool kv_q8 = false);
 
+// Grow the split-KV merge scratch for a session whose cache reaches `extent`
+// keys (n_ctx). Called once per session at cache allocation, before any graph
+// capture. The scratch is a workspace; its size changes no arithmetic.
+void attn_fdec_reserve_extent(int head_dim, int gqa, int n_heads_q,
+                              int n_heads_kv, uint64_t sliding_window,
+                              uint64_t extent, bool kv_f16,
+                              bool kv_q8 = false);
+
 // Shared memory and resident blocks of one decode-attention instantiation:
 // head-size class, MT m-tiles, `stages` buffered K/V tiles (2 or 3). Used by
 // the occupancy report; returns false when that combination does not exist.

@@ -2555,11 +2555,20 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     }
     case OpKind::Embedding: {
       int64_t nb = 0;
-      // The gathered table's format, per the `slot` the node names. token_embd
-      // (the tied lm_head) is a quantized table; the per-layer table is plain
-      // f32 and so has no quant type to record.
-      if (slot != model::WeightSlot::PerLayerTokenEmbd)
-        note_weight_quant(model_->weights.token_embd);
+      const bool per_layer = slot == model::WeightSlot::PerLayerTokenEmbd;
+      // Gathered from pin+mapped host bytes when nothing else keeps the table
+      // resident: the ~1.5 GiB per-layer table, or an untied token_embd pinned
+      // at device initialization (the logits matvec has its own output table).
+      // A tied token_embd stays resident for the matvec, and a table the host
+      // would not register keeps its device copy, so both use device memory.
+      const bool mapped_embd =
+          per_layer || model_->embd_mapped->load(std::memory_order_acquire);
+      const quant::QuantizedTensor& embd =
+          per_layer ? model_->weights.per_layer_token_embd
+                    : model_->weights.token_embd;
+      // The gathered table's format. token_embd is a quantized table; the
+      // per-layer table is plain f32 and so has no quant type to record.
+      if (!per_layer) note_weight_quant(model_->weights.token_embd);
       int64_t vr = 0;
       if (verify_attr(vr)) {
         // Verify: one gather per query row, ids from the staged device slot.
@@ -2567,42 +2576,32 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         const uint64_t* tokens_dev =
             reinterpret_cast<const uint64_t*>(tokens_buf_.id);
         if (!tokens_dev || vr <= 0) { ok = false; break; }
-        if (slot == model::WeightSlot::PerLayerTokenEmbd)
-          ok = quant::cuda::gather_f32_mapped_dev_batched_ids(
-              model_->weights.per_layer_token_embd, tokens_dev, int(vr), out);
-        else
-          ok = quant::cuda::gather_f32_resident_dev_batched_ids(
-              model_->weights.token_embd, tokens_dev, int(vr), out);
+        ok = mapped_embd
+                 ? quant::cuda::gather_f32_mapped_dev_batched_ids(
+                       embd, tokens_dev, int(vr), out)
+                 : quant::cuda::gather_f32_resident_dev_batched_ids(
+                       embd, tokens_dev, int(vr), out);
       } else if (batch_attr(nb)) {
         // Batched: gather n token rows (prefill), ids read from the persistent
         // device slot tokens_buf_.
         const uint64_t* tokens_dev =
             reinterpret_cast<const uint64_t*>(tokens_buf_.id);
         if (!tokens_dev) { ok = false; break; }
-        if (slot == model::WeightSlot::PerLayerTokenEmbd)
-          ok = quant::cuda::gather_f32_mapped_dev_batched_ids(
-              model_->weights.per_layer_token_embd, tokens_dev, int(nb), out);
-        else
-          ok = quant::cuda::gather_f32_resident_dev_batched_ids(
-              model_->weights.token_embd, tokens_dev, int(nb), out);
+        ok = mapped_embd
+                 ? quant::cuda::gather_f32_mapped_dev_batched_ids(
+                       embd, tokens_dev, int(nb), out)
+                 : quant::cuda::gather_f32_resident_dev_batched_ids(
+                       embd, tokens_dev, int(nb), out);
       } else {
         // Token embedding gather on the device: dequantize the token's row of
-        // token_embd (Q3_K) / per_layer_token_embd (Q4_K) straight to device
-        // f32. The token id is read from the persistent device buffer
-        // `token_buf_` (Phase 3.2 B4), not the host graph input, so the next
-        // token id never round-trips through the host.
+        // token_embd / per_layer_token_embd straight to device f32. The token
+        // id is read from the persistent device buffer `token_buf_` (Phase 3.2
+        // B4), not the host graph input, so the next token id never
+        // round-trips through the host.
         const float* tok_dev = dev_mut(token_in_slot());
-        if (slot == model::WeightSlot::PerLayerTokenEmbd) {
-          // ~1.5 GiB tensor that does not fit resident: pin+map it in place and
-          // gather the token's row zero-copy (no per-token H2D).
-          ok = quant::cuda::gather_f32_mapped_dev_row(
-              model_->weights.per_layer_token_embd, tok_dev, out);
-        } else {
-          // token_embd is the tied lm_head, already resident (the logits matvec
-          // uploads it once): gather straight from the device weight, no H2D.
-          ok = quant::cuda::gather_f32_resident_dev_row(model_->weights.token_embd,
-                                                        tok_dev, out);
-        }
+        ok = mapped_embd
+                 ? quant::cuda::gather_f32_mapped_dev_row(embd, tok_dev, out)
+                 : quant::cuda::gather_f32_resident_dev_row(embd, tok_dev, out);
       }
       break;
     }

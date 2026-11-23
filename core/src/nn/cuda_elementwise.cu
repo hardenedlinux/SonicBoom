@@ -4498,6 +4498,26 @@ uint64_t attn_decode_requested_chunk(uint64_t chunk_attr, int n_heads_kv,
 // written too, so a class measured once is not measured again.
 constexpr int kFdecMaxRows = 64;  // the verify row cap the scratch covers
 constexpr uint64_t kFdecMinChunk = 32;  // smallest candidate chunk size
+// The causal key extent the model-load reserve covers. A session whose cache
+// reaches further grows the scratch in attn_fdec_reserve_extent, at session
+// allocation, before any graph capture.
+constexpr uint64_t kFdecDefaultExtent = 4096;
+// The split-KV merge scratch of a class: its widest launch is the smallest
+// candidate chunk (the largest chunk count) at kFdecMaxRows rows, and those
+// rows extend the covered keys past the extent by at most their count. A
+// windowed class saturates at its window; `causal_extent` is ignored there.
+static size_t fdec_scratch_bytes(int head_dim, int n_heads_q,
+                                 uint64_t sliding_window,
+                                 uint64_t causal_extent) {
+  uint64_t cover = sliding_window > 0 ? sliding_window : causal_extent;
+  if (cover == 0) cover = 16384;
+  cover += uint64_t(kFdecMaxRows);
+  const uint64_t n_chunks = (cover - 1) / kFdecMinChunk + 2 +
+                            (uint64_t(kFdecMaxRows - 1) + kFdecMinChunk - 1) /
+                                kFdecMinChunk;
+  return size_t(kFdecMaxRows) * size_t(n_chunks) * size_t(n_heads_q) *
+         size_t(head_dim + 2) * sizeof(float);
+}
 
 struct FdecPick {
   bool fdec = false;
@@ -4931,19 +4951,12 @@ void attn_fdec_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
   // window is the class's reachable extent (a windowed layer saturates at its
   // window).
   const auto reserve_fdec_scratch = [&] {
-    // The warm-up measures a causal class up to the 16384-key extent; a
-    // windowed class saturates at its window. A verify step's rows extend the
-    // launch past that extent by at most its row count.
-    uint64_t cover = sliding_window > 0
-                         ? sliding_window
-                         : std::min<uint64_t>(capacity, 16384);
-    if (cover == 0) cover = 16384;
-    cover += uint64_t(kFdecMaxRows);
-    const uint64_t n_chunks = (cover - 1) / kFdecMinChunk + 2 +
-                              (uint64_t(kFdecMaxRows - 1) + kFdecMinChunk - 1) /
-                                  kFdecMinChunk;
-    const size_t need = size_t(kFdecMaxRows) * size_t(n_chunks) *
-                        size_t(n_heads_q) * size_t(head_dim + 2) * sizeof(float);
+    // The load-time reserve covers the default causal extent (a windowed class
+    // saturates at its window); a session with a larger cache grows it in
+    // attn_fdec_reserve_extent before any graph is captured.
+    const size_t need = fdec_scratch_bytes(
+        head_dim, n_heads_q, sliding_window,
+        std::min<uint64_t>(capacity, kFdecDefaultExtent));
     (void)grow_scratch(g_attn_partial_mq, g_attn_partial_mq_bytes, need);
   };
 
@@ -5833,6 +5846,27 @@ uint64_t attn_decode_plan_chunk(int head_dim, int gqa, int n_heads_q,
   attn_fdec_resolve(head_dim, gqa, n_heads_q, n_heads_kv, sliding_window,
                     capacity, kv_f16, kv_q8, chunk);
   return chunk;
+}
+
+// Grow the split-KV merge scratch for a session whose cache reaches `extent`
+// keys (n_ctx). Called once per session, at cache allocation, so a capture
+// never allocates: the model-load reserve covers only the default extent. The
+// scratch is a workspace; its size changes no arithmetic.
+void attn_fdec_reserve_extent(int head_dim, int gqa, int n_heads_q,
+                              int n_heads_kv, uint64_t sliding_window,
+                              uint64_t extent, bool kv_f16, bool kv_q8) {
+  if (extent == 0 || !available() || !kv_f16 || kv_q8) return;
+  if (n_heads_q != gqa * n_heads_kv) return;
+  if (!fdec_shape_supported(head_dim, gqa)) return;
+  if (!runtime::feature_enabled(runtime::Feature::SplitKv)) return;
+  if (attn_exp2_enabled()) return;
+  int part = 0;
+  const std::string key = attn_decode_class_key(
+      head_dim, gqa, n_heads_q, n_heads_kv, sliding_window, true, false);
+  if (!fdec_selected(key, head_dim, gqa, kv_f16, kv_q8, &part)) return;
+  const size_t need = fdec_scratch_bytes(head_dim, n_heads_q, sliding_window,
+                                         std::min<uint64_t>(extent, 16384));
+  (void)grow_scratch(g_attn_partial_mq, g_attn_partial_mq_bytes, need);
 }
 
 bool attn_launch_codegen(const compiler::AttentionShape &shape,

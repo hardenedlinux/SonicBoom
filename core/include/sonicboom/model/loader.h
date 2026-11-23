@@ -50,6 +50,13 @@ struct Gemma4Model {
   // initializes the device in the child.
   std::shared_ptr<std::atomic<bool>> device_ready =
       std::make_shared<std::atomic<bool>>(false);
+  // True when token_embd was pinned as a mapped host table at device
+  // initialization, so the embedding gather reads it zero-copy instead of
+  // keeping a device copy. Only an untied embedding (the logits matvec uses
+  // `output`) is pinned; a table backed by a file mapping cannot be registered
+  // and stays on the resident path.
+  std::shared_ptr<std::atomic<bool>> embd_mapped =
+      std::make_shared<std::atomic<bool>>(false);
 };
 
 // Load and validate `r` as a Gemma 4 E4B model. Returns an error string when

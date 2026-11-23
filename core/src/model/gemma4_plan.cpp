@@ -4576,6 +4576,29 @@ bool kv_session_allocate(const Gemma4Model& m, planner::KvCacheSession& session,
   session.cache_id = planner::next_kv_cache_id();
   session.n_ctx = n_ctx;
   session.filled_tokens.clear();
+  // Reserve the split-KV merge scratch for this session's reachable extent,
+  // before any graph is captured: the model-load reserve covers the default
+  // extent, and a larger session grows the workspace here rather than every
+  // model paying the largest extent up front.
+  {
+    const bool kv_f16 = numerics_kv_storage() == KvStorage::F16;
+    const bool kv_q8 = numerics_kv_storage() == KvStorage::Q8;
+    std::vector<std::array<uint64_t, 4>> seen;
+    for (uint32_t l = 0; l < m.config.block_count; ++l) {
+      const LayerConfig& lc = m.config.layer_config(l);
+      const int n_q = int(lc.n_heads_q);
+      const int n_kv = int(lc.n_heads_kv);
+      if (n_kv <= 0 || n_q <= 0) continue;
+      const std::array<uint64_t, 4> cls{uint64_t(lc.head_dim),
+                                        uint64_t(n_q / n_kv), uint64_t(n_q),
+                                        lc.sliding_window != 0 ? 1u : 0u};
+      if (std::find(seen.begin(), seen.end(), cls) != seen.end()) continue;
+      seen.push_back(cls);
+      nn::cuda::attn_fdec_reserve_extent(int(lc.head_dim), n_q / n_kv, n_q,
+                                         n_kv, lc.sliding_window, n_ctx,
+                                         kv_f16, kv_q8);
+    }
+  }
   // Release the runtimes bound to this set when the set's last owner goes,
   // even if the caller never calls release_session_runtimes (see
   // SessionRuntimeOwner). Assigned after `caches`, so it is destroyed first.
@@ -5299,6 +5322,14 @@ bool resolve_tune_for_model(const Gemma4Model& m) {
   warm_verify_gemv_wp_model(m);
   warm_mmq_decode_model(m);
   warm_decode_attn_model(m);
+  // An untied token_embd is gathered through the zero-copy mapped path (the
+  // logits matvec keeps its own output table resident). Pin it now: the
+  // registration is not capturable, and a decode step that first gathers the
+  // table inside a captured graph would otherwise fail. A table the host will
+  // not register (a file-backed mapping) keeps the resident path.
+  if (m.weights.output.valid() && !m.weights.per_layer_token_embd.valid())
+    m.embd_mapped->store(quant::cuda::pin_mapped_weight(m.weights.token_embd),
+                         std::memory_order_release);
   tune::seal();
   if (tune::sealed_missed()) {
     std::cerr << "[tune] BUG unresolved key=" << tune::sealed_miss_key()
