@@ -43,5 +43,7 @@
      ("pytorch" "Coming from PyTorch"))
     ("Benchmarks"
      ("benchmark" "Benchmarks"))
+    ("Models"
+     ("models" "Models tested"))
     ("Project"
      ("roadmap" "Roadmap"))))
