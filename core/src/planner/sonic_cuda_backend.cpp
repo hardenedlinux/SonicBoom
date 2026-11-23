@@ -330,6 +330,11 @@ void SonicCudaBackend::init_staging() {
         moe_prefetch_k_ = uint32_t(v);
     }
   }
+  // Round 17 E: compute pool misses on the host instead of uploading them.
+  if (const char* env = std::getenv("SONICBOOM_MOE_CPU_MISSES");
+      env && *env && std::strcmp(env, "0") != 0 &&
+      std::strcmp(env, "off") != 0)
+    moe_cpu_misses_ = true;
   // Persistent current-token slot; sized for the verify step's widest row set
   // (k+1 <= kMaxVerifyRows) so one Argmax node's row indices land contiguously
   // for a single D2H read. Decode reads element 0 only.
@@ -477,6 +482,7 @@ SonicCudaBackend::~SonicCudaBackend() {
   if (pred_norm_) g_alloc.deallocate(pred_norm_);
   if (pred_ids_) g_alloc.deallocate(pred_ids_);
   if (pred_w_) g_alloc.deallocate(pred_w_);
+  if (cpu_partial_) g_alloc.deallocate(cpu_partial_);
   if (sample_host_) cudaFreeHost(sample_host_);
 }
 
@@ -3001,6 +3007,17 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         ok = false;
         break;
       }
+      // SONICBOOM_MOE_CPU_MISSES applies to decode only (verify and prefill
+      // keep uploading every miss). The partial-sum buffer is allocated before
+      // select() runs: if it cannot be, the node falls back to uploading, so
+      // the selection buffer is never asked to carry a -1 the host will not
+      // fill in.
+      bool cpu_path = moe_cpu_misses_ && !prefill && !verify && rows == 1 &&
+                      !sonicboom::cuda::boom_capturing();
+      if (cpu_path && !cpu_partial_) {
+        cpu_partial_ = g_alloc.allocate(dim * sizeof(float));
+        if (!cpu_partial_) cpu_path = false;
+      }
       std::vector<int64_t> ids(rows * k);
       if (!device::download(in[1].device.handle, ids.data(), ib)) {
         ok = false;
@@ -3049,9 +3066,30 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       std::expected<void, std::string> selected;
       {
         ExpertStageTimer select_timer(ExpertStageTimer::kSelect);
-        selected = (*pool)->select(weight_layer, ids);
+        selected = (*pool)->select(weight_layer, ids, !cpu_path);
       }
       if (!selected) return std::unexpected(fail(selected.error()));
+      // The selection entries the pool left to the host (slot -1). They are in
+      // ascending expert order, as the route wrote the ids.
+      std::vector<uint32_t> cpu_miss;
+      if (cpu_path)
+        for (uint64_t j = 0; j < k; ++j)
+          if ((*pool)->selection_host()[j] < 0) cpu_miss.push_back(uint32_t(j));
+      if (!cpu_miss.empty()) {
+        // Read back what the host computation needs while the stream is still
+        // idle at this node (the ids download above already ordered it), then
+        // launch the device kernel and compute the misses while it runs.
+        cpu_x_.resize(size_t(dim));
+        cpu_w_.resize(size_t(k));
+        cpu_y_.assign(size_t(dim), 0.0f);
+        if (!device::download(in[0].device.handle, cpu_x_.data(),
+                              dim * sizeof(float)) ||
+            !device::download(in[2].device.handle, cpu_w_.data(),
+                              k * sizeof(float))) {
+          ok = false;
+          break;
+        }
+      }
       const nn::cuda::MoeExpertPool pooled{
           (*pool)->data(ExpertPool::kGate), (*pool)->data(ExpertPool::kUp),
           (*pool)->data(ExpertPool::kDown),
@@ -3070,6 +3108,33 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             static_cast<const int32_t*>((*pool)->selection()),
             (*pool)->selection_host(), views, act, dev_mut(out_handle), rows, k,
             dim, prefill, pooled, nullptr);
+      }
+      if (ok && !cpu_miss.empty()) {
+        // The device kernel left a zero for every host entry, so the host sum
+        // is their whole contribution. It runs here, after the launch: the
+        // device kernel is already in flight on the stream.
+        std::vector<quant::QuantizedTensor> mg(cpu_miss.size());
+        std::vector<quant::QuantizedTensor> mu(cpu_miss.size());
+        std::vector<quant::QuantizedTensor> md(cpu_miss.size());
+        std::vector<int64_t> mids(cpu_miss.size());
+        std::vector<float> mw(cpu_miss.size());
+        for (size_t m = 0; m < cpu_miss.size(); ++m) {
+          const uint64_t e = uint64_t(ids[cpu_miss[m]]);
+          mg[m] = views.gate[e];
+          mu[m] = views.up[e];
+          md[m] = views.down[e];
+          mids[m] = int64_t(m);
+          mw[m] = cpu_w_[size_t(cpu_miss[m])];
+        }
+        const nn::MoeExpertWeights sub{
+            std::span<const quant::QuantizedTensor>(mg.data(), mg.size()),
+            std::span<const quant::QuantizedTensor>(mu.data(), mu.size()),
+            std::span<const quant::QuantizedTensor>(md.data(), md.size())};
+        std::fill(cpu_y_.begin(), cpu_y_.end(), 0.0f);
+        ok = nn::moe_experts(cpu_x_, mids, mw, sub, act, cpu_y_) &&
+             device::upload(cpu_y_.data(), cpu_partial_.id,
+                            dim * sizeof(float)) &&
+             nn::cuda::add_dev(dev_mut(cpu_partial_.id), out, out, int(dim));
       }
       break;
     }

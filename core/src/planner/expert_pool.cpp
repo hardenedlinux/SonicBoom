@@ -180,6 +180,9 @@ void print_stats_at_exit() {
                static_cast<unsigned long long>(s.hits),
                static_cast<unsigned long long>(s.misses),
                static_cast<unsigned long long>(s.bytes));
+  if (s.cpu_misses != 0)
+    std::fprintf(stderr, "expert cpu misses: %llu entries (no bytes moved)\n",
+                 static_cast<unsigned long long>(s.cpu_misses));
   if (s.prefetch_nodes != 0 || s.prefetch_uploads != 0)
     std::fprintf(stderr,
                  "expert prefetch: calls=%llu uploads=%llu bytes=%llu "
@@ -389,7 +392,7 @@ std::expected<std::unique_ptr<ExpertPool>, std::string> ExpertPool::create(
 }
 
 std::expected<void, std::string> ExpertPool::select(
-    uint32_t block, std::span<const int64_t> ids) {
+    uint32_t block, std::span<const int64_t> ids, bool upload_misses) {
   std::lock_guard<std::mutex> lk(mutex_);
   const BlockInfo& info = block < blocks_.size() ? blocks_[block] : BlockInfo{};
   if (info.experts == 0)
@@ -475,13 +478,32 @@ std::expected<void, std::string> ExpertPool::select(
         ++stats_.prefetch_hits;
       }
     } else {
-      const int32_t victim = victim_for(needed);
-      if (victim < 0)
-        return std::unexpected(
-            "expert pool: every slot is needed by one node");
-      if (owner_[victim] >= 0) {
-        slot_of_[owner_[victim]] = -1;
-        note_evicted(owner_[victim]);
+      int32_t victim = -1;
+      if (upload_misses) {
+        victim = victim_for(needed);
+        if (victim < 0)
+          return std::unexpected(
+              "expert pool: every slot is needed by one node");
+        if (owner_[victim] >= 0) {
+          slot_of_[owner_[victim]] = -1;
+          note_evicted(owner_[victim]);
+        }
+      } else {
+        // SONICBOOM_MOE_CPU_MISSES: fill an empty slot if there is one; a full
+        // pool leaves the key to the host. Never evicts, so the pool's
+        // contents stop changing once it is full.
+        for (uint64_t s = 0; s < n_slots_; ++s) {
+          if (owner_[s] < 0) {
+            victim = int32_t(s);
+            break;
+          }
+        }
+        if (victim < 0) {
+          sel_host_[j] = -1;
+          ++stats_.misses;
+          ++stats_.cpu_misses;
+          continue;
+        }
       }
 
       const quant::QuantizedTensor* role_tensors[3] = {gate_of_[key],
@@ -516,9 +538,12 @@ std::expected<void, std::string> ExpertPool::select(
     sel_host_[j] = slot;
   }
 
-  // Stamp every slot this node uses, once, and count the use of its key.
+  // Stamp every slot this node uses, once, and count the use of its key. A key
+  // the host computes has no slot and left the pool unchanged.
   for (int64_t key : needed) {
-    stamp_[size_t(slot_of_[key])] = node;
+    const int32_t s = slot_of_[size_t(key)];
+    if (s < 0) continue;
+    stamp_[size_t(s)] = node;
     ++uses_[size_t(key)];
   }
 

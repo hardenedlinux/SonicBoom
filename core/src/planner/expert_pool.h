@@ -86,6 +86,10 @@ class ExpertPool {
     uint64_t prefetch_bytes = 0;
     uint64_t prefetch_hits = 0;
     uint64_t prefetch_waste = 0;
+    // Selection entries left to the host because no slot could hold them
+    // (SONICBOOM_MOE_CPU_MISSES); they are misses and are also counted in
+    // `misses`, but they moved no bytes.
+    uint64_t cpu_misses = 0;
   };
 
   // Size the pool from `weights` and allocate its three device arrays.
@@ -117,8 +121,16 @@ class ExpertPool {
   // weights' blocks; `ids` is the node's rows*used selected experts in node
   // order. Thread-safe and deterministic: counts are per key, halved every
   // kAgePeriod nodes, and ties fall back to the stamp, then the lowest slot.
+  //
+  // With `upload_misses` false (SONICBOOM_MOE_CPU_MISSES) a key that has no
+  // empty slot is not uploaded and not evicted for: its selection entry is -1
+  // and the caller computes that expert on the host. Empty slots are still
+  // filled, so the pool warms up the way it would with uploads on, and
+  // residency stays a function of the routing history. No slot is ever taken
+  // from a key this way, so the pool's contents never change once it is full.
   std::expected<void, std::string> select(uint32_t block,
-                                          std::span<const int64_t> ids);
+                                          std::span<const int64_t> ids,
+                                          bool upload_misses = true);
 
   // Upload the predicted experts `ids` of `block` ahead of its selection node
   // (SONICBOOM_MOE_PREFETCH). The copies travel on a second staging pipeline

@@ -460,6 +460,18 @@ private:
   // makes it a no-op.
   void prefetch_after_residual(std::string_view name, uint64_t x, uint64_t bytes);
 
+  // Round 17 E: host-computed pool misses (SONICBOOM_MOE_CPU_MISSES). With the
+  // setting on, a decode node's miss that finds no empty pool slot is not
+  // uploaded; the device kernel leaves a zero for it and the host computes it
+  // from the downloaded activation, adding the result to the node's output.
+  // Opt-in: the host path quantizes the activation q8_K where the device path
+  // uses q8_1, so an output is not bit-identical to an all-device run.
+  bool moe_cpu_misses_ = false;
+  hal::Buffer cpu_partial_;    // [embedding_length] floats: missed experts' sum
+  std::vector<float> cpu_x_;   // host copy of the node's one-row activation
+  std::vector<float> cpu_w_;   // host copy of the node's route weights
+  std::vector<float> cpu_y_;   // host sum of the missed experts
+
   // The device address of the position / token a kernel reads or writes for the
   // current step: the single-step slots outside chunk mode, the step's own ring
   // slot inside it.

@@ -599,6 +599,16 @@ bool moe_experts_dev(const float* x, const int64_t* ids_host,
       for (uint64_t j = 0; j < k; ++j) {
         const uint64_t e = uint64_t(ids_host[r * k + j]);
         const int32_t slot = slots_host[r * k + j];
+        float* out_slice = out + (r * k + j) * d;
+        if (slot < 0) {
+          // SONICBOOM_MOE_CPU_MISSES: the caller computes this expert on the
+          // host. Leave a zero here so the weighted sum contributes nothing
+          // for it; the caller adds the host result to the sum afterwards.
+          if (cudaMemsetAsync(out_slice, 0, d * sizeof(float), s) !=
+              cudaSuccess)
+            return false;
+          continue;
+        }
         const quant::QuantizedTensor& gw = experts.gate[e];
         const quant::QuantizedTensor& uw = experts.up[e];
         const quant::QuantizedTensor& dw = experts.down[e];
@@ -617,7 +627,7 @@ bool moe_experts_dev(const float* x, const int64_t* ids_host,
         if (cudaGetLastError() != cudaSuccess) return false;
         if (!quant::cuda::matvec_f32_dev_device_weight(
                 dw, pooled(pool.down_bytes, pool.down_stride, slot), gate,
-                out + (r * k + j) * d))
+                out_slice))
           return false;
       }
     }
@@ -687,7 +697,10 @@ bool moe_experts_dev(const float* x, const int64_t* ids_host,
     if (!uw.valid() || !dw.valid()) return false;
     const uint64_t ff = gw.dims()[1];
     if (ff == 0 || ff > ff_max) return false;
+    // Prefill uploads every miss: a negative slot here is a caller bug, not a
+    // host-computed expert.
     const int32_t slot = slots_host[kw_of[begin]];
+    if (slot < 0) return false;
     const int n_i = int(n_e);
     moe_gather_kernel<<<moe_grid(int64_t(n_e * d)), 256, 0, s>>>(
         x, d_row + begin, X, int64_t(n_e), int64_t(d));
