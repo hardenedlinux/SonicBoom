@@ -107,6 +107,15 @@ bool stats_enabled() {
   return env && *env && std::strcmp(env, "0") != 0;
 }
 
+// SONICBOOM_MOE_PREFETCH=on gives the pool a second staging pipeline and makes
+// the backend upload predicted experts ahead of their selection node. Off
+// unless set; "off"/"0" is off.
+bool prefetch_on() {
+  const char* env = std::getenv("SONICBOOM_MOE_PREFETCH");
+  if (!env || !*env) return false;
+  return std::strcmp(env, "0") != 0 && std::strcmp(env, "off") != 0;
+}
+
 // The routing trace (SONICBOOM_EXPERT_TRACE=path): one line per selection
 // node, "block entries id...", appended in execution order. An offline
 // simulator replays it; the runtime never reads the file. Off unless set.
@@ -171,6 +180,15 @@ void print_stats_at_exit() {
                static_cast<unsigned long long>(s.hits),
                static_cast<unsigned long long>(s.misses),
                static_cast<unsigned long long>(s.bytes));
+  if (s.prefetch_nodes != 0 || s.prefetch_uploads != 0)
+    std::fprintf(stderr,
+                 "expert prefetch: calls=%llu uploads=%llu bytes=%llu "
+                 "hits=%llu waste=%llu bytes\n",
+                 static_cast<unsigned long long>(s.prefetch_nodes),
+                 static_cast<unsigned long long>(s.prefetch_uploads),
+                 static_cast<unsigned long long>(s.prefetch_bytes),
+                 static_cast<unsigned long long>(s.prefetch_hits),
+                 static_cast<unsigned long long>(s.prefetch_waste));
   std::fprintf(stderr,
                "expert stats: select=%.6f s experts=%.6f s route=%.6f s\n",
                t.select_s, t.experts_s, t.route_s);
@@ -196,8 +214,10 @@ ExpertPool::Stats ExpertPool::stats() const {
 }
 
 ExpertPool::~ExpertPool() {
-  // Drain the copy stream before the arrays go back to the pool: a staged copy
+  // Drain the copy streams before the arrays go back to the pool: a staged copy
   // may still be in flight.
+  if (prefetch_staging_) device::staging_destroy(prefetch_staging_);
+  prefetch_staging_ = nullptr;
   if (staging_) device::staging_destroy(staging_);
   staging_ = nullptr;
   for (uint64_t& h : handles_) {
@@ -299,6 +319,7 @@ std::expected<std::unique_ptr<ExpertPool>, std::string> ExpertPool::create(
   pool->stamp_.assign(pool->n_slots_, 0);
   pool->slot_of_.assign(pool->total_keys_, -1);
   pool->uses_.assign(pool->total_keys_, 0);
+  pool->prefetched_.assign(pool->total_keys_, 0);
   pool->handles_[kGate] = device::acquire(pool->n_slots_ * pool->stride_[kGate]);
   pool->handles_[kUp] = device::acquire(pool->n_slots_ * pool->stride_[kUp]);
   pool->handles_[kDown] =
@@ -335,6 +356,29 @@ std::expected<std::unique_ptr<ExpertPool>, std::string> ExpertPool::create(
     std::fprintf(stderr,
                  "expert pool: pinned staging unavailable, uploads stay "
                  "synchronous\n");
+
+  // The prefetch pipeline (SONICBOOM_MOE_PREFETCH). Sized to hold one block's
+  // predicted set in a single half; its copies run ahead of the selection node
+  // that consumes them.
+  if (prefetch_on()) {
+    uint64_t pf_bytes = 64ull << 20;
+    if (const char* kb_env = std::getenv("SONICBOOM_MOE_PREFETCH_STAGE_KB");
+        kb_env && *kb_env) {
+      char* end = nullptr;
+      const unsigned long long kb = std::strtoull(kb_env, &end, 10);
+      if (end == kb_env || *end != '\0' || kb == 0)
+        return std::unexpected(
+            std::string("expert pool: SONICBOOM_MOE_PREFETCH_STAGE_KB is not a "
+                        "positive size in KiB: ") +
+            kb_env);
+      pf_bytes = uint64_t(kb) * 1024ull;
+    }
+    pool->prefetch_staging_ = device::staging_create(pf_bytes);
+    if (!pool->prefetch_staging_)
+      return std::unexpected(
+          std::string("expert pool: cannot allocate the prefetch staging "
+                      "buffer"));
+  }
 
   if (stats_enabled())
     std::fprintf(stderr, "expert pool: %llu slots x %llu bytes, %llu MiB\n",
@@ -395,6 +439,18 @@ std::expected<void, std::string> ExpertPool::select(
   }
   sel_host_.resize(ids.size());
 
+  // Copies issued ahead (prefetch) must finish before this node's copies touch
+  // the same slot, and a prefetched slot must be complete before the kernel
+  // reads it. Both are stream waits, not host waits: the copies had the block's
+  // other nodes to travel under.
+  if (prefetch_staging_ && prefetch_ready_) {
+    if ((staging_ && !device::staging_chain(staging_, prefetch_staging_)) ||
+        !device::staging_wait(prefetch_staging_))
+      return std::unexpected(
+          "expert pool: cannot order the prefetched copies");
+    prefetch_ready_ = false;
+  }
+
   // The copy stream must not overwrite a slot an earlier node's kernel may
   // still be reading (the synchronous cudaMemcpy this replaces got that for
   // free). One event orders all the copies of this node behind that work.
@@ -412,29 +468,21 @@ std::expected<void, std::string> ExpertPool::select(
     int32_t slot = slot_of_[key];
     if (slot >= 0) {
       ++stats_.hits;
-    } else {
-      // Evict the least-used slot this node does not need; a tie goes to the
-      // older stamp, then the lowest slot index. An empty slot has no key, so
-      // it counts as unused and is taken first.
-      int32_t victim = -1;
-      uint64_t victim_use = 0, victim_stamp = 0;
-      for (uint64_t s = 0; s < n_slots_; ++s) {
-        if (owner_[s] >= 0 &&
-            std::find(needed.begin(), needed.end(), owner_[s]) != needed.end())
-          continue;
-        const uint64_t use =
-            owner_[s] >= 0 ? uses_[size_t(owner_[s])] : uint64_t{0};
-        if (victim < 0 || use < victim_use ||
-            (use == victim_use && stamp_[s] < victim_stamp)) {
-          victim = int32_t(s);
-          victim_use = use;
-          victim_stamp = stamp_[s];
-        }
+      // A slot this select found because prefetch() brought it in: count it
+      // once, as used.
+      if (prefetched_[size_t(key)] != 0) {
+        prefetched_[size_t(key)] = 0;
+        ++stats_.prefetch_hits;
       }
+    } else {
+      const int32_t victim = victim_for(needed);
       if (victim < 0)
         return std::unexpected(
             "expert pool: every slot is needed by one node");
-      if (owner_[victim] >= 0) slot_of_[owner_[victim]] = -1;
+      if (owner_[victim] >= 0) {
+        slot_of_[owner_[victim]] = -1;
+        note_evicted(owner_[victim]);
+      }
 
       const quant::QuantizedTensor* role_tensors[3] = {gate_of_[key],
                                                        up_of_[key],
@@ -484,12 +532,136 @@ std::expected<void, std::string> ExpertPool::select(
   return {};
 }
 
+int32_t ExpertPool::victim_for(const std::vector<int64_t>& needed) const {
+  // Evict the least-used slot this node does not need; a tie goes to the older
+  // stamp, then the lowest slot index. An empty slot has no key, so it counts
+  // as unused and is taken first.
+  int32_t victim = -1;
+  uint64_t victim_use = 0, victim_stamp = 0;
+  for (uint64_t s = 0; s < n_slots_; ++s) {
+    if (owner_[s] >= 0 &&
+        std::find(needed.begin(), needed.end(), owner_[s]) != needed.end())
+      continue;
+    const uint64_t use =
+        owner_[s] >= 0 ? uses_[size_t(owner_[s])] : uint64_t{0};
+    if (victim < 0 || use < victim_use ||
+        (use == victim_use && stamp_[s] < victim_stamp)) {
+      victim = int32_t(s);
+      victim_use = use;
+      victim_stamp = stamp_[s];
+    }
+  }
+  return victim;
+}
+
+void ExpertPool::note_evicted(int64_t key) {
+  if (prefetched_[size_t(key)] == 0) return;
+  prefetched_[size_t(key)] = 0;
+  stats_.prefetch_waste += gate_of_[size_t(key)]->byte_size() +
+                           up_of_[size_t(key)]->byte_size() +
+                           down_of_[size_t(key)]->byte_size();
+}
+
+std::expected<void, std::string> ExpertPool::prefetch(
+    uint32_t block, std::span<const int64_t> ids) {
+  std::lock_guard<std::mutex> lk(mutex_);
+  if (!prefetch_staging_ || ids.empty()) return {};
+  const BlockInfo& info = block < blocks_.size() ? blocks_[block] : BlockInfo{};
+  if (info.experts == 0) return {};
+
+  // The distinct predicted keys, in rank order; the needed set protects an
+  // earlier admission of this call from a later one.
+  std::vector<int64_t> needed;
+  needed.reserve(ids.size());
+  for (int64_t id : ids) {
+    if (id < 0 || uint64_t(id) >= info.experts) continue;
+    const int64_t key = int64_t(info.key_base) + id;
+    if (std::find(needed.begin(), needed.end(), key) == needed.end())
+      needed.push_back(key);
+  }
+  if (needed.empty()) return {};
+
+  std::vector<int64_t> todo;
+  todo.reserve(needed.size());
+  for (int64_t key : needed)
+    if (slot_of_[size_t(key)] < 0) todo.push_back(key);
+  if (todo.empty()) return {};
+  ++stats_.prefetch_nodes;
+
+  // The copies wait for everything already launched on the compute stream, so
+  // a slot this block's kernel still reads is not overwritten under it, and
+  // run on the prefetch pipeline so nothing waits for them here.
+  if (!device::staging_begin(prefetch_staging_)) {
+    prefetch_ready_ = false;
+    return std::unexpected(
+        "expert pool: cannot start the prefetch pipeline");
+  }
+
+  auto fail = [this](const char* msg) -> std::expected<void, std::string> {
+    // A partial copy leaves slot contents unknown. Forget every residency (the
+    // arrays are fully rewritten by the next select), so a failed prefetch can
+    // never turn a later hit into a stale read. The next select misses and
+    // uploads everything, which is slower but identical. The copies already
+    // queued are fenced first, so that select's copies and kernel are ordered
+    // after them rather than racing them.
+    std::fill(owner_.begin(), owner_.end(), -1);
+    std::fill(slot_of_.begin(), slot_of_.end(), -1);
+    std::fill(prefetched_.begin(), prefetched_.end(), 0);
+    prefetch_ready_ = device::staging_fence(prefetch_staging_);
+    return std::unexpected(std::string("expert pool: ") + msg);
+  };
+
+  for (int64_t key : todo) {
+    const int32_t slot = victim_for(needed);
+    if (slot < 0) break;  // every slot holds a predicted expert: nothing to gain
+    if (owner_[slot] >= 0) {
+      slot_of_[size_t(owner_[slot])] = -1;
+      note_evicted(owner_[slot]);
+    }
+    const quant::QuantizedTensor* role_tensors[3] = {gate_of_[size_t(key)],
+                                                     up_of_[size_t(key)],
+                                                     down_of_[size_t(key)]};
+    for (uint32_t role = 0; role < 3; ++role) {
+      const quant::QuantizedTensor& t = *role_tensors[role];
+      const uint64_t bytes = t.byte_size();
+      const uint64_t base = handles_[role] + uint64_t(slot) * stride_[role];
+      if (!device::staging_upload(prefetch_staging_, t.data().data(), base,
+                                  bytes))
+        return fail("cannot copy a predicted expert to the device");
+      const uint64_t tail = stride_[role] - bytes;
+      if (tail > 0) {
+        static const std::byte zeros[kSlotAlignment] = {};
+        if (!device::staging_upload(prefetch_staging_, zeros, base + bytes,
+                                    tail))
+          return fail("cannot zero a slot's read-ahead tail");
+      }
+      stats_.prefetch_bytes += bytes;
+      stats_.bytes += bytes;
+    }
+    owner_[slot] = key;
+    slot_of_[size_t(key)] = slot;
+    stamp_[slot] = stats_.nodes;
+    prefetched_[size_t(key)] = 1;
+    ++stats_.prefetch_uploads;
+  }
+
+  // Record the batch's completion on the copy stream; select() waits for it.
+  if (!device::staging_fence(prefetch_staging_)) {
+    prefetch_ready_ = false;
+    return fail("cannot fence the prefetched copies");
+  }
+  prefetch_ready_ = true;
+  return {};
+}
+
 void ExpertPool::clear() {
   std::lock_guard<std::mutex> lk(mutex_);
   std::fill(owner_.begin(), owner_.end(), -1);
   std::fill(stamp_.begin(), stamp_.end(), 0);
   std::fill(slot_of_.begin(), slot_of_.end(), -1);
   std::fill(uses_.begin(), uses_.end(), 0);
+  std::fill(prefetched_.begin(), prefetched_.end(), 0);
+  prefetch_ready_ = false;
   stats_ = Stats{};
 }
 

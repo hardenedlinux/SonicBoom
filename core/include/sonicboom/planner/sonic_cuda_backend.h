@@ -44,6 +44,7 @@
 #include <map>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace sonicboom::planner {
@@ -440,6 +441,24 @@ private:
     nn::MoeExpertWeights weights{};
   };
   std::map<uint32_t, MoeLayerViews> moe_views_;
+
+  // Round 17 D: predicted-expert prefetch (SONICBOOM_MOE_PREFETCH). At a decode
+  // block's output residual the next block's router runs on the device over the
+  // normalized residual; the ids come back and the pool starts uploading the
+  // absent ones under the block's remaining nodes. pred_norm_/pred_ids_/
+  // pred_w_ are the device scratch the prediction uses, allocated on its first
+  // call. A prediction failure disables the feature for the rest of the run.
+  bool moe_prefetch_ = false;
+  uint32_t moe_prefetch_k_ = 8;
+  hal::Buffer pred_norm_;   // [embedding_length] floats
+  hal::Buffer pred_ids_;    // [moe_prefetch_k_] int64
+  hal::Buffer pred_w_;      // [moe_prefetch_k_] floats (route's weight result)
+  std::vector<int64_t> pred_host_;
+  // Predict block L+1's experts from block L's residual `x` (the first output
+  // of the residual node) and start uploading them. Advisory: a block that is
+  // dense, a name that is not a block residual, or a non-decode row count
+  // makes it a no-op.
+  void prefetch_after_residual(std::string_view name, uint64_t x, uint64_t bytes);
 
   // The device address of the position / token a kernel reads or writes for the
   // current step: the single-step slots outside chunk mode, the step's own ring

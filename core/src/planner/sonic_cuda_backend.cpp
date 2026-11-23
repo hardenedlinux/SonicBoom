@@ -316,6 +316,20 @@ void SonicCudaBackend::bind_segment_extent(uint64_t extent) {
 
 void SonicCudaBackend::init_staging() {
   dump_ = NodeDump::create();
+  // Round 17 D: predicted-expert prefetch. The pool's prefetch pipeline exists
+  // only when the same setting is on (expert_pool.cpp reads it again); the
+  // backend side decides when a prediction runs and what k it takes.
+  if (const char* env = std::getenv("SONICBOOM_MOE_PREFETCH");
+      env && *env && std::strcmp(env, "0") != 0 &&
+      std::strcmp(env, "off") != 0) {
+    moe_prefetch_ = true;
+    if (const char* k = std::getenv("SONICBOOM_MOE_PREFETCH_K"); k && *k) {
+      char* end = nullptr;
+      const unsigned long v = std::strtoul(k, &end, 10);
+      if (end != k && *end == '\0' && v > 0 && v <= 4096)
+        moe_prefetch_k_ = uint32_t(v);
+    }
+  }
   // Persistent current-token slot; sized for the verify step's widest row set
   // (k+1 <= kMaxVerifyRows) so one Argmax node's row indices land contiguously
   // for a single D2H read. Decode reads element 0 only.
@@ -332,6 +346,78 @@ void SonicCudaBackend::init_staging() {
     tokens_buf_ = g_alloc.allocate(chunk * sizeof(uint64_t));
   if (pos_buf_)
     g_alloc.fill(pos_buf_, 0, kMaxVerifyRows * sizeof(uint64_t));  // defensive: pos starts at 0
+}
+
+void SonicCudaBackend::prefetch_after_residual(std::string_view name,
+                                               uint64_t x, uint64_t bytes) {
+  if (!model_) return;
+  const uint32_t d = model_->config.embedding_length;
+  if (bytes != uint64_t(d) * sizeof(float)) return;  // decode rows only
+  // The emitter's block residual is "x2<N>" (the standard decoder block) or
+  // "x3<N>" (a per-layer gate adds its projection after it, Gemma 4).
+  if (name.size() < 3 || name[0] != 'x' || (name[1] != '2' && name[1] != '3'))
+    return;
+  uint32_t block = 0;
+  for (char c : name.substr(2)) {
+    if (c < '0' || c > '9') return;
+    block = block * 10 + uint32_t(c - '0');
+  }
+  const auto& blocks = model_->weights.blocks;
+  if (block + 1 >= blocks.size()) return;
+  const model::BlockWeights& next = blocks[block + 1];
+  if (next.expert_gate.empty()) return;
+  const uint32_t experts = uint32_t(next.expert_gate.size());
+  const uint32_t k = std::min(moe_prefetch_k_, experts);
+
+  // The pool owns the prefetch pipeline; without it (off, or its creation
+  // failed) there is nothing to feed, and the prediction readback would be
+  // pure cost.
+  auto pool = expert_pool_for(model_->weights);
+  if (!pool || !(*pool)->prefetch_enabled()) {
+    moe_prefetch_ = false;
+    return;
+  }
+
+  if (!pred_norm_) {
+    pred_norm_ = g_alloc.allocate(uint64_t(d) * sizeof(float));
+    pred_ids_ = g_alloc.allocate(uint64_t(k) * sizeof(int64_t));
+    pred_w_ = g_alloc.allocate(uint64_t(k) * sizeof(float));
+    if (!pred_norm_ || !pred_ids_ || !pred_w_) {
+      if (pred_norm_) g_alloc.deallocate(pred_norm_);
+      if (pred_ids_) g_alloc.deallocate(pred_ids_);
+      if (pred_w_) g_alloc.deallocate(pred_w_);
+      pred_norm_ = {};
+      pred_ids_ = {};
+      pred_w_ = {};
+      moe_prefetch_ = false;
+      return;
+    }
+    pred_host_.resize(k);
+  }
+
+  // Block L+1's router sees rms_norm(h_L, ffn_norm_{L+1}); then the device
+  // route writes the top-k ids, which are what the pool should upload. The
+  // arithmetic is the route node's own, so the prediction follows the same
+  // ties and selection order.
+  const quant::QuantizedTensor& router = next.expert_router;
+  const quant::QuantizedTensor* router_q = router.valid() ? &router : nullptr;
+  if (!router_q && next.expert_router_f32.empty()) return;
+  if (!nn::cuda::rms_norm_dev(next.ffn_norm, dev_mut(x),
+                              model_->config.rms_epsilon, dev_mut(pred_norm_.id),
+                              int(d)))
+    return;
+  if (!nn::cuda::moe_route_dev(dev_mut(pred_norm_.id), router_q,
+                               next.expert_router_f32, experts, k, 1.0f,
+                               reinterpret_cast<int64_t*>(pred_ids_.id),
+                               reinterpret_cast<float*>(pred_w_.id), 1))
+    return;
+  if (!device::download(pred_ids_.id, pred_host_.data(),
+                        uint64_t(k) * sizeof(int64_t)))
+    return;
+  if (auto r = (*pool)->prefetch(block + 1, pred_host_); !r) {
+    std::fprintf(stderr, "expert prefetch disabled: %s\n", r.error().c_str());
+    moe_prefetch_ = false;
+  }
 }
 
 bool SonicCudaBackend::enable_decode_chunking(uint32_t k) {
@@ -388,6 +474,9 @@ SonicCudaBackend::~SonicCudaBackend() {
   if (sample_params_) g_alloc.deallocate(sample_params_);
   if (sample_window_) g_alloc.deallocate(sample_window_);
   if (sample_cands_) g_alloc.deallocate(sample_cands_);
+  if (pred_norm_) g_alloc.deallocate(pred_norm_);
+  if (pred_ids_) g_alloc.deallocate(pred_ids_);
+  if (pred_w_) g_alloc.deallocate(pred_w_);
   if (sample_host_) cudaFreeHost(sample_host_);
 }
 
@@ -3063,6 +3152,11 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     for (const auto& e : sibling_outs) device::release(e.first, e.second);
     return std::vector<TensorValue>{};
   }
+
+  // Round 17 D: a decode block's output residual is where the next block's
+  // experts can be predicted and uploaded under the block that follows.
+  if (moe_prefetch_ && !sonicboom::cuda::boom_capturing())
+    prefetch_after_residual(out_td->name, out_handle, out_bytes);
 
   // Debug dump (node_dump.h): the first output, read back synchronously. The
   // dump covers the uncaptured path only — a capture's memcpy cannot be

@@ -71,12 +71,21 @@ class ExpertPool {
  public:
   // Counters reported when SONICBOOM_EXPERT_STATS=1. hits/misses count
   // selection entries (a repeated (block, expert) within one node is a hit
-  // after the first), so they are a function of the token history alone.
+  // after the first), so they are a function of the token history alone. The
+  // prefetch counters (SONICBOOM_MOE_PREFETCH) split the uploads into those
+  // issued ahead of a selection node and those a selection node issued itself;
+  // bytes counts both. prefetched_hits are slots a selection found resident
+  // because of a prefetch; prefetched_waste is bytes evicted again unused.
   struct Stats {
     uint64_t nodes = 0;
     uint64_t hits = 0;
     uint64_t misses = 0;
     uint64_t bytes = 0;
+    uint64_t prefetch_nodes = 0;
+    uint64_t prefetch_uploads = 0;
+    uint64_t prefetch_bytes = 0;
+    uint64_t prefetch_hits = 0;
+    uint64_t prefetch_waste = 0;
   };
 
   // Size the pool from `weights` and allocate its three device arrays.
@@ -111,6 +120,21 @@ class ExpertPool {
   std::expected<void, std::string> select(uint32_t block,
                                           std::span<const int64_t> ids);
 
+  // Upload the predicted experts `ids` of `block` ahead of its selection node
+  // (SONICBOOM_MOE_PREFETCH). The copies travel on a second staging pipeline
+  // and are not waited for here: the next select() makes the compute stream
+  // wait for them, and lets its own copies start only after they finish. An id
+  // that is already resident is skipped, as is one for which no slot can be
+  // found — the call is advisory and never fails the run for a full pool. The
+  // slot choice follows select()'s aging-LFU order, so residency (and every
+  // output) stays a function of the routing history, not of timing. A missing
+  // pipeline (prefetch off) makes it a no-op.
+  std::expected<void, std::string> prefetch(uint32_t block,
+                                            std::span<const int64_t> ids);
+
+  // Whether the prefetch pipeline exists (SONICBOOM_MOE_PREFETCH=on).
+  bool prefetch_enabled() const noexcept { return prefetch_staging_ != nullptr; }
+
   Stats stats() const;
 
   // Test hook: forget what is resident and zero the counters; the arrays stay
@@ -131,6 +155,14 @@ class ExpertPool {
   };
 
   std::expected<void, std::string> allocate(uint64_t pool_bytes);
+
+  // The slot select()/prefetch() would evict for this node's `needed` keys:
+  // lowest aging use, then oldest stamp, then lowest index; empty slots first.
+  // -1 when every slot holds a needed key.
+  int32_t victim_for(const std::vector<int64_t>& needed) const;
+  // Drop the prefetch bookkeeping of an evicted key: a slot uploaded ahead and
+  // evicted before any selection used it is wasted upload.
+  void note_evicted(int64_t key);
 
   mutable std::mutex mutex_;
   std::vector<BlockInfo> blocks_;
@@ -158,6 +190,14 @@ class ExpertPool {
   // The pinned staging pipeline; null when it could not be created, in which
   // case select() falls back to the synchronous copy.
   device::Staging* staging_ = nullptr;
+  // The second pipeline, for copies issued ahead of their selection node; null
+  // unless SONICBOOM_MOE_PREFETCH is on. ready_ says a fence event has been
+  // recorded on it since the last select().
+  device::Staging* prefetch_staging_ = nullptr;
+  bool prefetch_ready_ = false;
+  // Per global key: 1 when prefetch() brought it in and no select() has used it
+  // yet (so evicting it is a wasted upload).
+  std::vector<uint8_t> prefetched_;
 
   Stats stats_;
 };

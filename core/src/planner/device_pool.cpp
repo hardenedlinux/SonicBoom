@@ -23,10 +23,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <new>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -339,6 +342,15 @@ bool staging_upload(Staging* s, const void* host, uint64_t handle,
 #ifdef SONICBOOM_USE_CUDA
   if (!s || (!host && bytes != 0) || handle == 0) return false;
   if (bytes == 0) return true;
+  // Test hook: SONICBOOM_EXPERT_UPLOAD_DELAY_US spaces the issued chunks, so a
+  // caller that assumes a fixed upload rate fails visibly. Off unless set.
+  static const uint64_t delay_us = [] {
+    const char* env = std::getenv("SONICBOOM_EXPERT_UPLOAD_DELAY_US");
+    if (!env || !*env) return uint64_t{0};
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(env, &end, 10);
+    return (end == env || *end != '\0') ? uint64_t{0} : uint64_t(v);
+  }();
   const unsigned char* src = static_cast<const unsigned char*>(host);
   uint64_t off = 0;
   while (off < bytes) {
@@ -364,6 +376,8 @@ bool staging_upload(Staging* s, const void* host, uint64_t handle,
     s->pending[s->cur] = true;
     s->used += chunk;
     off += chunk;
+    if (delay_us != 0)
+      std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
   }
   return true;
 #else
@@ -380,6 +394,37 @@ bool staging_commit(Staging* s) {
                              0) == cudaSuccess;
 #else
   (void)s;
+  return false;
+#endif
+}
+
+bool staging_fence(Staging* s) {
+#ifdef SONICBOOM_USE_CUDA
+  if (!s) return false;
+  return cudaEventRecord(s->ready, s->copy) == cudaSuccess;
+#else
+  (void)s;
+  return false;
+#endif
+}
+
+bool staging_wait(Staging* s) {
+#ifdef SONICBOOM_USE_CUDA
+  if (!s) return false;
+  return cudaStreamWaitEvent(sonicboom::cuda::boom_current_stream(), s->ready,
+                             0) == cudaSuccess;
+#else
+  (void)s;
+  return false;
+#endif
+}
+
+bool staging_chain(Staging* s, Staging* after) {
+#ifdef SONICBOOM_USE_CUDA
+  if (!s || !after) return false;
+  return cudaStreamWaitEvent(s->copy, after->ready, 0) == cudaSuccess;
+#else
+  (void)s; (void)after;
   return false;
 #endif
 }

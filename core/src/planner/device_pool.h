@@ -82,6 +82,11 @@ bool memset_device(uint64_t handle, int value, uint64_t bytes);
 //                     kernel is not overwritten under it)
 //   staging_upload()  host memcpy into the pinned half + cudaMemcpyAsync
 //   staging_commit()  the current stream waits for every issued copy
+//   staging_fence()   record the same "all issued copies" event without making
+//                     the current stream wait (a prefetch pipeline runs ahead)
+//   staging_wait()    make the current stream wait for that event later
+//   staging_chain()   make one pipeline's copy stream wait for another's fence,
+//                     so two pipelines never write a slot concurrently
 //
 // The only host wait is the reuse of a pinned half whose previous copy has not
 // completed yet (cudaEventQuery/Sync at that point); the default 16 MiB holds
@@ -95,6 +100,9 @@ bool staging_begin(Staging* s);
 bool staging_upload(Staging* s, const void* host, uint64_t handle,
                     uint64_t bytes);
 bool staging_commit(Staging* s);
+bool staging_fence(Staging* s);
+bool staging_wait(Staging* s);
+bool staging_chain(Staging* s, Staging* after);
 
 // Block until all device work is complete.
 bool synchronize();
