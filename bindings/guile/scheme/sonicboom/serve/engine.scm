@@ -44,7 +44,7 @@
             chat-request-frequency-penalty chat-request-constraint
 
             engine-admit! engine-run engine-run-job engine-drop! engine-generate
-            engine-stats
+            engine-ticket-wait-ms engine-stats
 
             result? result-finish-reason result-content result-tool-calls
             result-prompt-tokens result-completion-tokens result-cached-tokens))
@@ -378,7 +378,13 @@ PyTorch: none"
   (with-mutex (engine-lock engine)
     (hashq-set! (engine-stats-table engine) key v)))
 
-;;; The queue. A ticket is a fresh pair; only its identity matters.
+;;; The queue. A ticket is a fresh list; its identity is what the queue
+;;; compares, and it also carries when it was admitted (index 1) and when it
+;;; started running (index 2, unset until then), so a request can report how
+;;; long it waited.
+
+(define (ticket-now-ms)
+  (quotient (* 1000 (get-internal-real-time)) internal-time-units-per-second))
 
 (define (engine-admit! engine)
   "Put a request in ENGINE's queue and return its ticket.
@@ -404,7 +410,7 @@ count), it raises (queue-full n) with the number of requests over the limit."
         (hashq-set! (engine-stats-table engine) 'rejected
                     (1+ (hashq-ref (engine-stats-table engine) 'rejected 0)))
         (throw 'queue-full (1- admitted)))
-      (let ((ticket (list 'ticket)))
+      (let ((ticket (list 'ticket (ticket-now-ms) #f)))
         (set-engine-queue! engine (append (engine-queue engine) (list ticket)))
         (hashq-set! (engine-stats-table engine) 'max-waiting
                     (max (hashq-ref (engine-stats-table engine) 'max-waiting 0)
@@ -419,7 +425,8 @@ count), it raises (queue-full n) with the number of requests over the limit."
         (wait-condition-variable (engine-cv engine) (engine-lock engine))
         (lp)))
     (set-engine-queue! engine (cdr (engine-queue engine)))
-    (set-engine-running! engine ticket)))
+    (set-engine-running! engine ticket)
+    (list-set! ticket 2 (ticket-now-ms))))
 
 ;; Leave the queue: done running, or never run.
 (define (engine-drop! engine ticket)
@@ -441,6 +448,27 @@ PyTorch: none"
         (set-engine-running! engine #f)
         (set-engine-queue! engine (delete ticket (engine-queue engine) eq?)))
     (broadcast-condition-variable (engine-cv engine))))
+
+(define (engine-ticket-wait-ms ticket)
+  "How long TICKET waited for its turn in milliseconds.
+
+Args:
+  ticket: a ticket from engine-admit!.
+Returns: the wait in ms, or #f when the ticket never started (it was dropped
+  before its turn, for example because its client went away).
+Example:
+  (use-modules (sonicboom serve engine))
+  (let* ((engine (make-engine '()))
+         (ticket (engine-admit! engine)))
+    (engine-run-job engine ticket (lambda () #t))
+    (>= (engine-ticket-wait-ms ticket) 0))
+  => #t
+PyTorch: none
+Note: admission and the start of running are stamped on the ticket, so the
+value is what the queue cost the request, not the time it spent generating."
+  (and (pair? (cddr ticket))
+       (list-ref ticket 2)
+       (max 0 (- (list-ref ticket 2) (list-ref ticket 1)))))
 
 (define (next-call-id! engine)
   (with-mutex (engine-lock engine)

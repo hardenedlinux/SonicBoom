@@ -40,6 +40,28 @@ static void check(int ok, const char *what) {
   }
 }
 
+/* The value of a top-level numeric field ("key": 123) in a model-info
+ * document; 0 when the field is absent. */
+static unsigned long long json_number(const char *json, const char *key) {
+  char pattern[64];
+  snprintf(pattern, sizeof pattern, "\"%s\": ", key);
+  const char *p = strstr(json, pattern);
+  return p ? strtoull(p + strlen(pattern), NULL, 10) : 0;
+}
+
+/* The sum of every "<key>": N between FROM and TO (NULL TO: to the end). */
+static unsigned long long json_sum_between(const char *from, const char *to,
+                                           const char *key) {
+  char pattern[64];
+  snprintf(pattern, sizeof pattern, "\"%s\": ", key);
+  const size_t plen = strlen(pattern);
+  unsigned long long sum = 0;
+  for (const char *p = from;
+       (p = strstr(p, pattern)) != NULL && (to == NULL || p < to); p += plen)
+    sum += strtoull(p + plen, NULL, 10);
+  return sum;
+}
+
 static void check_status(boom_status st, boom_error *err, const char *what) {
   if (st != BOOM_OK) {
     fprintf(stderr, "  FAIL: %s: %s\n", what,
@@ -232,6 +254,54 @@ int main(void) {
   check_status(boom_image_model_arch(model, arch, sizeof arch, &arch_len, &err),
                err, "arch");
   check(strcmp(arch, "moss-image") == 0, "arch: moss-image");
+
+  // Model description; reads only the safetensors headers.
+  size_t info_len = 0;
+  check(boom_image_model_info(model, NULL, 0, &info_len, &err) ==
+            BOOM_ERR_BINDING,
+        "info: a NULL buffer asks for the size");
+  check(err != NULL && boom_error_get_kind(err) == BOOM_ERRKIND_BINDING,
+        "info: the size request is a binding error");
+  if (err) {
+    boom_error_free(err);
+    err = NULL;
+  }
+  char *info = (char *)malloc(info_len);
+  check(info != NULL, "info: the buffer allocates");
+  if (info != NULL) {
+    size_t written = 0;
+    check_status(boom_image_model_info(model, info, info_len, &written, &err),
+                 err, "info");
+    check(written == info_len && info[written - 1] == '\0',
+          "info: *len_out includes the NUL");
+    check(strstr(info, "\"arch\": \"moss-image\"") != NULL,
+          "info: arch is moss-image");
+    check(json_number(info, "params") > 0, "info: params counts the weights");
+    check(json_number(info, "context_length") > 0,
+          "info: the text encoder's context length is declared");
+    check(json_number(info, "vocab_size") > 0,
+          "info: the vocabulary size is declared");
+    check(strstr(info, "\"has_vision\": true") != NULL &&
+              strstr(info, "\"has_tool_template\": false") != NULL,
+          "info: the capability flags reflect the pipeline");
+    check(strstr(info, "\"components\": {") != NULL &&
+              strstr(info, "\"text_encoder\": {") != NULL &&
+              strstr(info, "\"transformer\": {") != NULL &&
+              strstr(info, "\"vae\": {") != NULL,
+          "info: all three components are described");
+    const char *quant = strstr(info, "\"quant\": [");
+    const char *components = strstr(info, "\"components\": {");
+    check(quant != NULL && components != NULL && quant < components,
+          "info: the quant and component sections are present");
+    if (quant != NULL && components != NULL && quant < components) {
+      const unsigned long long params = json_number(info, "params");
+      check(json_sum_between(quant, components, "weights") == params,
+            "info: the quant entries' weights add up to params");
+      check(json_sum_between(components, NULL, "weights") == params,
+            "info: the components' weights add up to params");
+    }
+    free(info);
+  }
 
   // (a) generate, two-call sizing first.
   uint8_t *rgb = (uint8_t *)malloc(IMAGE_BYTES);

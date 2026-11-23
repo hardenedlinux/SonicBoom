@@ -9,8 +9,11 @@
 
 #include <sonicboom/capi.h>
 
+#include <cstddef>
+#include <cstring>
 #include <new>
 #include <string>
+#include <string_view>
 
 struct boom_error {
   boom_error_kind kind;
@@ -44,6 +47,57 @@ inline void set_error(boom_error **err_out, boom_error_kind kind,
     return;
   }
   *err_out = err;
+}
+
+// Append a JSON string literal, escaped. The info documents only carry ASCII
+// identifiers (architectures, quantizations), but escaping keeps them valid
+// whatever a file declares.
+inline void append_json_string(std::string &out, std::string_view s) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  out += '"';
+  for (const unsigned char c : s) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\b': out += "\\b"; break;
+      case '\f': out += "\\f"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          out += "\\u00";
+          out += kHex[c >> 4];
+          out += kHex[c & 0xf];
+        } else {
+          out += static_cast<char>(c);
+        }
+    }
+  }
+  out += '"';
+}
+
+// The two-call buffer contract of the JSON document outputs (the model-info
+// calls, like boom_explain_json): *len_out always receives the needed byte
+// count including the NUL; a NULL or short buffer answers BOOM_ERR_BINDING,
+// which is the sizing answer rather than a failure.
+inline boom_status copy_json_document(const std::string &text, char *out,
+                                      size_t cap, size_t *len_out,
+                                      boom_error **err_out,
+                                      const char *what) noexcept {
+  if (len_out == nullptr) {
+    set_error(err_out, BOOM_ERRKIND_INTERNAL, "invalid argument");
+    return BOOM_ERR_INTERNAL;
+  }
+  const size_t need = text.size() + 1;
+  *len_out = need;
+  if (out == nullptr || cap < need) {
+    set_error(err_out, BOOM_ERRKIND_BINDING,
+              (std::string(what) + ": buffer too small (see *len_out)").c_str());
+    return BOOM_ERR_BINDING;
+  }
+  std::memcpy(out, text.c_str(), need);
+  return BOOM_OK;
 }
 
 // Contain every C++ exception so none escapes an exported `boom_*` function.

@@ -737,6 +737,32 @@ boom_status boom_llm_model_arch(const boom_llm_model *model, char *out, size_t c
 boom_status boom_llm_model_eos(const boom_llm_model *model, boom_token *out, size_t cap,
                            size_t *n_out, boom_error **err_out);
 
+/* A JSON description of the loaded model, for introspection (a capability or
+ * compatibility check, a status page, a benchmark record). The document is one
+ * object:
+ *
+ *   arch              string  general.architecture ("gemma4", "qwen2", ...)
+ *   params            number  weights: the summed element count of every
+ *                             tensor, norms and tables included
+ *   context_length    number  <arch>.context_length as the file declares it
+ *                             (0 when the file declares none)
+ *   vocab_size        number  entries in the loaded tokenizer vocabulary
+ *   has_vision        bool    the file carries vision components (the
+ *                             clip.has_vision_encoder flag, or a vision
+ *                             tower's tensors)
+ *   has_tool_template bool    tokenizer.chat_template mentions tools
+ *   tensors           number  entries in the tensor directory
+ *   quant             array   one object per tensor type, sorted by name:
+ *                             {"type", "tensors", "weights", "bytes"} — how
+ *                             the file's weight bytes are distributed over
+ *                             quantizations (F32, Q4_K, IQ2_XXS, ...), so a
+ *                             caller can tell what mixture a GGUF really is
+ *
+ * Two-call sizing: *len_out always receives the needed byte count including
+ * the NUL; a NULL or short buffer answers BOOM_ERR_BINDING. */
+boom_status boom_llm_model_info(const boom_llm_model *model, char *out, size_t cap,
+                            size_t *len_out, boom_error **err_out);
+
 /* Tokenize/detokenize with the model's GGUF built-in vocabulary (SPM-style BPE
  * for Gemma 4). tokenize encodes `text` (UTF-8, `len` bytes) into token ids
  * with <bos> prepended (llama-tokenize add_special); detokenize renders `tokens`
@@ -913,6 +939,29 @@ void boom_image_model_free(boom_image_model *model);
 /* The architecture name ("moss-image"), two-call sizing like the other string
  * outputs: a short cap returns BOOM_ERR_BINDING and the needed byte count. */
 boom_status boom_image_model_arch(const boom_image_model *model, char *out,
+                              size_t cap, size_t *len_out,
+                              boom_error **err_out);
+
+/* A JSON description of the loaded image model, the same shape as
+ * boom_llm_model_info:
+ *
+ *   arch              string  "moss-image"
+ *   params            number  weights across text_encoder, transformer and vae
+ *   context_length    number  the text encoder's max_position_embeddings
+ *   vocab_size        number  the tokenizer's vocabulary size
+ *   has_vision        bool    true: the pipeline carries image components (the
+ *                             VAE decoder; for an LLM the flag means it accepts
+ *                             images as input)
+ *   has_tool_template bool    false: the image pipeline has no chat tool use
+ *   tensors           number  entries in the three component directories
+ *   quant             array   tensor count, weight count and bytes per dtype
+ *                             ("BF16", "F32", ...), sorted by name
+ *   components        object  per component (text_encoder, transformer, vae):
+ *                             the same tensors/weights/bytes counts
+ *
+ * Two-call sizing: *len_out always receives the needed byte count including
+ * the NUL; a NULL or short buffer answers BOOM_ERR_BINDING. */
+boom_status boom_image_model_info(const boom_image_model *model, char *out,
                               size_t cap, size_t *len_out,
                               boom_error **err_out);
 

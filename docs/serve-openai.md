@@ -258,6 +258,41 @@ them. The mock backend honors `temperature`, `top_p`, `top_k` and `min_p`; it
 has no penalty or repetition model, so `repeat_penalty` and the two penalties
 are accepted and ignored there.
 
+### Request log
+
+`--request-log PATH` appends one JSON line per request:
+
+```json
+{"id": "req-6773a6c1-12", "time": 1795418553, "end": 1795418554,
+ "method": "POST", "path": "/v1/chat/completions", "status": "done",
+ "ms": 1214, "model": "qwen2.5-7b", "kind": "chat", "queue_ms": 3,
+ "switch_ms": 812, "prompt_tokens": 42, "completion_tokens": 128,
+ "cached_tokens": 0, "size": null, "steps": null, "n": null,
+ "free_mib_start": 5210, "free_mib_end": 5188}
+```
+
+- `id` names the request; `time` and `end` are its start and finish in Unix
+  seconds; `ms` is the whole request.
+- `status` is `done`, `cancelled` (the client went away, or the job was
+  cancelled), `failed` (any other error response) or `rejected` (the queue was
+  full, a 429).
+- `model` and `kind` (`chat` or `image`) say which model the request was for.
+- `prompt_tokens`, `completion_tokens` and `cached_tokens` are the chat
+  result's usage. `size` (`[width, height]`), `steps` and `n` are an image
+  request's shape. Fields that do not apply are `null`.
+- `queue_ms` is how long the request waited for the device (null if it never
+  got its turn); `switch_ms` is the model switch made for it, when one
+  happened (null otherwise).
+- `free_mib_start` and `free_mib_end` are the device memory free at the
+  request's start and end, read from `nvidia-smi`; null when it cannot be
+  read.
+
+Request and response bodies are never written — no prompt, no conversation,
+no image description — so prompts stay out of the file. A streaming request's
+line is written when its stream ends. An unusable path fails at startup, not
+at the first request. The WebSocket route is not logged: its handler is a
+long-lived callback factory, not a response.
+
 ### Constrained replies
 
 Two request fields compile to a grammar constraint on the real backend:
@@ -425,7 +460,7 @@ guile -L bindings/guile/scheme bindings/guile/tests/serve/test-serve-http.scm
 python3 bindings/guile/tests/serve/test-openai-sdk.py      # pip install openai
 ```
 
-Results: units 80/80, HTTP 133/133, images 36/36; openai SDK (3.29.0) 24/24
+Results: units 80/80, HTTP 140/140, images 36/36; openai SDK (3.29.0) 24/24
 when last run.
 
 ## 8. Limits of the prototype

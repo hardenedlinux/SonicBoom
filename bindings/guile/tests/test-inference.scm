@@ -53,7 +53,7 @@
 
 (let ((path (find-model)))
   (if (not path)
-      (test-skip 18)
+      (test-skip 25)
       (let* ((model (load-model path))
              (sess1 (make-session model 512)))
         (test-equal "generate-tokens reproduces the golden decode stream"
@@ -208,6 +208,26 @@
               0
               (prefill! sess3 '(3 4 5))))
           (free-session! sess3))
+
+        ;; The model's own description: the GGUF's declared fields, read
+        ;; without running the model.
+        (let ((info (model-info model)))
+          (test-equal "model-info: the architecture is the GGUF's" "gemma4"
+            (assq-ref info 'arch))
+          (test-assert "model-info: params counts the weights"
+            (> (assq-ref info 'params) 0))
+          (test-assert "model-info: the context length is declared"
+            (> (assq-ref info 'context_length) 0))
+          (test-assert "model-info: the vocabulary size is declared"
+            (> (assq-ref info 'vocab_size) 0))
+          (test-assert "model-info: the weight-type mixture is present"
+            (pair? (assq-ref info 'quant)))
+          (test-assert "model-info: each quant entry is type/tensors/weights/bytes"
+            (lset= eq? '(type tensors weights bytes)
+                   (map car (car (assq-ref info 'quant)))))
+          (test-assert "model-info: the capability flags are booleans"
+            (and (boolean? (assq-ref info 'has_vision))
+                 (boolean? (assq-ref info 'has_tool_template)))))
 
         (free-model! model))))
 

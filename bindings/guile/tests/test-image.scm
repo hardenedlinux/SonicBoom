@@ -59,11 +59,36 @@
           (not (file-exists? "/dev/nvidia0"))
           (not (libsonicboom-available?))
           (not (cuda-build?)))
-      (test-skip 10)
+      (test-skip 17)
       (let* ((model (load-image-model dir))
              (w 64) (h 64))
         (test-equal "the architecture is moss-image"
           "moss-image" (image-model-arch model))
+
+        ;; The model's own description: safetensors headers only, no generation.
+        (let ((info (image-model-info model)))
+          (test-equal "image-model-info: the architecture is moss-image"
+            "moss-image" (assq-ref info 'arch))
+          (test-assert "image-model-info: params counts the weights"
+            (> (assq-ref info 'params) 0))
+          (test-assert "image-model-info: the context length is declared"
+            (> (assq-ref info 'context_length) 0))
+          (test-assert "image-model-info: the vocabulary size is declared"
+            (> (assq-ref info 'vocab_size) 0))
+          (test-assert "image-model-info: the three components are described"
+            (let ((c (assq-ref info 'components)))
+              (and (assq 'text_encoder c)
+                   (assq 'transformer c)
+                   (assq 'vae c))))
+          (test-equal "image-model-info: has_vision, and no tool template"
+            '(#t #f)
+            (list (assq-ref info 'has_vision)
+                  (assq-ref info 'has_tool_template)))
+          (test-assert "image-model-info: each quant entry is type/tensors/weights/bytes"
+            (let ((keys (map car (car (assq-ref info 'quant)))))
+              (and (= 4 (length keys))
+                   (memq 'type keys) (memq 'tensors keys)
+                   (memq 'weights keys) (memq 'bytes keys)))))
 
         (let* ((once (generate-images model #:prompt "a red fox"
                                       #:width w #:height h #:steps 2

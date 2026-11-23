@@ -207,6 +207,11 @@ struct TextEncoder::Impl {
       if (!got) return std::unexpected(got.error());
       *dest = *got;
     }
+    // Optional: reported through model info, not needed by the forward, so a
+    // config without it still loads (0 means "not declared").
+    if (const auto* v = c->find("max_position_embeddings");
+        v && v->is_integer && v->integer > 0)
+      cfg.max_position_embeddings = v->integer;
     cfg.rms_norm_eps = num_of("rms_norm_eps", 1e-6f);
 
     const auto* rope = c->find("rope_parameters");

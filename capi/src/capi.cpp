@@ -64,6 +64,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -2228,6 +2229,128 @@ boom_status boom_llm_model_eos(const boom_llm_model *model, boom_token *out, siz
         if (!eos.empty())
           std::memcpy(out, eos.data(), eos.size() * sizeof(boom_token));
         return BOOM_OK;
+      },
+      err_out);
+}
+
+// --- Model info -------------------------------------------------------------
+
+namespace {
+
+void append_json_number(std::string &out, uint64_t n) {
+  out += std::to_string(n);
+}
+
+// An unsigned integer metadata value; false for another type or a negative
+// integer (every count it is used for is non-negative).
+bool metadata_u64(const gguf::Value *v, uint64_t &out) {
+  if (v == nullptr) return false;
+  switch (v->type) {
+    case gguf::ValueType::UInt8:
+    case gguf::ValueType::UInt16:
+    case gguf::ValueType::UInt32:
+    case gguf::ValueType::UInt64:
+      out = v->u;
+      return true;
+    case gguf::ValueType::Int8:
+    case gguf::ValueType::Int16:
+    case gguf::ValueType::Int32:
+    case gguf::ValueType::Int64:
+      if (v->i < 0) return false;
+      out = static_cast<uint64_t>(v->i);
+      return true;
+    default:
+      return false;
+  }
+}
+
+std::string llm_model_info_json(const boom_llm_bundle &bundle) {
+  const gguf::Reader &reader = bundle.reader;
+
+  std::string arch;
+  if (const gguf::Value *v = reader.find("general.architecture");
+      v != nullptr && v->type == gguf::ValueType::String)
+    arch = v->s;
+
+  struct TypeTotals {
+    uint64_t tensors = 0;
+    uint64_t weights = 0;
+    uint64_t bytes = 0;
+  };
+  std::map<std::string_view, TypeTotals> quant;
+  uint64_t params = 0;
+  uint64_t tensors = 0;
+  bool vision = false;
+  for (const gguf::TensorInfo &t : reader.tensors()) {
+    ++tensors;
+    params += t.n_elements;
+    TypeTotals &totals = quant[gguf::ggml_type_name(t.type)];
+    ++totals.tensors;
+    totals.weights += t.n_elements;
+    totals.bytes += t.byte_size.value_or(0);
+    if (t.name.starts_with("v.") || t.name.starts_with("vision.") ||
+        t.name.starts_with("mm."))
+      vision = true;
+  }
+  if (const gguf::Value *v = reader.find("clip.has_vision_encoder");
+      v != nullptr && v->type == gguf::ValueType::Bool)
+    vision = vision || v->b;
+
+  uint64_t context_length = 0;
+  if (!arch.empty())
+    metadata_u64(reader.find(arch + ".context_length"), context_length);
+
+  // A chat template that branches on tools is the file's own statement that
+  // the model can be asked to call them.
+  bool tool_template = false;
+  if (const gguf::Value *v = reader.find("tokenizer.chat_template");
+      v != nullptr && v->type == gguf::ValueType::String)
+    tool_template = v->s.find("tools") != std::string::npos ||
+                    v->s.find("tool_call") != std::string::npos;
+
+  std::string out = "{\"arch\": ";
+  sonicboom::capi_private::append_json_string(out, arch);
+  out += ", \"params\": ";
+  append_json_number(out, params);
+  out += ", \"context_length\": ";
+  append_json_number(out, context_length);
+  out += ", \"vocab_size\": ";
+  append_json_number(out, bundle.vocab.tokens.size());
+  out += ", \"has_vision\": ";
+  out += vision ? "true" : "false";
+  out += ", \"has_tool_template\": ";
+  out += tool_template ? "true" : "false";
+  out += ", \"tensors\": ";
+  append_json_number(out, tensors);
+  out += ", \"quant\": [";
+  bool first = true;
+  for (const auto &[name, totals] : quant) {
+    if (!first) out += ", ";
+    first = false;
+    out += "{\"type\": ";
+    sonicboom::capi_private::append_json_string(out, name);
+    out += ", \"tensors\": ";
+    append_json_number(out, totals.tensors);
+    out += ", \"weights\": ";
+    append_json_number(out, totals.weights);
+    out += ", \"bytes\": ";
+    append_json_number(out, totals.bytes);
+    out += '}';
+  }
+  out += "]}";
+  return out;
+}
+
+}  // namespace
+
+boom_status boom_llm_model_info(const boom_llm_model *model, char *out, size_t cap,
+                            size_t *len_out, boom_error **err_out) {
+  return guard(
+      [&]() -> boom_status {
+        if (model == nullptr) return fail_arg(err_out);
+        return sonicboom::capi_private::copy_json_document(
+            llm_model_info_json(*model->bundle), out, cap, len_out, err_out,
+            "boom_llm_model_info");
       },
       err_out);
 }

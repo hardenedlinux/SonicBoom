@@ -21,6 +21,7 @@
              (srfi srfi-64)
              (ice-9 match)
              (ice-9 rdelim)
+             (ice-9 textual-ports)
              (ice-9 binary-ports)
              (rnrs bytevectors)
              (web client)
@@ -41,6 +42,10 @@
 (define base (format #f "http://127.0.0.1:~a" port))
 (define tmp (or (getenv "TMPDIR") "/tmp"))
 (define log-file (format #f "~a/sonicboom-serve-test-~a.log" tmp (getpid)))
+(define request-log-file
+  (format #f "~a/sonicboom-serve-requests-~a.jsonl" tmp (getpid)))
+;; The server appends to the request log; start each run with no stale lines.
+(when (file-exists? request-log-file) (delete-file request-log-file))
 
 (define server-pid
   (let ((pid (primitive-fork)))
@@ -52,6 +57,7 @@
                   "bindings/guile/scheme/sonicboom/serve/app.scm"
                   "--backend" (or (getenv "SONICBOOM_SERVE_BACKEND") "mock")
                   "--port" (number->string port) "--queue" "1" "--step-delay" "0.01"
+                  "--request-log" request-log-file
                   "--runtime-dir" (format #f "~a/sonicboom-serve-test-~a" tmp (getpid))))
         pid)))
 
@@ -94,6 +100,18 @@
      (else (usleep 250000) (lp (1+ i))))))
 
 (define (stats . path) (apply jref (cdr (http 'GET "/sonicboom/stats")) path))
+
+;; The --request-log JSONL as a list of parsed line objects.
+(define (request-log-lines)
+  (if (file-exists? request-log-file)
+      (call-with-input-file request-log-file
+        (lambda (port)
+          (let lp ((out '()))
+            (let ((line (read-line port)))
+              (if (eof-object? line)
+                  (reverse out)
+                  (lp (cons (json-string->scm line) out)))))))
+      '()))
 
 (define (msg role content) `(("role" . ,role) ("content" . ,content)))
 
@@ -641,6 +659,106 @@
   ((status . body)
    (test-equal "load: unknown -> 404" 404 status)
    (test-equal "load: unknown code" "model_not_found" (jref body "error" "code"))))
+
+;;; --- the request log ----------------------------------------------------------------
+
+;; --request-log PATH appends one JSON line per request: id, model, kind,
+;; start/end, status, token counts, queue and switch times, device memory.
+;; The body is never written, so a marker in the prompt must stay out of the
+;; file. JSON null is the symbol `null' after parsing.
+
+(define (null-or-integer? v) (or (eq? 'null v) (integer? v)))
+
+;; The lines appended since BEFORE, once one satisfies PRED.
+(define (wait-for-new-line before pred)
+  (let lp ((i 0))
+    (match (find pred (drop (request-log-lines) before))
+      (#f (if (> i 100) #f (begin (usleep 100000) (lp (1+ i)))))
+      (hit hit))))
+
+(let ((marker "r16-request-log-marker-7f3a"))
+  (chat (request gemma (list (msg "user" marker))))
+  (let* ((lines (request-log-lines))
+         (tail (and (pair? lines) (last lines))))
+    (test-assert "request log: a line per request" (> (length lines) 20))
+    (test-equal "request log: the method" "POST" (jref tail "method"))
+    (test-equal "request log: the path" "/v1/chat/completions"
+      (jref tail "path"))
+    (test-equal "request log: the outcome" "done" (jref tail "status"))
+    (test-equal "request log: the model" gemma (jref tail "model"))
+    (test-equal "request log: the kind" "chat" (jref tail "kind"))
+    (test-assert "request log: an id"
+      (and (string? (jref tail "id"))
+           (string-prefix? "req-" (jref tail "id"))))
+    (test-assert "request log: start and end timestamps"
+      (and (integer? (jref tail "time")) (integer? (jref tail "end"))
+           (>= (jref tail "end") (jref tail "time"))))
+    (test-assert "request log: the chat token counts"
+      (and (integer? (jref tail "prompt_tokens"))
+           (integer? (jref tail "completion_tokens"))
+           (integer? (jref tail "cached_tokens"))))
+    (test-assert "request log: the queue wait"
+      (integer? (jref tail "queue_ms")))
+    (test-assert "request log: the device memory"
+      (and (null-or-integer? (jref tail "free_mib_start"))
+           (null-or-integer? (jref tail "free_mib_end"))
+           (or (eq? 'null (jref tail "switch_ms"))
+               (integer? (jref tail "switch_ms")))))
+    (test-assert "request log: a chat record has no image fields"
+      (and (eq? 'null (jref tail "size"))
+           (eq? 'null (jref tail "steps"))
+           (eq? 'null (jref tail "n"))))
+    (test-assert "request log: every line carries the full record"
+      (every (lambda (l)
+               (and (string? (jref l "id"))
+                    (integer? (jref l "time"))
+                    (integer? (jref l "end"))
+                    (string? (jref l "method"))
+                    (string? (jref l "path"))
+                    (member (jref l "status")
+                            '("done" "failed" "cancelled" "rejected"))
+                    (number? (jref l "ms"))
+                    (assoc "model" l) (assoc "kind" l)
+                    (assoc "queue_ms" l) (assoc "switch_ms" l)
+                    (assoc "prompt_tokens" l) (assoc "completion_tokens" l)
+                    (assoc "cached_tokens" l)
+                    (assoc "size" l) (assoc "steps" l) (assoc "n" l)
+                    (assoc "free_mib_start" l) (assoc "free_mib_end" l)))
+             lines))
+    (test-assert "request log: a 404 is a failed record"
+      (any (lambda (l) (and (equal? "/v1/models/nope" (jref l "path"))
+                            (equal? "failed" (jref l "status"))))
+           lines))
+    (test-assert "request log: a full queue is a rejected record"
+      (any (lambda (l) (and (equal? "/v1/chat/completions" (jref l "path"))
+                            (equal? "rejected" (jref l "status"))
+                            (string? (jref l "model"))))
+           lines))
+    (test-assert "request log: no request body is written"
+      (not (string-contains
+            (call-with-input-file request-log-file get-string-all)
+            marker)))))
+
+;; A client that goes away mid-stream leaves exactly one cancelled record,
+;; written when the stream ends.
+(let* ((before (length (request-log-lines)))
+       (s #f))
+  (call-with-values
+      (lambda ()
+        (open-stream (request gemma (list (msg "user" long-line)) '("stream" . #t))))
+    (lambda (sock resp reader)
+      (set! s sock)
+      (read-event reader) (read-event reader) (read-event reader)))
+  (close s)
+  (let ((line (wait-for-new-line
+               before (lambda (l) (equal? "cancelled" (jref l "status"))))))
+    (test-assert "request log: a cancelled stream is a cancelled record" line)
+    (test-equal "request log: the cancelled record's model" gemma
+      (jref (or line '()) "model"))
+    (test-equal "request log: the cancelled record's kind" "chat"
+      (jref (or line '()) "kind"))
+    (test-assert "request log: the cancelled record counts what was generated"
+      (integer? (jref (or line '()) "completion_tokens")))))
 
 ;;; --- WebSocket ------------------------------------------------------------------------
 

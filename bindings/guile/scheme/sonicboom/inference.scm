@@ -26,7 +26,8 @@
   #:use-module (system foreign)
   #:use-module (rnrs bytevectors)
   #:use-module (ice-9 optargs)
-  #:export (load-model free-model! model-arch model-eos
+  #:use-module (json)
+  #:export (load-model free-model! model-arch model-eos model-info
             make-session free-session! device-trim!
             set-grammar! set-json-schema! clear-grammar! constraint-state
             json-schema->gbnf
@@ -260,6 +261,52 @@ Note: Generation stops on these ids, per model rather than per family."
                 (bytevector->pointer n-slot) (slot-ptr err-slot))))
       (sb-check! st err-slot "model-eos")
       (s32-bv->list bv n))))
+
+;; A JSON document parsed into the shape build-info and explain-json return:
+;; symbol-keyed alists, JSON arrays as lists.
+(define (normalize-json node)
+  (cond ((pair? node)
+         (map (lambda (entry)
+                (cons (string->symbol (car entry))
+                      (normalize-json (cdr entry))))
+              node))
+        ((vector? node) (map normalize-json (vector->list node)))
+        (else node)))
+
+;; The model's JSON description (capi.h boom_llm_model_info): what the file
+;; actually holds — its parameter count, its quantization mixture, its context
+;; length — rather than what its name suggests. Two-call sizing: the sizing
+;; call answers BOOM_ERR_BINDING and fills the byte count (including the NUL).
+(define (model-info model)
+  "A description of the model as its GGUF file declares it.
+
+The result is an alist with the keys arch, params (the summed element count of
+every tensor), context_length, vocab_size, has_vision, has_tool_template,
+tensors, and quant: a list of (type tensors weights bytes) alists, one per
+quantization in the file, sorted by type name.
+
+Args:
+  model: a model handle.
+Returns: the alist.
+PyTorch: none
+Note: Read from the GGUF's own directory and metadata; nothing is guessed from
+the file name. It needs a loaded model, so it has no Example block (the docs
+tests run examples without loading one)."
+  (let* ((len-slot (make-bytevector 8 0))       ; size_t
+         (err-slot (make-slot)))
+    ;; Sizing call (cap 0): fills *len_out (the count including the NUL).
+    (let ((st ((proc 'boom_llm_model_info) model %null-pointer 0
+               (bytevector->pointer len-slot) (slot-ptr err-slot))))
+      (cond ((sb-status-ok? st) #t)
+            ((= st BOOM_ERR_BINDING) (capture-error err-slot))
+            (else (sb-check! st err-slot "model-info"))))
+    (let* ((n (bytevector-u64-native-ref len-slot 0))
+           (out (make-bytevector n 0))
+           (st ((proc 'boom_llm_model_info) model (bytevector->pointer out) n
+                (bytevector->pointer len-slot) (slot-ptr err-slot))))
+      (sb-check! st err-slot "model-info")
+      (normalize-json
+       (json-string->scm (utf8->string (bytevector-range out 0 (- n 1))))))))
 
 ;;; --- session ----------------------------------------------------------------
 

@@ -357,6 +357,8 @@ PyTorch: none"
                                                    (list '* '* size_t '* '*)))
                (boom_llm_model_eos . ,(foreign-proc "boom_llm_model_eos" int
                                                   (list '* '* size_t '* '*)))
+               (boom_llm_model_info . ,(foreign-proc "boom_llm_model_info" int
+                                                   (list '* '* size_t '* '*)))
                (boom_llm_tokenize . ,(foreign-proc "boom_llm_tokenize" int
                                                  (list '* '* size_t '* size_t '* '*)))
                (boom_llm_tokenize_ex . ,(foreign-proc "boom_llm_tokenize_ex" int
@@ -392,6 +394,8 @@ PyTorch: none"
                (boom_image_model_free . ,(foreign-proc "boom_image_model_free" void
                                                      (list '*)))
                (boom_image_model_arch . ,(foreign-proc "boom_image_model_arch" int
+                                                     (list '* '* size_t '* '*)))
+               (boom_image_model_info . ,(foreign-proc "boom_image_model_info" int
                                                      (list '* '* size_t '* '*)))
                (boom_image_generate . ,(foreign-proc "boom_image_generate" int
                                                    (list '* '* '* '* '* size_t

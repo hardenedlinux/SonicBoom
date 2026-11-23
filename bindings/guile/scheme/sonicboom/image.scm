@@ -20,8 +20,9 @@
   #:use-module (system foreign)
   #:use-module (rnrs bytevectors)
   #:use-module (ice-9 optargs)
+  #:use-module (json)
   #:export (load-image-model free-image-model! image-model-arch
-            generate-images write-png))
+            image-model-info generate-images write-png))
 
 ;;; --- errors -----------------------------------------------------------------
 
@@ -87,6 +88,53 @@ PyTorch: none"
                 (+ m 1) (bytevector->pointer len-slot) (slot-ptr err-slot))))
       (sb-check! st err-slot "image-model-arch")
       (pointer->string (bytevector->pointer out)))))
+
+;; A JSON document parsed into the shape build-info and explain-json return:
+;; symbol-keyed alists, JSON arrays as lists.
+(define (normalize-json node)
+  (cond ((pair? node)
+         (map (lambda (entry)
+                (cons (string->symbol (car entry))
+                      (normalize-json (cdr entry))))
+              node))
+        ((vector? node) (map normalize-json (vector->list node)))
+        (else node)))
+
+;; The image model's JSON description (capi.h boom_image_model_info): the
+;; weight counts and dtype mixture of its three components, its text encoder's
+;; context length, and the tokenizer's vocabulary size.
+(define (image-model-info model)
+  "A description of the loaded image model.
+
+The result is an alist with the keys arch, params, context_length,
+vocab_size, has_vision, has_tool_template, tensors, quant (one alist per
+dtype: type, tensors, weights, bytes) and components (text_encoder,
+transformer, vae, each with tensors, weights and bytes).
+
+Args:
+  model: an image-model handle.
+Returns: the alist.
+PyTorch: none
+Note: has_vision is true: an image pipeline carries image components (the VAE
+decoder), where for an LLM the same flag means it accepts image input. It needs
+a loaded model, so it has no Example block (the docs tests run examples without
+loading one)."
+  (let* ((len-slot (make-bytevector 8 0))       ; size_t
+         (err-slot (make-slot)))
+    ;; Sizing call (cap 0): fills *len_out (the count including the NUL).
+    (let ((st ((proc 'boom_image_model_info) model %null-pointer 0
+               (bytevector->pointer len-slot) (slot-ptr err-slot))))
+      (cond ((sb-status-ok? st) #t)
+            ((= st BOOM_ERR_BINDING) (capture-error err-slot))
+            (else (sb-check! st err-slot "image-model-info"))))
+    (let* ((n (bytevector-u64-native-ref len-slot 0))
+           (out (make-bytevector n 0))
+           (st ((proc 'boom_image_model_info) model (bytevector->pointer out) n
+                (bytevector->pointer len-slot) (slot-ptr err-slot))))
+      (sb-check! st err-slot "image-model-info")
+      (normalize-json
+       (json-string->scm
+        (pointer->string (bytevector->pointer out) (- n 1) "UTF-8"))))))
 
 ;;; --- generation -------------------------------------------------------------
 

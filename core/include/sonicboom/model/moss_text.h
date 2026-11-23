@@ -70,6 +70,10 @@ struct TextEncoderConfig {
   int64_t value_head_dim = 0;
   int64_t num_value_heads = 0;
   int64_t vocab_size = 0;
+  // The longest sequence the encoder was trained for (its RoPE range), from
+  // max_position_embeddings. It bounds a prompt's token count; the forward
+  // does not depend on it.
+  int64_t max_position_embeddings = 0;
   float rms_norm_eps = 0.0f;
   float rope_theta = 0.0f;
   int64_t rotary_dim = 0;        // head_dim * partial_rotary_factor

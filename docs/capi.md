@@ -260,6 +260,7 @@ plus the `(sonicboom inference)` wrappers):
 | sampling (temperature, top-k, top-p, min-p, seed, penalties) | `boom_llm_decode` over `boom_llm_sampling`; its sampled path keeps draw state in the session, so repeated `max_tokens` 1 calls are the serving path's per-token `step` |
 | logit mask before sampling | the session's compiled grammar; the argmax / sampled-select kernel applies its bitmap |
 | tokenizer and EOS ids from GGUF metadata | `boom_llm_tokenize(_ex)`, `boom_llm_detokenize`, `boom_llm_model_eos` |
+| model introspection (not used by the serving path) | `boom_llm_model_info` / `boom_image_model_info`: a JSON document read from the model's own files (header-level), with the architecture, parameter count, quantization mixture, context length, vocabulary size and capability flags; the Guile `model-info` / `image-model-info` bindings return it parsed |
 
 Not in the ABI yet: session fork (`boom_llm_session_fork`), a sampler handle
 (`boom_llm_sampler_new` — parameters are passed to each `boom_llm_decode` call

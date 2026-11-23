@@ -53,12 +53,17 @@
 ;;;   --context-length N              of the loaded model (16384 real, 8192
 ;;;                                   mock)
 ;;;   --step-delay S --prefill-delay S    simulated device time, seconds
+;;;   --request-log PATH              append one JSON line per request
+;;;                                   (id, model, kind, start/end, status,
+;;;                                   token counts, queue/switch ms, device
+;;;                                   memory; never a request body)
 ;;;   --runtime-dir DIR               Artanis' working directory
 ;;;                                   ($TMPDIR/sonicboom-serve-<pid>)
 
 (use-modules (artanis artanis)
              ((artanis config) #:select (conf-set!))
              ((artanis env) #:select (%current-toplevel))
+             ((artanis route) #:select (rc-method rc-path))
              (rnrs bytevectors)
              (srfi srfi-1)
              (srfi srfi-9)
@@ -89,6 +94,7 @@
                  (max-sessions (value #t)) (token-budget (value #t))
                  (context-length (value #t)) (step-delay (value #t))
                  (prefill-delay (value #t)) (image-model (value #t))
+                 (request-log (value #t))
                  (runtime-dir (value #t)))))
 
 (define (option key default)
@@ -308,23 +314,33 @@
 ;; event is the same images object the non-stream reply holds (the same PNGs);
 ;; a cancellation ends it with {"id", "status": "cancelled"} instead, and
 ;; "[DONE]" ends the stream either way.
-(define (stream-images job request send)
-  (catch #t
-    (lambda ()
-      (send (json-ascii-string
-             (images-object
-              (now)
-              (run-job
-               (lambda ()
-                 (residency-ensure! residency image-model-id)
-                 (render-images request
-                                #:progress (image-progress job send))))))))
-    (lambda (key . args)
-      (send (json-ascii-string
-             (if (cancelled-condition? key args)
-                 `(("id" . ,(job-id job)) ("status" . "cancelled"))
-                 (error-object-of key args))))))
-  (send "[DONE]"))
+(define (stream-images job request ctx send)
+  (let ((status
+         (catch #t
+           (lambda ()
+             (if (send (json-ascii-string
+                        (images-object
+                         (now)
+                         ;; The producer thread has no request context of its
+                         ;; own (dynamic parameters do not reach it); the
+                         ;; request's record is passed in so the ticket is
+                         ;; noted there.
+                         (run-job
+                          (lambda ()
+                            (residency-ensure! residency image-model-id)
+                            (render-images request
+                                           #:progress (image-progress job send)))
+                          ctx))))
+                 'done
+                 'cancelled))
+           (lambda (key . args)
+             (send (json-ascii-string
+                    (if (cancelled-condition? key args)
+                        `(("id" . ,(job-id job)) ("status" . "cancelled"))
+                        (error-object-of key args))))
+             (if (cancelled-condition? key args) 'cancelled 'failed)))))
+    (send "[DONE]")
+    (request-log-finish! ctx status)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Helpers
@@ -422,11 +438,20 @@
       ;; backends sample; this guards a future one that does not.
       (unless (backend-sampling? backend)
         (check-greedy-body body))
-      (values request stream? include-usage? (engine-admit! engine)))))
+      ;; Noted before admission: a rejected request's record still says which
+      ;; model it asked for.
+      (when (current-request-log)
+        (request-log-note! (chat-request-model request) 'chat))
+      (let ((ticket (engine-admit! engine)))
+        (when (current-request-log)
+          (request-log-ticket! (current-request-log) ticket))
+        (values request stream? include-usage? ticket)))))
 
 ;; Run an admitted request, sending its chunks through send-obj (returns #f
-;; once the client is gone). Ends with "[DONE]" through send-text.
-(define (stream-chunks ticket request include-usage? send-obj send-text)
+;; once the client is gone). Ends with "[DONE]" through send-text. CTX is the
+;; request's log record, or #f; the token counts and the outcome are noted
+;; there as they become known.
+(define (stream-chunks ticket request include-usage? ctx send-obj send-text)
   (let ((id (new-completion-id))
         (created (now))
         (model (chat-request-model request)))
@@ -436,7 +461,9 @@
     ;; streaming client can replay the reply.
     (if (not (send-obj (chunk-object id created model (role-delta)
                                      #:seed (chat-request-seed request))))
-        (engine-drop! engine ticket)    ; gone before the first chunk
+        (begin
+          (request-log-finish! ctx 'cancelled)  ; gone before the first chunk
+          (engine-drop! engine ticket))
         (catch #t
           (lambda ()
             (let ((result
@@ -447,22 +474,33 @@
                                    (('tool-call index call-id name arguments)
                                     (every chunk (tool-call-deltas index call-id name
                                                                    arguments))))))))
-              (unless (equal? (result-finish-reason result) "cancelled")
-                (and (chunk (finish-delta) (result-finish-reason result))
-                     (or (not include-usage?)
-                         (send-obj (usage-chunk-object id created model result)))
-                     (send-text "[DONE]")))))
+              (request-log-result! ctx result)
+              (if (equal? (result-finish-reason result) "cancelled")
+                  (request-log-finish! ctx 'cancelled)
+                  (request-log-finish!
+                   ctx
+                   (if (and (chunk (finish-delta) (result-finish-reason result))
+                            (or (not include-usage?)
+                                (send-obj (usage-chunk-object id created model
+                                                              result)))
+                            (send-text "[DONE]"))
+                       'done
+                       'cancelled)))))
           (lambda (key . args)
             (engine-drop! engine ticket)
+            (request-log-finish! ctx 'failed)
             (and (send-obj (error-object-of key args))
                  (send-text "[DONE]")))))))
 
 ;; Run an arbitrary job (an image generation, a load or an unload) behind the
 ;; admitted chat requests, waiting for its turn in a runner thread. NOTE: the
 ;; same as chat: no dynamic-wind around call-with-runner. A failure drops the
-;; ticket here; engine-run-job drops it when the job returns.
-(define (run-job thunk)
+;; ticket here; engine-run-job drops it when the job returns. CTX is the
+;; request's log record (the current one by default; an SSE producer runs in a
+;; thread without the request's dynamic state and passes it explicitly).
+(define* (run-job thunk #:optional (ctx (current-request-log)))
   (let ((ticket (engine-admit! engine)))
+    (when ctx (request-log-ticket! ctx ticket))
     (catch #t
       (lambda ()
         (call-with-runner
@@ -479,11 +517,216 @@
        alist))
 
 ;;; ---------------------------------------------------------------------------
+;;; Request log
+;;;
+;;; With --request-log PATH every request to a route below appends one JSON
+;;; object as one line. It records metadata only — a request body (a prompt, a
+;;; conversation, an image instruction) is never written:
+;;;
+;;;   id, time (start, Unix seconds), end (Unix seconds), method, path,
+;;;   status (done / failed / cancelled / rejected), ms (the whole request),
+;;;   model, kind (chat / image), queue_ms (the wait for the device),
+;;;   switch_ms (the model switch made for this request, when one happened),
+;;;   prompt_tokens, completion_tokens, cached_tokens (chat),
+;;;   size [width height], steps, n (image),
+;;;   free_mib_start, free_mib_end (device memory free, from nvidia-smi; null
+;;;   when it cannot be read).
+;;;
+;;; A route that answers immediately is logged by the wrapper when the handler
+;;; returns, with the status its response chose (429 is a rejection; any other
+;;; 4xx/5xx a failure). An SSE producer runs after the response is registered,
+;;; so its route claims the record (request-log-defer!) and the producer —
+;;; the only place that sees the end of the stream — writes it.
+
+(define request-log-path (option 'request-log #f))
+(define request-log-lock (make-mutex))
+
+;; Fail at startup, not at the first request, when the path is unusable.
+(when request-log-path
+  (let ((port (open-file request-log-path "a"))) (close-port port)))
+
+;; One request's record. Everything that is only known later (the model, the
+;; token counts, the outcome) is filled in as it becomes known; the ticket
+;; carries the queue wait, and switches is the residency counter sampled when
+;; the request started, so a change means a switch happened for it.
+(define-record-type <request-log>
+  (%make-request-log id method path start free-start switches)
+  request-log?
+  (id request-log-id)
+  (method request-log-method)
+  (path request-log-rule)  ; the route, not the log file's path
+  (start request-log-start)
+  (free-start request-log-free-start)
+  (switches request-log-switches)
+  (model request-log-model set-request-log-model!)
+  (kind request-log-kind set-request-log-kind!)
+  (ticket request-log-ticket set-request-log-ticket!)
+  (prompt-tokens request-log-prompt-tokens set-request-log-prompt-tokens!)
+  (completion-tokens request-log-completion-tokens
+                     set-request-log-completion-tokens!)
+  (cached-tokens request-log-cached-tokens set-request-log-cached-tokens!)
+  (size request-log-size set-request-log-size!)
+  (steps request-log-steps set-request-log-steps!)
+  (n request-log-n set-request-log-n!)
+  (status request-log-status set-request-log-status!)
+  (deferred? request-log-deferred? set-request-log-deferred?!)
+  (done? request-log-done? set-request-log-done?!))
+
+(define current-request-log (make-parameter #f))
+(define request-log-counter 0)
+(define request-log-counter-lock (make-mutex))
+
+(define (new-request-id)
+  (with-mutex request-log-counter-lock
+    (set! request-log-counter (1+ request-log-counter))
+    (format #f "req-~8,'0x-~a" (car (gettimeofday)) request-log-counter)))
+
+;; A value for the JSON document: the value, or null.
+(define (or-null v) (if v v 'null))
+
+(define (tv-diff-ms a b)
+  (inexact->exact
+   (round (* 1000 (+ (- (car b) (car a))
+                     (/ (- (cdr b) (cdr a)) 1000000.0))))))
+
+;; Note what is known about the request being served in this thread, if it is
+;; being logged.
+(define (request-log-note! model kind)
+  (let ((ctx (current-request-log)))
+    (when ctx
+      (set-request-log-model! ctx model)
+      (set-request-log-kind! ctx kind))))
+
+(define (request-log-ticket! ctx ticket)
+  (when ctx (set-request-log-ticket! ctx ticket)))
+
+;; The chat result's token counts.
+(define (request-log-result! ctx result)
+  (when ctx
+    (set-request-log-prompt-tokens! ctx (result-prompt-tokens result))
+    (set-request-log-completion-tokens! ctx (result-completion-tokens result))
+    (set-request-log-cached-tokens! ctx (result-cached-tokens result))))
+
+;; The image request's shape: size (width height), steps and batch count.
+(define (request-log-image! ctx request)
+  (when ctx
+    (set-request-log-size! ctx (list (assoc-ref request "width")
+                                     (assoc-ref request "height")))
+    (set-request-log-steps! ctx (assoc-ref request "steps"))
+    (set-request-log-n! ctx (assoc-ref request "n"))))
+
+;; This request's outcome is written by someone else (an SSE producer). Until
+;; it does, the wrapper leaves the record alone; if registering the response
+;; itself fails, the claim is undone so the wrapper still writes the failure.
+(define (request-log-deferred ctx thunk)
+  (if ctx
+      (begin
+        (set-request-log-deferred?! ctx #t)
+        (catch #t
+          (lambda () (thunk))
+          (lambda (key . args)
+            (set-request-log-deferred?! ctx #f)
+            (apply throw key args))))
+      (thunk)))
+
+;; Write the record, once. STATUS is one of done, failed, cancelled, rejected.
+(define (request-log-finish! ctx status)
+  (when (and ctx request-log-path status)
+    (with-mutex request-log-lock
+      (unless (request-log-done? ctx)
+        (set-request-log-done?! ctx #t)
+        (let* ((end (gettimeofday))
+               (switches-now (residency-switch-count residency))
+               (ticket (request-log-ticket ctx))
+               (size (request-log-size ctx))
+               (line
+                (scm->json-string
+                 `(("id" . ,(request-log-id ctx))
+                   ("time" . ,(car (request-log-start ctx)))
+                   ("end" . ,(car end))
+                   ("method" . ,(symbol->string (request-log-method ctx)))
+                   ("path" . ,(request-log-rule ctx))
+                   ("status" . ,(symbol->string status))
+                   ("ms" . ,(tv-diff-ms (request-log-start ctx) end))
+                   ("model" . ,(or-null (request-log-model ctx)))
+                   ("kind" . ,(or-null (and (request-log-kind ctx)
+                                            (symbol->string
+                                             (request-log-kind ctx)))))
+                   ("queue_ms" . ,(or-null (and ticket
+                                                (engine-ticket-wait-ms ticket))))
+                   ("switch_ms" . ,(or-null
+                                    (and (not (= switches-now
+                                                 (request-log-switches ctx)))
+                                         (residency-last-switch-ms residency))))
+                   ("prompt_tokens" . ,(or-null
+                                        (request-log-prompt-tokens ctx)))
+                   ("completion_tokens" . ,(or-null
+                                            (request-log-completion-tokens ctx)))
+                   ("cached_tokens" . ,(or-null
+                                        (request-log-cached-tokens ctx)))
+                   ("size" . ,(or-null (and size (list->vector size))))
+                   ("steps" . ,(or-null (request-log-steps ctx)))
+                   ("n" . ,(or-null (request-log-n ctx)))
+                   ("free_mib_start" . ,(or-null (request-log-free-start ctx)))
+                   ("free_mib_end" . ,(or-null (residency-free-vram-mib))))))
+               (port (open-file request-log-path "a")))
+          (display line port)
+          (newline port)
+          (close-port port))))))
+
+;; The value of a keyword in the response-emit argument list, or DEFAULT.
+(define (keyword-ref args key default)
+  (let loop ((a args))
+    (cond ((null? a) default)
+          ((eq? (car a) key) (cadr a))
+          (else (loop (cddr a))))))
+
+;; Wrap a route handler so it logs its request when it answers. The status is
+;; the one the handler's response-emit chose: a 429 is a rejection, any other
+;; error a failure. A handler-producer pair that claims the record
+;; (request-log-deferred) writes it itself. The response values pass through
+;; untouched.
+(define (logged handler)
+  (lambda (rc)
+    (let* ((start (gettimeofday))
+           (ctx (and request-log-path
+                     (%make-request-log (new-request-id)
+                                        (rc-method rc) (rc-path rc) start
+                                        (residency-free-vram-mib)
+                                        (residency-switch-count residency)))))
+      (parameterize ((current-request-log ctx))
+        (call-with-values
+            (lambda () (handler rc))
+          (lambda (body . rest)
+            (when (and ctx (not (request-log-deferred? ctx)))
+              (let ((code (keyword-ref rest #:status 200)))
+                (request-log-finish!
+                 ctx
+                 (or (request-log-status ctx)
+                     (cond ((= code 429) 'rejected)
+                           ((>= code 400) 'failed)
+                           (else 'done))))))
+            (apply values body rest)))))))
+
+;; The routes below register through these so every plain HTTP request is
+;; logged. get / post / page-delete take the handler as their last argument,
+;; options before it. The WebSocket route stays on get: its handler is a
+;; callback factory, not a response.
+(define (logged-register register rule opts-and-handler)
+  (let* ((rev (reverse opts-and-handler))
+         (handler (logged (car rev))))
+    (apply register rule (reverse (cons handler (cdr rev))))))
+
+(define (logged-get rule . rest) (logged-register get rule rest))
+(define (logged-post rule . rest) (logged-register post rule rest))
+(define (logged-delete rule . rest) (logged-register page-delete rule rest))
+
+;;; ---------------------------------------------------------------------------
 ;;; Routes
 
-(get "/health" (lambda (rc) "ok"))
+(logged-get "/health" (lambda (rc) "ok"))
 
-(get "/v1/models" #:mime 'json
+(logged-get "/v1/models" #:mime 'json
   (lambda (rc)
     (:mime rc
            `(("object" . "list")
@@ -497,7 +740,7 @@
                                         #:loaded (residency-loaded? residency id))))
                    (residency-ids residency))))))))
 
-(get "/v1/models/:id"
+(logged-get "/v1/models/:id"
   (lambda (rc)
     (let ((id (params rc "id")))
       (if (eq? 'chat (residency-kind residency id))
@@ -508,7 +751,7 @@
 
 ;; Every served model, chat and image, with its residency state. Only one of
 ;; them is loaded at a time (the one the last job left on the device).
-(get "/sonicboom/models" #:mime 'json
+(logged-get "/sonicboom/models" #:mime 'json
   (lambda (rc)
     (:mime rc
            `(("object" . "list")
@@ -521,61 +764,72 @@
 ;; Load and unload are ordinary jobs: they queue behind running work and
 ;; switch the device only when it is idle. A load switches away from the
 ;; resident model, exactly as a request for this model would.
-(post "/sonicboom/models/:id/load"
+(logged-post "/sonicboom/models/:id/load"
   (lambda (rc)
     (let ((id (params rc "id")))
       (catch #t
         (lambda ()
           (unless (residency-known? residency id)
             (throw 'model-not-found id))
+          (request-log-note! id (residency-kind residency id))
           (run-job (lambda () (residency-load! residency id)))
           (json-emit 200 (alist->json (residency-info residency id))))
         (lambda (key . args)
           (apply error-emit (classify key args)))))))
 
-(post "/sonicboom/models/:id/unload"
+(logged-post "/sonicboom/models/:id/unload"
   (lambda (rc)
     (let ((id (params rc "id")))
       (catch #t
         (lambda ()
           (unless (residency-known? residency id)
             (throw 'model-not-found id))
+          (request-log-note! id (residency-kind residency id))
           (run-job (lambda () (residency-unload! residency id)))
           (json-emit 200 (alist->json (residency-info residency id))))
         (lambda (key . args)
           (apply error-emit (classify key args)))))))
 
-(post "/v1/chat/completions"
+(logged-post "/v1/chat/completions"
   (lambda (rc)
-    (catch #t
-      (lambda ()
-        (call-with-values (lambda () (admit (read-json-body rc)))
-          (lambda (request stream? include-usage? ticket)
-            (if stream?
-                (sse-response
-                 (lambda (send)
-                   (stream-chunks ticket request include-usage?
-                                  (lambda (obj) (send (json-ascii-string obj)))
-                                  send)))
-                ;; NOTE: No dynamic-wind around call-with-runner: the task
-                ;;       is suspended by aborting to the Ragnarok scheduler,
-                ;;       which would run the after thunk while the runner
-                ;;       still works. engine-run leaves the queue itself.
-                (let ((result (catch #t
-                                (lambda ()
-                                  (call-with-runner
-                                   (lambda () (engine-run engine ticket request
-                                                          (lambda _ #t)))
-                                   #:timeout 0))
-                                (lambda (key . args)
-                                  (engine-drop! engine ticket)
-                                  (apply throw key args)))))
-                  (json-emit 200 (completion-object
-                                  (new-completion-id) (now)
-                                  (chat-request-model request) result
-                                  #:seed (chat-request-seed request))))))))
-      (lambda (key . args)
-        (apply error-emit (classify key args))))))
+    (let ((ctx (current-request-log)))
+      (catch #t
+        (lambda ()
+          (call-with-values (lambda () (admit (read-json-body rc)))
+            (lambda (request stream? include-usage? ticket)
+              (if stream?
+                  ;; The producer runs after this handler returns, in a
+                  ;; thread of its own: it gets the record explicitly and
+                  ;; writes it when the stream ends.
+                  (request-log-deferred
+                   ctx
+                   (lambda ()
+                     (sse-response
+                      (lambda (send)
+                        (stream-chunks ticket request include-usage? ctx
+                                       (lambda (obj)
+                                         (send (json-ascii-string obj)))
+                                       send)))))
+                  ;; NOTE: No dynamic-wind around call-with-runner: the task
+                  ;;       is suspended by aborting to the Ragnarok scheduler,
+                  ;;       which would run the after thunk while the runner
+                  ;;       still works. engine-run leaves the queue itself.
+                  (let ((result (catch #t
+                                  (lambda ()
+                                    (call-with-runner
+                                     (lambda () (engine-run engine ticket request
+                                                            (lambda _ #t)))
+                                     #:timeout 0))
+                                  (lambda (key . args)
+                                    (engine-drop! engine ticket)
+                                    (apply throw key args)))))
+                    (request-log-result! ctx result)
+                    (json-emit 200 (completion-object
+                                    (new-completion-id) (now)
+                                    (chat-request-model request) result
+                                    #:seed (chat-request-seed request))))))))
+        (lambda (key . args)
+          (apply error-emit (classify key args)))))))
 
 ;; Image generation is blocking and long, so it runs in a runner thread like a
 ;; chat completion (same NOTE as above: no dynamic-wind around the runner),
@@ -587,48 +841,57 @@
 ;; {"step","total","image"} event per denoising step, then the images object,
 ;; then "[DONE]". Either way the job can be cancelled by id; a cancellation
 ;; answers 409 (non-stream) or {"id","status":"cancelled"} (stream).
-(post "/v1/images/generations"
+(logged-post "/v1/images/generations"
   (lambda (rc)
-    (catch #t
-      (lambda ()
-        (let* ((body (read-json-body rc))
-               (stream? (eq? #t (assoc-ref body "stream")))
-               (request (parse-image-request body))
-               (job (job-register!))
-               (headers `((sonicboom-job-id . ,(job-id job)))))
-          (if stream?
-              (sse-response
-               (lambda (send)
-                 ;; The producer always runs, even when the client is already
-                 ;; gone, so the job is unregistered either way.
-                 (dynamic-wind
-                   (lambda () #t)
-                   (lambda () (stream-images job request send))
-                   (lambda () (job-unregister! job))))
-               #:headers headers)
-              (catch #t
-                (lambda ()
-                  (let ((b64s (run-job
-                               (lambda ()
-                                 (residency-ensure! residency image-model-id)
-                                 (render-images request
-                                                #:progress
-                                                (image-progress job #f))))))
+    (let ((ctx (current-request-log)))
+      (catch #t
+        (lambda ()
+          (let* ((body (read-json-body rc))
+                 (stream? (eq? #t (assoc-ref body "stream")))
+                 (request (parse-image-request body))
+                 (job (job-register!))
+                 (headers `((sonicboom-job-id . ,(job-id job)))))
+            (request-log-note! image-model-id 'image)
+            (request-log-image! ctx request)
+            (if stream?
+                ;; The producer writes the record when the stream ends.
+                (request-log-deferred
+                 ctx
+                 (lambda ()
+                   (sse-response
+                    (lambda (send)
+                      ;; The producer always runs, even when the client is
+                      ;; already gone, so the job is unregistered either way.
+                      (dynamic-wind
+                        (lambda () #t)
+                        (lambda () (stream-images job request ctx send))
+                        (lambda () (job-unregister! job))))
+                    #:headers headers)))
+                (catch #t
+                  (lambda ()
+                    (let ((b64s (run-job
+                                 (lambda ()
+                                   (residency-ensure! residency image-model-id)
+                                   (render-images request
+                                                  #:progress
+                                                  (image-progress job #f))))))
+                      (job-unregister! job)
+                      (json-emit 200 (images-object (now) b64s)
+                                 #:headers headers)))
+                  (lambda (key . args)
                     (job-unregister! job)
-                    (json-emit 200 (images-object (now) b64s)
-                               #:headers headers)))
-                (lambda (key . args)
-                  (job-unregister! job)
-                  (apply throw key args))))))
-      (lambda (key . args)
-        (apply error-emit (classify key args))))))
+                    (when (and ctx (cancelled-condition? key args))
+                      (set-request-log-status! ctx 'cancelled))
+                    (apply throw key args))))))
+        (lambda (key . args)
+          (apply error-emit (classify key args)))))))
 
 ;; Cancel a running or queued generation. The device work stops after the
 ;; current denoising step and its buffers are released; the response names the
 ;; job and its status. An unknown id (a finished job included) is a 404.
 ;; NOTE: Artanis exports the DELETE route as page-delete; its usual name,
 ;;       delete, is the (srfi srfi-1) procedure here.
-(page-delete "/sonicboom/jobs/:id"
+(logged-delete "/sonicboom/jobs/:id"
   (lambda (rc)
     (let ((id (params rc "id")))
       (if (job-cancel! id)
@@ -675,11 +938,13 @@
                                                "the message is not valid JSON")))))
             (lambda (request stream? include-usage? ticket)
               (spawn
-               (lambda () (stream-chunks ticket request include-usage? send-obj send-text))))))
+               (lambda ()
+                 (stream-chunks ticket request include-usage? #f send-obj
+                                send-text))))))
         (lambda (key . args)
           (send-obj (error-object-of key args)))))))
 
-(get "/sonicboom/stats" #:mime 'json
+(logged-get "/sonicboom/stats" #:mime 'json
   (lambda (rc)
     (:mime rc
            `(("engine" . ,(alist->json (engine-stats engine)))

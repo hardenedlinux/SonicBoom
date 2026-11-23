@@ -24,6 +24,7 @@
 #include <sonicboom/model/moss_pipeline.h>
 #include <sonicboom/model/moss_text.h>
 #include <sonicboom/model/plan.h>
+#include <sonicboom/safetensors/reader.h>
 #include <sonicboom/vocab/vocab.h>
 
 #include "capi_private.h"
@@ -34,9 +35,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -217,6 +220,148 @@ boom_status boom_image_model_arch(const boom_image_model *model, char *out,
         }
         std::memcpy(out, kArch, needed + 1);
         return BOOM_OK;
+      },
+      err_out);
+}
+
+// --- Model info -------------------------------------------------------------
+
+namespace {
+
+namespace st = sonicboom::safetensors;
+
+// One component's (or one dtype's) share of the checkpoint.
+struct WeightTotals {
+  uint64_t tensors = 0;
+  uint64_t weights = 0;
+  uint64_t bytes = 0;
+};
+
+void note_tensor(WeightTotals &totals, const st::TensorInfo &info) {
+  ++totals.tensors;
+  totals.weights += info.n_elements;
+  totals.bytes += info.end - info.begin;
+}
+
+std::expected<WeightTotals, std::string> sharded_totals(
+    std::map<std::string_view, WeightTotals> &by_dtype,
+    const std::filesystem::path &index_path) {
+  auto reader = st::ShardedReader::load(index_path);
+  if (!reader)
+    return std::unexpected(index_path.string() + ": " + reader.error().message);
+  WeightTotals totals;
+  for (const st::ShardedTensor &t : reader->tensors()) {
+    note_tensor(totals, t.info);
+    note_tensor(by_dtype[st::dtype_name(t.info.dtype)], t.info);
+  }
+  return totals;
+}
+
+std::expected<WeightTotals, std::string> single_totals(
+    std::map<std::string_view, WeightTotals> &by_dtype,
+    const std::filesystem::path &path) {
+  auto reader = st::Reader::load(path);
+  if (!reader)
+    return std::unexpected(path.string() + ": " + reader.error().message);
+  WeightTotals totals;
+  for (const st::TensorInfo &t : reader->tensors()) {
+    note_tensor(totals, t);
+    note_tensor(by_dtype[st::dtype_name(t.dtype)], t);
+  }
+  return totals;
+}
+
+// The three components are read again here, header only: the pipeline keeps
+// its own readers, which do not expose their tensor directories, and the
+// safetensors header is a few kilobytes per shard.
+std::expected<std::string, std::string> image_model_info_json(
+    const boom_image_model &model) {
+  std::map<std::string_view, WeightTotals> by_dtype;
+
+  auto text = sharded_totals(by_dtype, model.root / "text_encoder" /
+                                             "model.safetensors.index.json");
+  if (!text) return std::unexpected(text.error());
+  auto dit = sharded_totals(
+      by_dtype, model.root / "transformer" /
+                    "diffusion_pytorch_model.safetensors.index.json");
+  if (!dit) return std::unexpected(dit.error());
+  auto vae = single_totals(by_dtype, model.root / "vae" /
+                                            "diffusion_pytorch_model.safetensors");
+  if (!vae) return std::unexpected(vae.error());
+
+  const WeightTotals all{text->tensors + dit->tensors + vae->tensors,
+                         text->weights + dit->weights + vae->weights,
+                         text->bytes + dit->bytes + vae->bytes};
+
+  uint64_t context_length = 0;
+  if (const moss::TextEncoder *encoder = model.pipeline->text_encoder();
+      encoder != nullptr)
+    context_length =
+        static_cast<uint64_t>(encoder->config().max_position_embeddings);
+
+  std::string out = "{\"arch\": \"moss-image\", \"params\": ";
+  out += std::to_string(all.weights);
+  out += ", \"context_length\": ";
+  out += std::to_string(context_length);
+  out += ", \"vocab_size\": ";
+  out += std::to_string(model.vocab.tokens.size());
+  // The pipeline carries image components (the VAE decoder); it accepts no
+  // image input, which is the same question the LLM flag answers.
+  out += ", \"has_vision\": true, \"has_tool_template\": false, \"tensors\": ";
+  out += std::to_string(all.tensors);
+  out += ", \"quant\": [";
+  bool first = true;
+  for (const auto &[name, totals] : by_dtype) {
+    if (!first) out += ", ";
+    first = false;
+    out += "{\"type\": ";
+    sonicboom::capi_private::append_json_string(out, name);
+    out += ", \"tensors\": ";
+    out += std::to_string(totals.tensors);
+    out += ", \"weights\": ";
+    out += std::to_string(totals.weights);
+    out += ", \"bytes\": ";
+    out += std::to_string(totals.bytes);
+    out += '}';
+  }
+  out += "], \"components\": {";
+  out += "\"text_encoder\": {\"tensors\": ";
+  out += std::to_string(text->tensors);
+  out += ", \"weights\": ";
+  out += std::to_string(text->weights);
+  out += ", \"bytes\": ";
+  out += std::to_string(text->bytes);
+  out += "}, \"transformer\": {\"tensors\": ";
+  out += std::to_string(dit->tensors);
+  out += ", \"weights\": ";
+  out += std::to_string(dit->weights);
+  out += ", \"bytes\": ";
+  out += std::to_string(dit->bytes);
+  out += "}, \"vae\": {\"tensors\": ";
+  out += std::to_string(vae->tensors);
+  out += ", \"weights\": ";
+  out += std::to_string(vae->weights);
+  out += ", \"bytes\": ";
+  out += std::to_string(vae->bytes);
+  out += "}}}";
+  return out;
+}
+
+}  // namespace
+
+boom_status boom_image_model_info(const boom_image_model *model, char *out,
+                              size_t cap, size_t *len_out,
+                              boom_error **err_out) {
+  return guard(
+      [&]() -> boom_status {
+        if (model == nullptr || len_out == nullptr) return BOOM_ERR_INTERNAL;
+        auto json = image_model_info_json(*model);
+        if (!json) {
+          set_error(err_out, BOOM_ERRKIND_WEIGHT, json.error().c_str());
+          return BOOM_ERR_INTERNAL;
+        }
+        return sonicboom::capi_private::copy_json_document(
+            *json, out, cap, len_out, err_out, "boom_image_model_info");
       },
       err_out);
 }

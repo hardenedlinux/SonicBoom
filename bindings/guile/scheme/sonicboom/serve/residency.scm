@@ -43,7 +43,9 @@
             make-residency residency? residency-entries residency-entry
             residency-ids residency-known? residency-kind
             residency-loaded? residency-active residency-model residency-family
-            residency-ensure! residency-load! residency-unload! residency-info))
+            residency-ensure! residency-load! residency-unload! residency-info
+            residency-switch-count residency-last-switch-ms
+            residency-free-vram-mib))
 
 ;; One served model: its identity, how to load it, and its residency state.
 ;;
@@ -100,10 +102,16 @@ PyTorch: none"
 ;; engine's queue, so the manager needs no lock of its own: its state is only
 ;; changed between jobs, and readers see one field at a time.
 ;;
+;; switches counts the switches made since construction and recent-switch-ms
+;; is the duration of the last one, so a request can report a switch that
+;; happened while it waited (the counter changed) without this module knowing
+;; which request caused it.
+;;
 ;; PyTorch: none
 (define-record-type <residency>
   (make-residency* engine backend entries max-sessions token-budget
-                   image-loader image-unloader image-arch trim)
+                   image-loader image-unloader image-arch trim
+                   switches recent-switch-ms)
   residency?
   (engine residency-engine)
   (backend residency-backend)
@@ -113,7 +121,10 @@ PyTorch: none"
   (image-loader residency-image-loader)
   (image-unloader residency-image-unloader)
   (image-arch residency-image-arch)
-  (trim residency-trim))
+  (trim residency-trim)
+  (switches residency-switches set-residency-switches!)
+  (recent-switch-ms residency-recent-switch-ms
+                    set-residency-recent-switch-ms!))
 
 (define* (make-residency engine entries
                          #:key backend (max-sessions 4) (token-budget 32768)
@@ -149,7 +160,33 @@ Example:
   => #t
 PyTorch: none"
   (make-residency* engine backend entries max-sessions token-budget
-                   image-loader image-unloader image-arch trim))
+                   image-loader image-unloader image-arch trim 0 #f))
+
+(define (residency-switch-count resid)
+  "How many model switches RESID has made since it was created.
+
+Args:
+  resid: a residency manager.
+Returns: an exact non-negative integer.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
+               (sonicboom serve engine) (sonicboom serve residency))
+  (residency-switch-count
+   (make-residency (make-engine '())
+                   (list (make-residency-entry \"m\" 'chat '((id . \"m\"))))
+                   #:backend (make-mock-backend)))
+  => 0
+PyTorch: none"
+  (residency-switches resid))
+
+(define (residency-last-switch-ms resid)
+  "How long RESID's last model switch took, in milliseconds.
+
+Args:
+  resid: a residency manager.
+Returns: the switch duration in ms, or #f before the first switch.
+PyTorch: none"
+  (residency-recent-switch-ms resid))
 
 (define (residency-entry resid id)
   "The entry of model ID, or #f.
@@ -240,10 +277,17 @@ PyTorch: none"
 (define (now-ms)
   (quotient (* 1000 (get-internal-real-time)) internal-time-units-per-second))
 
-;; Free device memory in MiB, or #f when it cannot be read (no NVIDIA driver,
-;; no nvidia-smi). It is asked once per load and once per unload, not per
-;; request.
-(define (free-vram-mib)
+(define (residency-free-vram-mib)
+  "Free device memory in MiB, or #f when it cannot be read.
+
+Args:
+  none.
+Returns: an exact integer (MiB), or #f without an NVIDIA driver or
+  nvidia-smi.
+PyTorch: none
+Note: each call starts nvidia-smi. The manager asks it around a load and an
+unload; the request log asks it at a request's start and end when the log is
+enabled. Nothing on the normal request path calls it."
   (catch #t
     (lambda ()
       (let* ((port (open-input-pipe
@@ -252,6 +296,9 @@ PyTorch: none"
         (close-pipe port)
         (and (not (eof-object? line)) (string->number (string-trim-both line)))))
     (lambda _ #f)))
+
+;; The private name the manager uses around loads and unloads.
+(define (free-vram-mib) (residency-free-vram-mib))
 
 ;; What the load took, from the free-memory readings around it.
 (define (vram-delta before after)
@@ -315,7 +362,10 @@ PyTorch: none"
         (let ((t0 (now-ms)))
           (when active (unload-entry! resid active))
           (load-entry! resid e)
-          (set-residency-entry-switch-ms! e (- (now-ms) t0))
+          (let ((ms (- (now-ms) t0)))
+            (set-residency-entry-switch-ms! e ms)
+            (set-residency-switches! resid (1+ (residency-switches resid)))
+            (set-residency-recent-switch-ms! resid ms))
           e))))
 
 (define (residency-ensure! resid id)
