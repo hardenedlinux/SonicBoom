@@ -107,6 +107,18 @@ bool stats_enabled() {
   return env && *env && std::strcmp(env, "0") != 0;
 }
 
+// The routing trace (SONICBOOM_EXPERT_TRACE=path): one line per selection
+// node, "block entries id...", appended in execution order. An offline
+// simulator replays it; the runtime never reads the file. Off unless set.
+std::FILE* trace_file() {
+  static std::FILE* f = [] {
+    const char* path = std::getenv("SONICBOOM_EXPERT_TRACE");
+    if (!path || !*path) return static_cast<std::FILE*>(nullptr);
+    return std::fopen(path, "w");
+  }();
+  return f;
+}
+
 // One process-wide pool, keyed by the weights object it belongs to.
 struct Registry {
   std::mutex mutex;
@@ -335,6 +347,13 @@ std::expected<void, std::string> ExpertPool::select(
                              std::to_string(block));
   }
   if (ids.empty()) return {};
+
+  if (std::FILE* f = trace_file()) {
+    std::fprintf(f, "%u %zu", block, ids.size());
+    for (int64_t id : ids) std::fprintf(f, " %lld", static_cast<long long>(id));
+    std::fputc('\n', f);
+    std::fflush(f);
+  }
 
   const uint64_t node = ++stats_.nodes;
 
