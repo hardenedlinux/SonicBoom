@@ -292,13 +292,13 @@ on/off on the public models).
 | | |
 |---|---|
 | GPU | NVIDIA GeForce RTX 3050, 8 GB, compute 8.6 |
-| Driver / CUDA | 595.84 (CUDA 13.2 driver API); nvcc 12.0.140 |
+| Driver / CUDA | 595.84 (CUDA 13.2 driver API); nvcc 13.0.48 (CUDA 13.0 build) |
 | CPU | AMD Ryzen 5 5500 (6C/12T, Zen 3), PCIe 3.0 |
 | RAM | 32 GB DDR4-2400, single channel |
 | Host | Desktop, Ubuntu 24.04, Linux 6.8, x86-64, g++-13, build type Release |
 | Gemma model | [`unsloth/gemma-4-e4b-it-GGUF`](https://huggingface.co/unsloth/gemma-4-e4b-it-GGUF) → `gemma-4-E4B-it-Q5_K_M.gguf` (5,481,798,784 bytes, sha256 `a5d6e634db151368d2caa4270fd32ab604d96c2d1291950586989f46d8e17d36`) |
 | Qwen2.5-7B model | [`ngxson/Qwen2.5-7B-Instruct-1M-Q4_K_M-GGUF`](https://huggingface.co/ngxson/Qwen2.5-7B-Instruct-1M-Q4_K_M-GGUF) → `qwen2.5-7b-instruct-1m-q4_k_m.gguf` (4,683,073,888 bytes, sha256 `6dba997502a27b5f0c840346f45d9d62c0a04e6eb3cf72adc6c7ceb18804f380`) |
-| llama.cpp | commit `43fe9c64281`, CUDA build, `llama-bench -ngl 99` |
+| llama.cpp | commit `43fe9c64281`, CUDA 13.0 build (`build-cuda13`), `llama-bench -ngl 99` |
 | SonicBoom build | `tools/sb-report.sh`: git commit, CUDA archs actually compiled, LLVM version |
 
 The comparison is against llama.cpp at the commit above; newer versions may be
@@ -313,7 +313,7 @@ tests).
 # canonical table for one model (SonicBoom; set LLAMA_BIN to add the
 # llama.cpp column and the ratios — llama-bench and llama-server are taken
 # from that directory; --no-llama measures SonicBoom alone)
-LLAMA_BIN=$LLAMA_ROOT/build-cuda/bin \
+LLAMA_BIN=$LLAMA_ROOT/build-cuda13/bin \
   tools/bench.sh models/gemma-4-E4B-it-Q5_K_M.gguf
 
 # one metric by hand, e.g. decode at depth 512 (model from SONICBOOM_GEMMA_GGUF)
@@ -321,16 +321,23 @@ SONICBOOM_GEMMA_GGUF=models/gemma-4-E4B-it-Q5_K_M.gguf \
   tools/baseline/longctx_bench --depth 512 --steps 64
 
 # baseline (llama.cpp, same GGUF and machine)
-$LLAMA_ROOT/build-cuda/bin/llama-bench \
+$LLAMA_ROOT/build-cuda13/bin/llama-bench \
   -m models/gemma-4-E4B-it-Q5_K_M.gguf -p 512 -n 64 -ngl 99 -r 1
 
 # extended-context tiers: decode at depth 4K/8K/16K/32K and prefill 4K–32K
-LLAMA_BIN=$LLAMA_ROOT/build-cuda/bin \
+LLAMA_BIN=$LLAMA_ROOT/build-cuda13/bin \
   tools/bench.sh models/gemma-4-E4B-it-Q5_K_M.gguf --long
 
 # correctness
 ctest --test-dir build
 ```
+
+If the CUDA 13.0 toolkit is installed outside the dynamic-loader path (as on
+the reference machine, under `$HOME/opt/cuda-13.0`), prefix the commands that
+load CUDA with `LD_LIBRARY_PATH=$CUDA13/lib64:$LD_LIBRARY_PATH`, where
+`$CUDA13` is that toolkit root; otherwise both llama.cpp's `libcudart.so.13`
+and SonicBoom's `libsonicboom.so` fail to resolve their CUDA runtime. The
+CTest suite sets the variable itself.
 
 ## Standard run
 

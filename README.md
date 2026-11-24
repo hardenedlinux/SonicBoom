@@ -81,7 +81,8 @@ Details: [docs/reproducibility.md](docs/reproducibility.md).
 
 ## Quick start
 
-Requirements: Linux x86-64, g++-13, CMake, Ninja, CUDA 12.0+, an NVIDIA GPU
+Requirements: Linux x86-64, g++-13, CMake, Ninja, CUDA 13.0 (12.0 is the
+minimum supported toolkit), an NVIDIA GPU
 (tested on sm_86), GNU Guile 3.0 with
 [guile-json](https://github.com/aconchillo/guile-json) 4.7.3, and
 [SonicCross](https://github.com/hardenedlinux/SonicCross) v0.0.2 at build

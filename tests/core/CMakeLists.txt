@@ -48,11 +48,26 @@ endif()
 # Register a C++ suite with CTest. The suites load libsonicboom.so at runtime,
 # so the loader path must include its directory; the executable path is resolved
 # through a generator expression so it stays valid across build configurations.
+#
+# A suite that links the CUDA runtime directly (test_fattn_fa2 launches the
+# prefill kernel from a .cu translation unit) also needs libcudart.so.<major> at
+# load time. In a toolkit-only CUDA install (nvcc named on the configure line,
+# nothing on the system linker path) that library lives in the toolkit's own lib
+# directory, which a command-line LD_LIBRARY_PATH would hide. It is therefore
+# part of the loader path the test is launched with, from the test environment:
+# the toolkit the build used, then the build's library directory, then anything
+# the caller already had.
 function(boom_add_cpp_test name)
-  add_test(NAME ${name}
-           COMMAND ${CMAKE_COMMAND} -E env
-                   LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
-                   $<TARGET_FILE:${name}>)
+  set(_boom_test_ld "$<TARGET_FILE_DIR:sonicboom>")
+  if(SONICBOOM_USE_CUDA AND CUDAToolkit_LIBRARY_DIR)
+    string(PREPEND _boom_test_ld "${CUDAToolkit_LIBRARY_DIR}:")
+  endif()
+  if(DEFINED ENV{LD_LIBRARY_PATH} AND NOT "$ENV{LD_LIBRARY_PATH}" STREQUAL "")
+    string(APPEND _boom_test_ld ":$ENV{LD_LIBRARY_PATH}")
+  endif()
+  add_test(NAME ${name} COMMAND $<TARGET_FILE:${name}>)
+  set_tests_properties(${name} PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=${_boom_test_ld}")
 endfunction()
 
 foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_s_expr test_s_expr_exec test_native_ops test_autograd test_gguf test_dequant test_nn test_gemma4 test_qwen2_config test_vocab test_clip_grad_norm test_safetensors test_grammar test_sampling test_png test_tune_fingerprint test_gated_attention)

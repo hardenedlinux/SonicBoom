@@ -18,6 +18,10 @@ export LC_ALL=C LANG=C
 # unchanged (the server step is tools/bench-serve.sh), and any failure stops the
 # run with a non-zero status.
 #
+# The SonicBoom side is the default build (CUDA 13.0; 12.0 is the minimum
+# supported toolkit) and the llama.cpp side is that commit's build-cuda13, so
+# both arms are built with the same toolkit.
+#
 # Usage: tools/community-bench.sh <model.gguf> <llama.cpp/build/bin>
 #                                 [--runs N] [--no-llama] [--out FILE] [--serve]
 #                                 [--toolcall]

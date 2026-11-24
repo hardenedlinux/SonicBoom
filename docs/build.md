@@ -11,10 +11,13 @@ nothing else is needed at run time.
   is not wired up yet — the AVX2 translation unit has no architecture guard, so
   it does not compile there as it stands. The port is a guard plus a NEON
   sibling of the same fixed-point kernel.
-- CUDA toolkit 12.0 or newer and an NVIDIA GPU, compute capability 6.1 or
-  newer (`__dp4a`) — 7.5 or newer for the tensor-core MMQ path. The default
-  build targets the build machine's GPU as SASS only (see *CUDA architecture*);
-  the release is built and tested for **sm_86** (RTX 30-series).
+- CUDA toolkit 13.0 (the default and tested version) and an NVIDIA GPU,
+  compute capability 6.1 or newer (`__dp4a`) — 7.5 or newer for the
+  tensor-core MMQ path. CUDA 12.0 is the minimum supported toolkit; it is kept
+  buildable for comparisons against older libraries but is no longer the
+  default. The default build targets the build machine's GPU as SASS only (see
+  *CUDA architecture*); the release is built and tested for **sm_86**
+  (RTX 30-series).
 - GNU Guile 3.0 and
   [guile-json](https://github.com/aconchillo/guile-json) (the `(json)` module,
   used by the Guile binding for build info and by the serve front end).
@@ -55,6 +58,16 @@ tools/mlir/build-mlir.sh
 
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSONICBOOM_USE_CUDA=ON
 cmake --build build
+```
+
+CUDA 13.0 is what the default build and every published number use. When more
+than one toolkit is installed and `nvcc` on `PATH` is not 13.0, name the
+compiler explicitly; CMake derives the rest of the toolkit (libraries,
+`libdevice`, `nvtx3` headers) from it:
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSONICBOOM_USE_CUDA=ON \
+      -DCMAKE_CUDA_COMPILER=/opt/cuda-13.0/bin/nvcc
 ```
 
 The LLVM submodule is large, so the first clone and build take a while.

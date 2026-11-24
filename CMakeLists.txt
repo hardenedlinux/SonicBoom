@@ -161,9 +161,10 @@ if(SONICBOOM_USE_CUDA)
   endif()
 
   # native-torch headers (c10/util/intrusive_ptr.h) use C++20's operator<=>,
-  # so .cu host compilation needs C++20 (nvcc 12.0's highest supported host
-  # standard). This mirrors the C++23 the CPU native-torch TUs already compile
-  # under; C++20 is the closest nvcc 12.0 can reach.
+  # so .cu host compilation needs C++20. The default toolkit is 13.0, but 12.0
+  # remains the minimum supported and tops out at C++20 for the host compiler,
+  # so the CUDA standard stays at 20. This mirrors the C++23 the CPU
+  # native-torch TUs already compile under.
   set(CMAKE_CUDA_STANDARD 20)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 

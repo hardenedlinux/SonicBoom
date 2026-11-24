@@ -7,6 +7,10 @@ export LC_ALL=C LANG=C
 #
 # bench.sh — the one canonical SonicBoom benchmark.
 #
+# The SonicBoom side is the default build, which is CUDA 13.0 (12.0 is the
+# minimum supported toolkit); the llama.cpp reference is that commit's
+# build-cuda13 (CUDA 13.0) as well, so both sides of a ratio share a toolkit.
+#
 # Runs the canonical metric set for a GGUF and prints one table per model
 # (SonicBoom, and llama.cpp + ratio unless --no-llama). Every metric is the
 # median of `--runs` (default 3) independent process runs; each underlying tool
