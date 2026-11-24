@@ -425,6 +425,7 @@ add_subdirectory(core)
 
 # Public benchmark tools (C ABI).
 add_subdirectory(tools/bench)
+add_subdirectory(tools/output-decay)
 
 # M2 Layer 2 boundary tests.
 add_subdirectory(tests/core)
