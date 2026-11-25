@@ -3066,7 +3066,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       std::expected<void, std::string> selected;
       {
         ExpertStageTimer select_timer(ExpertStageTimer::kSelect);
-        selected = (*pool)->select(weight_layer, ids, !cpu_path);
+        selected = (*pool)->select(weight_layer, ids, !cpu_path,
+                                   /*defer_wait=*/true);
       }
       if (!selected) return std::unexpected(fail(selected.error()));
       // The selection entries the pool left to the host (slot -1). They are in
@@ -3101,13 +3102,23 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         ok = false;
         break;
       }
+      // Upload overlap: each selection entry's completion mark, so the kernel
+      // can start a resident expert without waiting for the node's last copy.
+      // Empty when the pool runs without overlap.
+      std::vector<uint64_t> entry_events;
+      if ((*pool)->overlap_enabled()) {
+        entry_events.resize(size_t(rows * k));
+        for (size_t j = 0; j < entry_events.size(); ++j)
+          entry_events[j] = (*pool)->entry_event(j);
+      }
       {
         ExpertStageTimer experts_timer(ExpertStageTimer::kExperts);
         ok = nn::cuda::moe_experts_dev(
             dev(in[0]), ids.data(), dev(in[2]),
             static_cast<const int32_t*>((*pool)->selection()),
             (*pool)->selection_host(), views, act, dev_mut(out_handle), rows, k,
-            dim, prefill, pooled, nullptr);
+            dim, prefill, pooled, nullptr,
+            entry_events.empty() ? nullptr : entry_events.data());
       }
       if (ok && !cpu_miss.empty()) {
         // The device kernel left a zero for every host entry, so the host sum

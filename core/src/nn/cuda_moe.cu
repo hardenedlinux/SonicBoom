@@ -558,7 +558,7 @@ bool moe_experts_dev(const float* x, const int64_t* ids_host,
                      const MoeExpertWeights& experts, MoeActivation activation,
                      float* y, uint64_t rows, uint64_t k, uint64_t d,
                      bool group_by_expert, const MoeExpertPool& pool,
-                     void* stream) {
+                     void* stream, const uint64_t* entry_events) {
   if (!quant::cuda::available() || rows == 0 || k == 0 || d == 0 || !x ||
       !ids_host || !weights_dev || !y || !slots_host)
     return false;
@@ -608,6 +608,14 @@ bool moe_experts_dev(const float* x, const int64_t* ids_host,
               cudaSuccess)
             return false;
           continue;
+        }
+        // The expert's upload, if this select issued one, must be complete
+        // before its matrices are read; residents carry no mark and start now.
+        if (entry_events) {
+          const uint64_t ev = entry_events[r * k + j];
+          if (ev && cudaStreamWaitEvent(
+                        s, reinterpret_cast<cudaEvent_t>(ev), 0) != cudaSuccess)
+            return false;
         }
         const quant::QuantizedTensor& gw = experts.gate[e];
         const quant::QuantizedTensor& uw = experts.up[e];
@@ -701,6 +709,15 @@ bool moe_experts_dev(const float* x, const int64_t* ids_host,
     // host-computed expert.
     const int32_t slot = slots_host[kw_of[begin]];
     if (slot < 0) return false;
+    // The first selection entry of this expert is the one select() processed
+    // first, so it carries the mark of this expert's upload (a later entry for
+    // the same expert is a hit on the same slot).
+    if (entry_events) {
+      const uint64_t ev = entry_events[uint64_t(kw_of[begin])];
+      if (ev && cudaStreamWaitEvent(s, reinterpret_cast<cudaEvent_t>(ev), 0) !=
+                    cudaSuccess)
+        return false;
+    }
     const int n_i = int(n_e);
     moe_gather_kernel<<<moe_grid(int64_t(n_e * d)), 256, 0, s>>>(
         x, d_row + begin, X, int64_t(n_e), int64_t(d));

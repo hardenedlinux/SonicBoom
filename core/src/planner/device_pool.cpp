@@ -612,6 +612,44 @@ bool staging_chain(Staging* s, Staging* after) {
 #endif
 }
 
+uint64_t event_create() {
+#ifdef SONICBOOM_USE_CUDA
+  cudaEvent_t e = nullptr;
+  if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
+    (void)cudaGetLastError();
+    return 0;
+  }
+  return reinterpret_cast<uint64_t>(e);
+#else
+  return 0;
+#endif
+}
+
+void event_destroy(uint64_t ev) {
+#ifdef SONICBOOM_USE_CUDA
+  if (!ev) return;
+  if (cudaEventDestroy(reinterpret_cast<cudaEvent_t>(ev)) != cudaSuccess)
+    (void)cudaGetLastError();
+#else
+  (void)ev;
+#endif
+}
+
+bool event_record(uint64_t ev, Staging* s) {
+#ifdef SONICBOOM_USE_CUDA
+  if (!ev || !s) return false;
+  if (cudaEventRecord(reinterpret_cast<cudaEvent_t>(ev), s->copy) !=
+      cudaSuccess) {
+    (void)cudaGetLastError();  // reported by the return value; not sticky
+    return false;
+  }
+  return true;
+#else
+  (void)ev; (void)s;
+  return false;
+#endif
+}
+
 bool synchronize() {
 #ifdef SONICBOOM_USE_CUDA
   return cudaStreamSynchronize(0) == cudaSuccess;

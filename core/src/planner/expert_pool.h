@@ -132,9 +132,22 @@ class ExpertPool {
   // filled, so the pool warms up the way it would with uploads on, and
   // residency stays a function of the routing history. No slot is ever taken
   // from a key this way, so the pool's contents never change once it is full.
+  //
+  // With `defer_wait` true the caller takes the node's ordering on itself: when
+  // the upload overlap is on (SONICBOOM_EXPERT_OVERLAP) the node does not end
+  // with a compute-stream wait for all its copies, and each uploaded entry gets
+  // a completion mark (entry_event) that the caller must hand to the kernel
+  // that uses that entry's expert. Hits carry no mark, or the mark of the
+  // earlier entry of this node that uploaded the same key, so a resident expert
+  // never starts before the copy that fills its slot. Nothing about which slot
+  // holds which key, or the order the kernel visits entries, depends on
+  // timing. The default, false, ends the call with the compute stream ordered
+  // behind every copy it issued, which is what a caller that does not know
+  // about the marks needs.
   std::expected<void, std::string> select(uint32_t block,
                                           std::span<const int64_t> ids,
-                                          bool upload_misses = true);
+                                          bool upload_misses = true,
+                                          bool defer_wait = false);
 
   // Upload the predicted experts `ids` of `block` ahead of its selection node
   // (SONICBOOM_MOE_PREFETCH). The copies travel on a second staging pipeline
@@ -150,6 +163,24 @@ class ExpertPool {
 
   // Whether the prefetch pipeline exists (SONICBOOM_MOE_PREFETCH=on).
   bool prefetch_enabled() const noexcept { return prefetch_staging_ != nullptr; }
+
+  // Upload overlap (SONICBOOM_EXPERT_OVERLAP). When it is on, a select() called
+  // with defer_wait does not make the compute stream wait for every copy of the
+  // node at its end; each selection entry that uploaded an expert is given a
+  // completion mark (entry_event), and the kernel waits for that entry's own
+  // mark just before using it. Residents compute while the misses travel; the
+  // arithmetic and the per-entry order are unchanged, so the output does not
+  // depend on how much of the copy finished first. Off under a CUDA Graph
+  // capture (the copies are host-issued stream waits) and when the staged
+  // pipeline is missing.
+  bool overlap_enabled() const noexcept { return overlap_; }
+
+  // The completion mark of selection entry j (0 when it has none), as written
+  // by the last select() called with defer_wait; valid until the next select().
+  // Zero for a select() without it: that call ended with the node-wide wait.
+  uint64_t entry_event(size_t j) const noexcept {
+    return j < entry_events_.size() ? entry_events_[j] : 0;
+  }
 
   Stats stats() const;
 
@@ -224,6 +255,13 @@ class ExpertPool {
   // The host expert ranges registered in place for direct copies, as passed to
   // device::host_register_pages(); unregistered at destruction.
   std::vector<std::pair<const void*, uint64_t>> host_registered_;
+  // Upload overlap: the policy, the per-entry mark of the last select() (0 when
+  // the entry needs no wait), and the marks themselves, one reused per entry
+  // index and created on first use.
+  bool overlap_ = false;
+  std::vector<uint64_t> entry_events_;
+  std::vector<uint64_t> event_handles_;
+
   Stats stats_;
 };
 

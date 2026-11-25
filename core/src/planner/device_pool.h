@@ -120,6 +120,18 @@ bool staging_fence(Staging* s);
 bool staging_wait(Staging* s);
 bool staging_chain(Staging* s, Staging* after);
 
+// A completion mark for one upload (an opaque cudaEvent_t handle; 0 on
+// failure). event_record() records the mark on the pipeline's copy stream, so
+// it comes after every copy issued there so far. The expert pool uses one mark
+// per selection entry; the routed-expert kernel makes the compute stream wait
+// for it just before using the entry's expert, so a resident expert computes
+// while a missing one is still travelling instead of the node waiting for its
+// last upload. Re-recording a mark is allowed: a wait keeps the state the event
+// had when it was issued.
+uint64_t event_create();
+void event_destroy(uint64_t ev);
+bool event_record(uint64_t ev, Staging* s);
+
 // Block until all device work is complete.
 bool synchronize();
 

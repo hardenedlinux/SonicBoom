@@ -18,6 +18,10 @@
 
 #include "device_pool.h"
 
+#ifdef SONICBOOM_USE_CUDA
+#include "../nn/cuda_stream.h"
+#endif
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
@@ -117,6 +121,25 @@ bool prefetch_on() {
   const char* env = std::getenv("SONICBOOM_MOE_PREFETCH");
   if (!env || !*env) return false;
   return std::strcmp(env, "0") != 0 && std::strcmp(env, "off") != 0;
+}
+
+// Expert upload overlap (SONICBOOM_EXPERT_OVERLAP): each selection entry waits
+// for its own upload instead of the node waiting for all of them, so residents
+// compute while the misses travel. On by default; "0"/"off" disables.
+bool overlap_on() {
+  const char* env = std::getenv("SONICBOOM_EXPERT_OVERLAP");
+  if (!env || !*env) return true;
+  return std::strcmp(env, "0") != 0 && std::strcmp(env, "off") != 0;
+}
+
+// True while the current thread records a CUDA Graph. A per-entry stream wait
+// spans two streams, which only the uncaptured path may do.
+bool graph_capturing() {
+#ifdef SONICBOOM_USE_CUDA
+  return sonicboom::cuda::boom_capturing();
+#else
+  return false;
+#endif
 }
 
 // The routing trace (SONICBOOM_EXPERT_TRACE=path): one line per selection
@@ -226,6 +249,11 @@ ExpertPool::~ExpertPool() {
   prefetch_staging_ = nullptr;
   if (staging_) device::staging_destroy(staging_);
   staging_ = nullptr;
+  // The copy streams above have drained, so every mark they recorded is
+  // complete and no pending stream wait can outlive its event.
+  for (uint64_t ev : event_handles_) device::event_destroy(ev);
+  event_handles_.clear();
+  entry_events_.clear();
   // The copies above have drained; the host expert bytes can go pageable
   // again.
   for (const auto& r : host_registered_)
@@ -367,6 +395,9 @@ std::expected<std::unique_ptr<ExpertPool>, std::string> ExpertPool::create(
     std::fprintf(stderr,
                  "expert pool: pinned staging unavailable, uploads stay "
                  "synchronous\n");
+  // Overlap needs the copy stream the marks are recorded on; without the
+  // pipeline the uploads are synchronous and there is nothing to overlap with.
+  pool->overlap_ = overlap_on() && pool->staging_ != nullptr;
 
   // The prefetch pipeline (SONICBOOM_MOE_PREFETCH). Sized to hold one block's
   // predicted set in a single half; its copies run ahead of the selection node
@@ -461,7 +492,8 @@ void ExpertPool::register_host_experts() {
 }
 
 std::expected<void, std::string> ExpertPool::select(
-    uint32_t block, std::span<const int64_t> ids, bool upload_misses) {
+    uint32_t block, std::span<const int64_t> ids, bool upload_misses,
+    bool defer_wait) {
   std::lock_guard<std::mutex> lk(mutex_);
   const BlockInfo& info = block < blocks_.size() ? blocks_[block] : BlockInfo{};
   if (info.experts == 0)
@@ -535,6 +567,27 @@ std::expected<void, std::string> ExpertPool::select(
     return device::upload(host, handle, bytes);
   };
 
+  // Upload overlap. With it on and the caller deferring the wait, each miss
+  // records a completion mark of its own on the copy stream and the kernel
+  // waits for that mark just before using the expert, so residents compute
+  // while the misses travel. A node whose marks could not all be recorded
+  // falls back to waiting for every copy at the end. A graph capture keeps the
+  // node-wide wait: the per-entry dependency spans two streams, which a
+  // recording cannot express.
+  bool overlapped = overlap_ && defer_wait && !graph_capturing();
+  if (uint64_t(ids.size()) > event_handles_.size())
+    event_handles_.resize(ids.size(), 0);
+  entry_events_.resize(ids.size());
+  std::fill(entry_events_.begin(), entry_events_.end(), uint64_t{0});
+  // key -> mark, for an id selected twice in one node: the later entries are
+  // hits on the slot an earlier entry uploaded, so they carry its mark.
+  std::vector<std::pair<int64_t, uint64_t>> marks;
+  marks.reserve(ids.size());
+  auto mark_for = [this](size_t j) -> uint64_t {
+    if (event_handles_[j] == 0) event_handles_[j] = device::event_create();
+    return event_handles_[j];
+  };
+
   for (size_t j = 0; j < ids.size(); ++j) {
     const int64_t key = int64_t(info.key_base) + ids[j];
     int32_t slot = slot_of_[key];
@@ -546,6 +599,14 @@ std::expected<void, std::string> ExpertPool::select(
         prefetched_[size_t(key)] = 0;
         ++stats_.prefetch_hits;
       }
+      // A repeated id: this entry is a hit on a slot an earlier entry of this
+      // same node is still uploading, so it waits for that entry's mark.
+      if (overlapped)
+        for (const auto& m : marks)
+          if (m.first == key) {
+            entry_events_[j] = m.second;
+            break;
+          }
     } else {
       int32_t victim = -1;
       if (upload_misses) {
@@ -603,6 +664,17 @@ std::expected<void, std::string> ExpertPool::select(
       slot_of_[key] = victim;
       ++stats_.misses;
       slot = victim;
+      // The mark goes after the expert's last copy (the tail zeros included),
+      // so waiting on it means the whole slot is readable.
+      if (overlapped) {
+        const uint64_t ev = mark_for(j);
+        if (ev && device::event_record(ev, staging_)) {
+          entry_events_[j] = ev;
+          marks.emplace_back(key, ev);
+        } else {
+          overlapped = false;  // the end waits for every copy instead
+        }
+      }
     }
     sel_host_[j] = slot;
   }
@@ -620,7 +692,9 @@ std::expected<void, std::string> ExpertPool::select(
            uint64_t(ids.size()) * sizeof(int32_t)))
     return std::unexpected(
         "expert pool: cannot write the selection buffer");
-  if (staging_ && !device::staging_commit(staging_))
+  // With overlap the kernel waits per entry, so the node-wide wait is skipped;
+  // the selection buffer is not read by any kernel, so it needs no waiter.
+  if (staging_ && !overlapped && !device::staging_commit(staging_))
     return std::unexpected(
         "expert pool: cannot commit the staged copies");
   return {};
@@ -755,6 +829,7 @@ void ExpertPool::clear() {
   std::fill(slot_of_.begin(), slot_of_.end(), -1);
   std::fill(uses_.begin(), uses_.end(), 0);
   std::fill(prefetched_.begin(), prefetched_.end(), 0);
+  std::fill(entry_events_.begin(), entry_events_.end(), 0);
   prefetch_ready_ = false;
   stats_ = Stats{};
 }

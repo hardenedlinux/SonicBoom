@@ -110,13 +110,20 @@ bool moe_experts(std::span<const float> x, std::span<const int64_t> ids,
 // the rows by expert and visits the experts in ascending index on one stream,
 // scattering with an explicit __fadd_rn/__fmul_rn. `stream` is an opaque CUDA
 // stream handle (nullptr = the current stream); the kernels run there.
+//
+// `entry_events` (optional, one per (row, expert) in the order of ids/slots) is
+// the pool's completion mark for that selection entry: a nonzero value makes
+// the stream wait for it before the entry's expert is used, so an expert's
+// upload can finish while the experts resident before it compute. The marks
+// only order the launches; no arithmetic changes.
 bool moe_experts_dev(const float* x, const int64_t* ids_host,
                      const float* weights_dev, const int32_t* slots_dev,
                      const int32_t* slots_host,
                      const MoeExpertWeights& experts, MoeActivation activation,
                      float* y, uint64_t rows, uint64_t k, uint64_t d,
                      bool group_by_expert, const MoeExpertPool& pool,
-                     void* stream = nullptr);
+                     void* stream = nullptr,
+                     const uint64_t* entry_events = nullptr);
 
 // Drop the MoE kernel scratch buffers (live slots and any retired because a CUDA
 // graph capture had their pointers baked in). A no-op while a capture is live;
