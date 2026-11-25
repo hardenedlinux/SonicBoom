@@ -2072,6 +2072,56 @@ public:
   }
 };
 
+// DeadNodeEliminationPass — remove what nothing reads (the forward phase).
+//
+// A graph the tracer emitted can hold a node whose result no node reads and
+// which is not a graph output: a branch the traced function computed and did
+// not use, or the operand side of a fold that was not applied. The node
+// executes a kernel and its result takes a buffer slot, so it is both time and
+// memory the graph does not need.
+//
+// This is PruneByDemandPass's second loop without a demand analysis: reverse
+// order, so a dead chain is removed from its end inward, dropping an
+// effect-free or read-only node (unit::removableWhenUnread) with no users whose
+// results are none of them graph outputs. Nothing is bypassed and no shape is
+// narrowed — that inference needs the consumer the demand analysis is built
+// from, and the forward phase has no consumer.
+class DeadNodeEliminationPass
+    : public UnitPass<DeadNodeEliminationPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DeadNodeEliminationPass)
+
+  void runOnOperation() override {
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    // canScheduleOn admits only boom.graph and boom.step; a null unit never
+    // reaches a pass.
+    if (!unit) return signalPassFailure();
+    GraphEditor view(unit);
+
+    llvm::SmallVector<mlir::Operation *> nodes;
+    for (mlir::Operation &node : view.body())
+      nodes.push_back(&node);
+    const llvm::ArrayRef<int64_t> outputs = unit.outputs();
+    for (mlir::Operation *node : llvm::reverse(nodes)) {
+      if (!unit::removableWhenUnread(node) || !node->use_empty())
+        continue;
+      if (node->getNumResults() == 0)
+        continue;
+      bool isOutput = false;
+      for (mlir::Value result : node->getResults())
+        if (llvm::is_contained(outputs, view.idOf(result)))
+          isOutput = true;
+      if (isOutput)
+        continue;
+      llvm::SmallVector<int64_t> ids(GraphEditor::resultIds(*node));
+      node->erase();
+      for (int64_t id : ids)
+        view.dropTensor(id);
+    }
+    view.commitTable();
+  }
+};
+
 // BufferReusePass — liveness-based buffer assignment (Stage 7).
 //
 // The planner's memory assignment used to give every activation its own buffer.
@@ -3253,6 +3303,7 @@ struct DisabledPasses {
   bool buffer_reuse = false;
   bool async_prefetch = false;
   bool prune_by_demand = false;
+  bool dead_node_elimination = false;
 };
 
 // The names the switch accepts: the pass class names, one table so the parser
@@ -3288,6 +3339,7 @@ constexpr PassName kPassNames[] = {
     {"BufferReusePass", &DisabledPasses::buffer_reuse},
     {"AsyncPrefetchPass", &DisabledPasses::async_prefetch},
     {"PruneByDemandPass", &DisabledPasses::prune_by_demand},
+    {"DeadNodeEliminationPass", &DisabledPasses::dead_node_elimination},
 };
 
 // Read SONICBOOM_IR_PASS_DISABLE into `out`. Returns false, having named both
@@ -3461,6 +3513,15 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase,
     // elementwise results the device executor may write in place.
     if (!off.buffer_reuse) pm.addPass(std::make_unique<BufferReusePass>());
     return;
+  case planner::IrPassPhase::Forward:
+    // A traced inference graph (the TTS forward mode): the same vocabulary as
+    // training minus the adjoints. Two passes, both semantic-neutral:
+    // dead-node elimination first, so a node nothing reads is not given a
+    // buffer, then buffer reuse over what is left.
+    if (!off.dead_node_elimination)
+      pm.addPass(std::make_unique<DeadNodeEliminationPass>());
+    if (!off.buffer_reuse) pm.addPass(std::make_unique<BufferReusePass>());
+    return;
   }
 }
 
@@ -3474,6 +3535,8 @@ const char *phaseName(planner::IrPassPhase phase) {
     return "verify";
   case planner::IrPassPhase::Training:
     return "training";
+  case planner::IrPassPhase::Forward:
+    return "forward";
   }
   return "?";
 }

@@ -273,7 +273,10 @@
    (torch "torch.Tensor.item"
      (status supported)
      (use ((sonicboom trace tensor) ctensor-item)))
-   (torch "torch.compile" (status missing))
+   (torch "torch.compile"
+     (status supported)
+     (use ((sonicboom compile) compile-forward))
+     (note "compile-forward traces one Scheme forward function into an acyclic device inference graph with no graph breaks, binds its weights by name from a safetensors or GGUF weight store, and returns a callable; torch.compile compiles an arbitrary Python callable and captures parameters from Python objects."))
    (torch "torch.nn.functional.mse_loss"
      (status supported)
      (use ((sonicboom train) autograd-mse))

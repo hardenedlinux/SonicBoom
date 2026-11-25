@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// The CPU Boom executor: the CPU peer of training::DeviceTrainingGraph.
+// The CPU Boom executor: the CPU peer of device::DeviceGraph.
 //
 // A Blade (S-Expr) document is lowered to Boom IR (compiler::bladeToBoom), run
 // through the same semantic-neutral pass phase the device executor uses

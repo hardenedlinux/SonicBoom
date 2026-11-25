@@ -17,7 +17,7 @@
   #:export (make-gnode gnode? gnode-op gnode-inputs gnode-outputs gnode-attrs
             gnode-output-names
             make-gparam gparam? gparam-name gparam-dtype gparam-shape
-            gparam-values
+            gparam-values gparam-bound
             type->sx graph->sexpr sexpr->text))
 
 ;; A recorded graph node: an operator, its inputs, its outputs and its attributes.
@@ -47,19 +47,45 @@ Example:
 PyTorch: none"
   (map car (gnode-outputs n)))
 
-;; An inline graph constant: its name, dtype, shape and flat values.
+;; A graph constant with a name, dtype, shape and either values or a bound name.
 ;;
 ;; The value list is stored already coerced to DTYPE. The S-Expr emission writes
-;; it as (data :values ...).
+;; it as (data :values ...). A parameter with a BOUND name is a weight the
+;; device inference graph takes from a weight store instead: the emission writes
+;; (data :bound "NAME"), the values are not emitted, and the store supplies the
+;; bytes after compile.
 ;;
 ;; PyTorch: none
 (define-record-type <gparam>
-  (make-gparam name dtype shape values)
+  (make-gparam* name dtype shape values bound)
   gparam?
   (name   gparam-name)
   (dtype  gparam-dtype)
   (shape  gparam-shape)
-  (values gparam-values))   ; flat list, already coerced to dtype
+  (values gparam-values)   ; flat list, already coerced to dtype
+  (bound  gparam-bound))   ; weight name string, or #f for an inline constant
+
+(define (make-gparam name dtype shape values . rest)
+  "Make a graph constant.
+NAME, DTYPE and SHAPE are its identity. VALUES is its flat value list, or #f
+when the constant is a bound weight. The optional REST argument is the weight
+name a device inference graph binds from a weight store; the document then
+carries (data :bound \"NAME\") and no values.
+Args:
+  name: the parameter name (a string).
+  dtype: a dtype symbol.
+  shape: a list of dimensions.
+  values: a flat list of values, or #f for a bound weight.
+  rest: optionally, the bound weight name.
+Returns: a gparam.
+Example:
+  (use-modules (sonicboom trace graph))
+  (gparam-bound (make-gparam \"w\" 'float32 '(2 2) #f \"w\"))
+  => \"w\"
+PyTorch: none"
+  (if (null? rest)
+      (make-gparam* name dtype shape values #f)
+      (make-gparam* name dtype shape values (car rest))))
 
 (define (type->sx dtype shape)
   "The S-Expr type form of DTYPE and SHAPE.
@@ -115,7 +141,11 @@ PyTorch: none"
       ,@(map (lambda (p)
                `(parameter ,(gparam-name p)
                            ,(type->sx (gparam-dtype p) (gparam-shape p))
-                           (data ,(string->symbol ":values") ,@(gparam-values p))))
+                           ,@(if (gparam-bound p)
+                                 `((data ,(string->symbol ":bound")
+                                         ,(gparam-bound p)))
+                                 `((data ,(string->symbol ":values")
+                                         ,@(gparam-values p))))))
              params))
      (nodes
       ,@(map (lambda (n)

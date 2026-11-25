@@ -14,15 +14,22 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// Device executor of a traced training step (sonicboom/training/device_graph.h).
+// Device executor of a traced training step or an inference forward graph
+// (sonicboom/device/graph.h).
 //
 // The pipeline is the one the planner uses, minus the plan: the Blade document
-// is lowered with bladeToBoom, the Training phase's passes rewrite it, and
+// is lowered with bladeToBoom, the mode's pass phase rewrites it (Training for
+// a training step, Forward — semantic-neutral passes only — for inference), and
 // boomToGraph hands the node list back. Every tensor then gets one device
 // buffer (the BufferReusePass marks in-place and buffer-class sharing, which
 // this executor may ignore — per-tensor buffers are the correct fallback it
 // documents), constants are uploaded once, and a step is: upload the bound
 // inputs, run the nodes in order, synchronize, download the outputs.
+//
+// Inference mode's weights are not constants of the document: each is a
+// `(data :bound ...)` parameter, left unallocated at compile and bound to a
+// device buffer the weight store owns (bind_weight), so one resident copy
+// serves every executable that names it.
 //
 // Backward nodes call the training module's existing fused kernels
 // (backward_internal.h) rather than re-implementing them, so a traced step uses
@@ -35,10 +42,10 @@
 // the device is unavailable — the graph is still lowered and verified, so a
 // bad graph is diagnosed the same way on either build.
 
-#include <sonicboom/training/device_graph.h>
+#include <sonicboom/device/graph.h>
 
-#include "backward_internal.h"
-#include "device_graph_kernels.h"
+#include "../training/backward_internal.h"
+#include "../training/device_graph_kernels.h"
 
 // Direct native-torch kernel calls for the ops the switch selects
 // (SONICBOOM_TRAIN_ATEN); the header is ATen-free on purpose.
@@ -64,7 +71,12 @@
 #include <utility>
 #include <variant>
 
-namespace sonicboom::training {
+namespace sonicboom::device {
+
+// The fused forward/backward kernels and the runtime entry points above them
+// are the training module's (core/src/training/); the alias keeps their call
+// sites spelled `detail::` here as they are there.
+namespace detail = training::detail;
 
 namespace {
 
@@ -224,7 +236,8 @@ bool parameter_bytes(const sx::Parameter& p, std::vector<std::byte>* out,
 
 // --- the compiled graph -----------------------------------------------------
 
-struct DeviceTrainingGraph::Impl {
+struct DeviceGraph::Impl {
+  Mode mode = Mode::Training;
   Graph graph;
   std::vector<std::uint64_t> buffers;  // by tensor id (planner ids are dense)
   // One device allocation per buffer slot. A slot is shared by the tensors the
@@ -237,6 +250,23 @@ struct DeviceTrainingGraph::Impl {
   std::vector<DeviceTensorInfo> input_info;
   std::vector<DeviceTensorInfo> output_info;
 
+  // Inference weights: the external tensors the document leaves to a store,
+  // and the tensor id each buffer feeds. A bound weight's buffer is owned by
+  // the store, so it is not in slot_buffers.
+  std::vector<DeviceWeightInfo> weight_info;
+  std::vector<TensorId> weight_ids;
+  std::uint64_t activation_bytes = 0;
+
+  MemoryStats stats() const {
+    MemoryStats m;
+    m.activation_bytes = activation_bytes;
+    m.scratch_bytes = ce_bytes;
+    for (const DeviceWeightInfo& w : weight_info)
+      if (w.bound) m.weight_bytes += w.num_bytes;
+    m.total_bytes = m.activation_bytes + m.weight_bytes + m.scratch_bytes;
+    return m;
+  }
+
   // Resident inputs: the graph writes the next value of these back into their
   // own device buffers (the optimizer update), so their host bytes are needed
   // once. `state_uploaded` says a run has already filled them.
@@ -246,6 +276,7 @@ struct DeviceTrainingGraph::Impl {
   // Scratch for the cross-entropy reduction, sized at compile; a kernel that
   // allocated here would make the step uncapturable.
   std::uint64_t ce_scratch = 0;
+  std::uint64_t ce_bytes = 0;
 
   // CUDA-graph capture of the node launches (SONICBOOM_TRAIN_GRAPH).
   bool capture_enabled = false;
@@ -276,21 +307,82 @@ struct DeviceTrainingGraph::Impl {
   std::uint64_t buffer(TensorId id) const { return buffers[id.value]; }
 };
 
-DeviceTrainingGraph::DeviceTrainingGraph() : impl_(std::make_unique<Impl>()) {}
-DeviceTrainingGraph::~DeviceTrainingGraph() = default;
-DeviceTrainingGraph::DeviceTrainingGraph(DeviceTrainingGraph&&) noexcept =
+DeviceGraph::DeviceGraph() : impl_(std::make_unique<Impl>()) {}
+DeviceGraph::~DeviceGraph() = default;
+DeviceGraph::DeviceGraph(DeviceGraph&&) noexcept =
     default;
-DeviceTrainingGraph& DeviceTrainingGraph::operator=(
-    DeviceTrainingGraph&&) noexcept = default;
+DeviceGraph& DeviceGraph::operator=(
+    DeviceGraph&&) noexcept = default;
 
-const std::vector<DeviceTensorInfo>& DeviceTrainingGraph::inputs()
+const std::vector<DeviceTensorInfo>& DeviceGraph::inputs()
     const noexcept {
   return impl_->input_info;
 }
 
-const std::vector<DeviceTensorInfo>& DeviceTrainingGraph::outputs()
+const std::vector<DeviceTensorInfo>& DeviceGraph::outputs()
     const noexcept {
   return impl_->output_info;
+}
+
+DeviceGraph::Mode DeviceGraph::mode() const noexcept { return impl_->mode; }
+
+const std::vector<DeviceWeightInfo>& DeviceGraph::weights() const noexcept {
+  return impl_->weight_info;
+}
+
+bool DeviceGraph::weights_bound() const noexcept {
+  for (const DeviceWeightInfo& w : impl_->weight_info)
+    if (!w.bound) return false;
+  return true;
+}
+
+bool DeviceGraph::bind_weight(std::size_t index, std::uint64_t device_buffer,
+                              std::string* error) {
+  Impl& s = *impl_;
+  if (index >= s.weight_info.size()) {
+    if (error)
+      *error = "weight index " + std::to_string(index) + " is out of range (" +
+               std::to_string(s.weight_info.size()) + " external weight(s))";
+    return false;
+  }
+  if (device_buffer == 0) {
+    if (error)
+      *error = "the buffer for weight '" + s.weight_info[index].name +
+               "' is null";
+    return false;
+  }
+  // The launches recorded so far baked in the previous buffer address.
+#ifdef SONICBOOM_USE_CUDA
+  if (s.graph_exec != nullptr) {
+    detail::dev_graph_free(s.graph_exec);
+    s.graph_exec = nullptr;
+    s.captured_key.clear();
+  }
+#endif
+  s.buffers[s.weight_ids[index].value] = device_buffer;
+  s.weight_info[index].bound = true;
+  return true;
+}
+
+void DeviceGraph::set_capture(bool on) noexcept {
+  impl_->capture_enabled = on;
+#ifndef SONICBOOM_USE_CUDA
+  (void)on;
+#else
+  if (!on && impl_->graph_exec != nullptr) {
+    detail::dev_graph_free(impl_->graph_exec);
+    impl_->graph_exec = nullptr;
+    impl_->captured_key.clear();
+  }
+#endif
+}
+
+bool DeviceGraph::capture_enabled() const noexcept {
+  return impl_->capture_enabled;
+}
+
+DeviceGraph::MemoryStats DeviceGraph::memory_stats() const noexcept {
+  return impl_->stats();
 }
 
 // --- node dispatch ----------------------------------------------------------
@@ -461,6 +553,12 @@ bool dispatch_node(const NodeContext& s, const GraphNodeDesc& n,
                                          out.data(),
                                          static_cast<std::int64_t>(out.size()),
                                          n_out));
+      return ok ? true : fail("kernel launch failed");
+    }
+    case OpKind::Relu: {
+      if (!arity(1, 1)) return false;
+      const bool ok = detail::graph_relu(buf(n.outputs[0]), buf(n.inputs[0]),
+                                         numel(n.outputs[0]));
       return ok ? true : fail("kernel launch failed");
     }
     case OpKind::Softmax: {
@@ -783,6 +881,8 @@ bool validate_node(const Graph& g, const GraphNodeDesc& n, std::string* error) {
       return fail("operand rank exceeds the result rank");
     return true;
   }
+  case OpKind::Relu:
+    return arity(1, 1);
   case OpKind::Softmax:
     return arity(1, 1) && (!shape(n.inputs[0]).empty()
                                ? true
@@ -859,7 +959,7 @@ bool validate_node(const Graph& g, const GraphNodeDesc& n, std::string* error) {
     return true;
   }
   default:
-    return fail("not supported by the device training executor");
+    return fail("not supported by the device graph executor");
   }
 }
 
@@ -945,32 +1045,76 @@ bool execute_nodes(const Graph& graph,
 
 // --- compile ----------------------------------------------------------------
 
-std::expected<std::unique_ptr<DeviceTrainingGraph>, std::string>
-DeviceTrainingGraph::compile(const sx::Document& doc) {
+std::expected<std::unique_ptr<DeviceGraph>, std::string>
+DeviceGraph::compile(const sx::Document& doc, Mode mode) {
+  const bool inference = mode == Mode::Inference;
   // Lower and pass first, on every build: a graph the IR rejects must be
   // rejected for that reason, not for the device's.
   mlir::MLIRContext context;
   auto module = compiler::bladeToBoom(doc, &context);
   if (!module)
     return std::unexpected("Blade -> Boom lowering failed (diagnostic above)");
-  if (!compiler::runBoomPasses(*module, planner::IrPassPhase::Training))
-    return std::unexpected("Boom IR Training passes failed (diagnostic above)");
+  if (!compiler::runBoomPasses(*module, inference ? planner::IrPassPhase::Forward
+                                                  : planner::IrPassPhase::Training))
+    return std::unexpected("Boom IR " +
+                           std::string(inference ? "Forward" : "Training") +
+                           " passes failed (diagnostic above)");
   auto lowered = compiler::boomToGraph(*module);
   if (!lowered)
     return std::unexpected("Boom IR -> graph lowering failed (diagnostic above)");
 
 #ifndef SONICBOOM_USE_CUDA
   return std::unexpected(
-      "SonicBoom was built without CUDA; the device training graph needs it");
+      std::string("SonicBoom was built without CUDA; the device ") +
+      (inference ? "inference graph needs it" : "training graph needs it"));
 #else
-  auto out = std::unique_ptr<DeviceTrainingGraph>(new DeviceTrainingGraph());
+  auto out = std::unique_ptr<DeviceGraph>(new DeviceGraph());
   Impl& s = *out->impl_;
+  s.mode = mode;
   s.graph = std::move(*lowered);
 
   const Graph& g = s.graph;
 
   std::map<std::string, const sx::Parameter*> params;
   for (const sx::Parameter& p : doc.graph.parameters) params[p.name] = &p;
+
+  // An inference weight is a `(data :bound "<name>")` parameter: a constant
+  // whose bytes the document does not hold. The store supplies them, by name,
+  // after compile. Everything else constant is inline data and is uploaded
+  // here. A sidecar reference to a file is that file format's business, not a
+  // weight store's, so it is rejected with the form to use instead.
+  std::vector<bool> external(g.tensors.size(), false);
+  if (inference) {
+    for (const TensorDesc& t : g.tensors) {
+      if (!t.is_constant) continue;
+      auto it = params.find(t.name);
+      if (it == params.end())
+        return std::unexpected("constant tensor '" + t.name +
+                               "' has no parameter in the document");
+      if (std::holds_alternative<sx::BoundData>(it->second->data)) {
+        if (t.dtype != sx::DType::Float32)
+          return std::unexpected(
+              "weight '" + t.name + "' has dtype " + sx::dtype_name(t.dtype) +
+              "; the inference graph reads float32 weights (the store "
+              "converts at upload)");
+        external[t.id.value] = true;
+        s.weight_ids.push_back(t.id);
+        DeviceWeightInfo w;
+        w.name = t.name;
+        w.bound_name =
+            std::get<sx::BoundData>(it->second->data).name;
+        w.dtype = t.dtype;
+        w.shape = t.shape;
+        w.num_bytes = t.size_bytes;
+        s.weight_info.push_back(std::move(w));
+      } else if (std::holds_alternative<sx::ExternalData>(it->second->data)) {
+        return std::unexpected(
+            "weight '" + t.name +
+            "' is an external file sidecar; an inference graph takes weights "
+            "from a weight store as (data :bound \"<name>\") parameters");
+      }
+    }
+  }
 
   // --- buffer slots ---------------------------------------------------------
   //
@@ -1025,6 +1169,8 @@ DeviceTrainingGraph::compile(const sx::Document& doc) {
   }
   for (std::size_t t = 0; t < g.tensors.size(); ++t) {
     if (slot_of[t] >= 0) continue;
+    // An external weight has no slot: its buffer is the store's, bound later.
+    if (external[t]) continue;
     if (g.tensors[t].size_bytes == 0)
       return std::unexpected("tensor '" + g.tensors[t].name +
                              "' has no storage");
@@ -1058,6 +1204,7 @@ DeviceTrainingGraph::compile(const sx::Document& doc) {
   std::vector<int64_t> slot_remap(slot_bytes.size(), -1);
   s.buffers.assign(g.tensors.size(), 0);
   for (std::size_t t = 0; t < g.tensors.size(); ++t) {
+    if (external[t]) continue;
     const int64_t sl = slot_of[t];
     if (slot_remap[sl] < 0) {
       const std::uint64_t b = detail::dev_alloc(slot_bytes[sl]);
@@ -1067,6 +1214,7 @@ DeviceTrainingGraph::compile(const sx::Document& doc) {
                                " bytes for tensor '" + g.tensors[t].name + "'");
       slot_remap[sl] = int64_t(s.slot_buffers.size());
       s.slot_buffers.push_back(b);
+      s.activation_bytes += slot_bytes[sl];
     }
     s.buffers[t] = s.slot_buffers[slot_remap[sl]];
   }
@@ -1083,8 +1231,8 @@ DeviceTrainingGraph::compile(const sx::Document& doc) {
     if (n.op == OpKind::ClipGradNorm) has_clip = true;
   }
   if (ce_rows > 0) {
-    s.ce_scratch = detail::dev_alloc(static_cast<std::uint64_t>(ce_rows) *
-                                     sizeof(float));
+    s.ce_bytes = static_cast<std::uint64_t>(ce_rows) * sizeof(float);
+    s.ce_scratch = detail::dev_alloc(s.ce_bytes);
     if (s.ce_scratch == 0)
       return std::unexpected("cannot allocate the cross-entropy scratch");
   }
@@ -1110,12 +1258,15 @@ DeviceTrainingGraph::compile(const sx::Document& doc) {
     if (h != 0) planner::device::release(h, bytes);
   }
   // A global-norm clip allocates its accumulator per execution, which a
-  // captured step cannot do; its graph keeps the direct path.
-  const char* train_graph = std::getenv("SONICBOOM_TRAIN_GRAPH");
-  s.capture_enabled =
-      !(train_graph != nullptr && train_graph[0] == '0' &&
-        train_graph[1] == '\0') &&
-      !has_clip;
+  // captured step cannot do; its graph keeps the direct path. Inference has no
+  // such op, and captures by default: a forward graph is the case capture
+  // exists for.
+  const char* graph_env =
+      std::getenv(inference ? "SONICBOOM_FORWARD_GRAPH"
+                            : "SONICBOOM_TRAIN_GRAPH");
+  s.capture_enabled = !(inference ? false : has_clip) &&
+                      !(graph_env != nullptr && graph_env[0] == '0' &&
+                        graph_env[1] == '\0');
 
 #ifdef SONICBOOM_USE_CUDA
   // The step's stream. Constants are uploaded on it (synchronously, before the
@@ -1125,7 +1276,7 @@ DeviceTrainingGraph::compile(const sx::Document& doc) {
     return std::unexpected("cannot create the training step's CUDA stream");
 #endif
   for (const TensorDesc& t : g.tensors) {
-    if (!t.is_constant) continue;
+    if (!t.is_constant || external[t.id.value]) continue;
     auto it = params.find(t.name);
     if (it == params.end())
       return std::unexpected("constant tensor '" + t.name +
@@ -1171,14 +1322,14 @@ DeviceTrainingGraph::compile(const sx::Document& doc) {
     if (!validate_node(g, n, &error)) return std::unexpected(error);
   }
 
-  return std::expected<std::unique_ptr<DeviceTrainingGraph>, std::string>(
+  return std::expected<std::unique_ptr<DeviceGraph>, std::string>(
       std::move(out));
 #endif
 }
 
 // --- run --------------------------------------------------------------------
 
-bool DeviceTrainingGraph::run(const std::byte* const* input_data,
+bool DeviceGraph::run(const std::byte* const* input_data,
                               const std::size_t* input_sizes,
                               std::vector<std::vector<std::byte>>* outputs,
                               std::string* error) {
@@ -1197,6 +1348,15 @@ bool DeviceTrainingGraph::run(const std::byte* const* input_data,
   if (s.input_info.size() != s.input_ids.size()) {
     if (error) *error = "run: malformed compiled graph";
     return false;
+  }
+  for (const DeviceWeightInfo& w : s.weight_info) {
+    if (!w.bound) {
+      if (error)
+        *error = "weight '" + w.name +
+                 "' is not bound; bind every weight from a weight store "
+                 "before the first run";
+      return false;
+    }
   }
 
   for (std::size_t i = 0; i < s.input_ids.size(); ++i) {
@@ -1258,11 +1418,11 @@ bool DeviceTrainingGraph::run(const std::byte* const* input_data,
 #endif
 }
 
-bool DeviceTrainingGraph::input_is_resident(std::size_t index) const noexcept {
+bool DeviceGraph::input_is_resident(std::size_t index) const noexcept {
   return index < impl_->resident_input.size() && impl_->resident_input[index];
 }
 
-bool DeviceTrainingGraph::run_resident(
+bool DeviceGraph::run_resident(
     const std::byte* const* input_data, const std::size_t* input_sizes,
     const std::size_t* download, std::size_t num_download,
     std::vector<std::vector<std::byte>>* outputs, std::string* error) {
@@ -1284,6 +1444,15 @@ bool DeviceTrainingGraph::run_resident(
   if (s.input_info.size() != s.input_ids.size()) {
     if (error) *error = "run_resident: malformed compiled graph";
     return false;
+  }
+  for (const DeviceWeightInfo& w : s.weight_info) {
+    if (!w.bound) {
+      if (error)
+        *error = "weight '" + w.name +
+                 "' is not bound; bind every weight from a weight store "
+                 "before the first run";
+      return false;
+    }
   }
   for (std::size_t j = 0; j < num_download; ++j) {
     if (download[j] >= s.output_ids.size()) {
@@ -1358,4 +1527,4 @@ bool DeviceTrainingGraph::run_resident(
 #endif
 }
 
-} // namespace sonicboom::training
+} // namespace sonicboom::device

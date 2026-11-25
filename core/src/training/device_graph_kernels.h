@@ -91,6 +91,9 @@ bool graph_rope_inplace(DevBuf x, std::int64_t rows, std::int64_t heads,
                         std::int64_t head_dim, std::uint64_t pos0,
                         float theta_base, float freq_scale);
 bool graph_silu_mul(DevBuf out, DevBuf g, DevBuf u, std::int64_t n);
+// out = max(in, 0) elementwise, with the CPU interpreter's rounding-free
+// semantics (a negative zero becomes +0).
+bool graph_relu(DevBuf out, DevBuf in, std::int64_t n);
 // Mean negative log-likelihood over rows; targets is int32, loss one float.
 // `scratch` is a device buffer of at least `rows` floats; the caller owns it so
 // a step can be captured (a per-call allocation would be illegal in a graph).

@@ -124,6 +124,13 @@ file(GLOB_RECURSE SONICBOOM_THREADPOOL_SOURCES CONFIGURE_DEPENDS
 file(GLOB_RECURSE SONICBOOM_TRAINING_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/training/*.cpp)
 
+# Device execution (core/src/device/): the compiled-graph executor (graph.cpp,
+# training and inference modes; its device work is guarded by
+# SONICBOOM_USE_CUDA and its kernels come from the CUDA block below) and the
+# inference weight store.
+file(GLOB_RECURSE SONICBOOM_DEVICE_SOURCES CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/device/*.cpp)
+
 # libsonicboom.so is SonicBoom's final published core library (SHARED).
 # Native-torch and MLIR are statically linked into it. The stable C ABI
 # (sonicboom_capi object library) is folded in so its `extern "C"` symbols are
@@ -142,6 +149,7 @@ add_library(sonicboom SHARED
   ${SONICBOOM_MODEL_SOURCES}
   ${SONICBOOM_THREADPOOL_SOURCES}
   ${SONICBOOM_TRAINING_SOURCES}
+  ${SONICBOOM_DEVICE_SOURCES}
   ${CMAKE_CURRENT_SOURCE_DIR}/src/mlir/smoke.cpp
   $<TARGET_OBJECTS:sonicboom_capi>)
 

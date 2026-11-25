@@ -228,6 +228,26 @@ PyTorch: none"
                ;; device training graph (boom_compile_device) — see capi.h
                (boom_compile_device . ,(foreign-proc "boom_compile_device" int
                                                    (list '* '* '*)))
+               ;; device graph in either mode (inference weights from a store)
+               (boom_compile_device_ex . ,(foreign-proc "boom_compile_device_ex" int
+                                                      (list '* int '* '*)))
+               (boom_weights_open . ,(foreign-proc "boom_weights_open" int
+                                                 (list '* int int '* '*)))
+               (boom_weights_free . ,(foreign-proc "boom_weights_free" void (list '*)))
+               (boom_weights_data_f32 . ,(foreign-proc "boom_weights_data_f32" int
+                                                     (list '* '* '* '* '*)))
+               (boom_weights_tensor_info
+                . ,(foreign-proc "boom_weights_tensor_info" int
+                                 (list '* '* '* '* '* '* '*)))
+               (boom_executable_bind_weights
+                . ,(foreign-proc "boom_executable_bind_weights" int
+                                 (list '* '* '*)))
+               (boom_executable_set_capture
+                . ,(foreign-proc "boom_executable_set_capture" int
+                                 (list '* int '*)))
+               (boom_executable_memory_stats
+                . ,(foreign-proc "boom_executable_memory_stats" int
+                                 (list '* '* '*)))
                (boom_input_count . ,(foreign-proc "boom_input_count" int
                                                 (list '* '*)))
                (boom_output_count . ,(foreign-proc "boom_output_count" int

@@ -235,6 +235,18 @@ __global__ void silu_mul_kernel(float* __restrict__ out,
   }
 }
 
+__global__ void relu_kernel(float* __restrict__ out,
+                            const float* __restrict__ in, std::int64_t n) {
+  const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+  for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x +
+                        threadIdx.x;
+       i < n; i += stride) {
+    // The same expression as the CPU interpreter's relu_kernel, so the two
+    // paths agree bit for bit (a negative zero becomes +0).
+    out[i] = in[i] > 0.0f ? in[i] : 0.0f;
+  }
+}
+
 __global__ void ce_row_kernel(const float* __restrict__ logits,
                               const int32_t* __restrict__ targets,
                               float* __restrict__ row_loss, std::int64_t cols) {
@@ -581,6 +593,14 @@ bool graph_silu_mul(DevBuf out, DevBuf g, DevBuf u, std::int64_t n) {
   if (n == 0) return true;
   silu_mul_kernel<<<grid_for(n), kThreads, 0, cur_stream()>>>(
       ptr<float>(out), ptr<const float>(g), ptr<const float>(u), n);
+  return ok();
+}
+
+bool graph_relu(DevBuf out, DevBuf in, std::int64_t n) {
+  if (n < 0) return false;
+  if (n == 0) return true;
+  relu_kernel<<<grid_for(n), kThreads, 0, cur_stream()>>>(
+      ptr<float>(out), ptr<const float>(in), n);
   return ok();
 }
 

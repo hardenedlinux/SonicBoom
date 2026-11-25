@@ -39,13 +39,14 @@
 #include <sonicboom/sx/parser.h>
 #include <sonicboom/tensor.h>
 #include <sonicboom/training/clip_grad_norm.h>
-#include <sonicboom/training/device_graph.h>
+#include <sonicboom/device/graph.h>
 #include <sonicboom/training/param.h>
 #include <sonicboom/vocab/grammar.h>
 #include <sonicboom/vocab/vocab.h>
 
 // core/src is a private include directory for this target (core/CMakeLists):
 // the decision registry is internal runtime state, not a Layer 2 header.
+#include "device/weight_store.h"
 #include "planner/autotune.h"
 #include "planner/decision_registry.h"
 // Private to this directory: boom_error's definition + the guard/set_error
@@ -94,7 +95,10 @@ struct boom_executable {
   // The CPU executable is shared with parameter views, which must outlive
   // this handle; freeing it here only drops this reference.
   std::shared_ptr<sx::Executable> exe;
-  std::unique_ptr<sonicboom::training::DeviceTrainingGraph> device;
+  std::unique_ptr<sonicboom::device::DeviceGraph> device;
+  // The store an inference executable bound its weights from. Kept alive here
+  // so the device buffers stay valid whatever order the two handles are freed.
+  std::shared_ptr<sonicboom::device::WeightStore> weights_store;
   bool input_bound = false;
   sx::Bytes input;    // copied at bind time
   sx::Bytes output;   // retained after execute
@@ -117,6 +121,10 @@ struct boom_executable {
 
 struct boom_tensor {
   nt::Tensor t;
+};
+
+struct boom_weights {
+  std::shared_ptr<sonicboom::device::WeightStore> store;
 };
 
 // A read-only host view of one executable parameter. The shared owner keeps
@@ -540,15 +548,19 @@ boom_status boom_compile(const boom_document *doc, const char *base_dir,
       err_out);
 }
 
-boom_status boom_compile_device(const boom_document *doc, boom_executable **exe_out,
-                            boom_error **err_out) {
+namespace {
+
+boom_status compile_device_mode(const boom_document *doc, bool inference,
+                                boom_executable **exe_out, boom_error **err_out) {
   return guard(
       [&]() -> boom_status {
         if (!doc || !exe_out)
           return fail_arg(err_out);
         *exe_out = nullptr;
 
-        auto graph = sonicboom::training::DeviceTrainingGraph::compile(doc->doc);
+        auto graph = sonicboom::device::DeviceGraph::compile(
+            doc->doc, inference ? sonicboom::device::DeviceGraph::Mode::Inference
+                                : sonicboom::device::DeviceGraph::Mode::Training);
         if (!graph) {
           set_error(err_out, BOOM_ERRKIND_COMPILE, graph.error().c_str());
           return BOOM_ERR_COMPILE;
@@ -557,6 +569,182 @@ boom_status boom_compile_device(const boom_document *doc, boom_executable **exe_
         auto *out = new boom_executable();
         out->device = std::move(*graph);
         *exe_out = out;
+        return BOOM_OK;
+      },
+      err_out);
+}
+
+} // namespace
+
+boom_status boom_compile_device(const boom_document *doc, boom_executable **exe_out,
+                            boom_error **err_out) {
+  return compile_device_mode(doc, /*inference=*/false, exe_out, err_out);
+}
+
+boom_status boom_compile_device_ex(const boom_document *doc, int inference,
+                                   boom_executable **exe_out,
+                                   boom_error **err_out) {
+  return compile_device_mode(doc, inference != 0, exe_out, err_out);
+}
+
+// --- Weight store (inference) -----------------------------------------------
+
+boom_status boom_weights_open(const char *path, boom_weight_format format,
+                              int convert_to_f32, boom_weights **weights_out,
+                              boom_error **err_out) {
+  return guard(
+      [&]() -> boom_status {
+        if (!path || !weights_out)
+          return fail_arg(err_out);
+        *weights_out = nullptr;
+
+        sonicboom::device::WeightStoreOptions options;
+        switch (format) {
+        case BOOM_WEIGHT_FORMAT_AUTO:
+          options.format = sonicboom::device::WeightFormat::Auto;
+          break;
+        case BOOM_WEIGHT_FORMAT_SAFETENSORS:
+          options.format = sonicboom::device::WeightFormat::Safetensors;
+          break;
+        case BOOM_WEIGHT_FORMAT_GGUF:
+          options.format = sonicboom::device::WeightFormat::Gguf;
+          break;
+        default:
+          return fail_arg(err_out);
+        }
+        options.convert_to_f32 = convert_to_f32 != 0;
+
+        auto store = sonicboom::device::WeightStore::open(path, options);
+        if (!store) {
+          set_error(err_out, BOOM_ERRKIND_WEIGHT, store.error().c_str());
+          return BOOM_ERR_WEIGHT;
+        }
+
+        auto *out = new boom_weights();
+        out->store = std::move(*store);
+        *weights_out = out;
+        return BOOM_OK;
+      },
+      err_out);
+}
+
+void boom_weights_free(boom_weights *weights) { delete weights; }
+
+boom_status boom_weights_data_f32(boom_weights *weights, const char *name,
+                                  const void **data_out, uint64_t *bytes_out,
+                                  boom_error **err_out) {
+  return guard(
+      [&]() -> boom_status {
+        if (!weights || !weights->store || !name || !data_out || !bytes_out)
+          return fail_arg(err_out);
+        std::string msg;
+        if (!weights->store->host_f32(name, data_out, bytes_out, &msg)) {
+          set_error(err_out, BOOM_ERRKIND_WEIGHT, msg.c_str());
+          return BOOM_ERR_WEIGHT;
+        }
+        return BOOM_OK;
+      },
+      err_out);
+}
+
+boom_status boom_weights_tensor_info(const boom_weights *weights, const char *name,
+                                     const char **dtype_name_out, int64_t *rank_out,
+                                     const int64_t **dims_out,
+                                     uint64_t *num_bytes_out,
+                                     boom_error **err_out) {
+  return guard(
+      [&]() -> boom_status {
+        if (!weights || !weights->store || !name)
+          return fail_arg(err_out);
+        const auto& store = *weights->store;
+        if (!store.has(name)) {
+          const std::string msg = "weight '" + std::string(name) + "' is not in '" +
+                                  store.path().string() + "'";
+          set_error(err_out, BOOM_ERRKIND_WEIGHT, msg.c_str());
+          return BOOM_ERR_WEIGHT;
+        }
+        const auto info = store.entry_info(name);
+        if (!info)
+          return fail_arg(err_out);
+        if (dtype_name_out)
+          *dtype_name_out = info->type_name->c_str();
+        if (rank_out)
+          *rank_out = static_cast<int64_t>(info->shape->size());
+        if (dims_out)
+          *dims_out = info->shape->data();
+        if (num_bytes_out)
+          *num_bytes_out = info->num_bytes;
+        return BOOM_OK;
+      },
+      err_out);
+}
+
+boom_status boom_executable_bind_weights(boom_executable *exe,
+                                         boom_weights *weights,
+                                         boom_error **err_out) {
+  return guard(
+      [&]() -> boom_status {
+        if (!exe || !weights || !weights->store)
+          return fail_arg(err_out);
+        if (!exe->is_device()) {
+          set_error(err_out, BOOM_ERRKIND_RUNTIME,
+                    "a CPU executable (boom_compile) has no device weights");
+          return BOOM_ERR_UNSUPPORTED;
+        }
+
+        const auto &info = exe->device->weights();
+        for (std::size_t i = 0; i < info.size(); ++i) {
+          std::string msg;
+          // The document's `(data :bound ...)` name is the store key; the
+          // graph's own value name is only for diagnostics.
+          const std::uint64_t buffer = weights->store->device_buffer(
+              info[i].bound_name, info[i].dtype, info[i].shape, &msg);
+          if (buffer == 0 || !exe->device->bind_weight(i, buffer, &msg)) {
+            set_error(err_out, BOOM_ERRKIND_BINDING, msg.c_str());
+            return BOOM_ERR_BINDING;
+          }
+        }
+        // Hold the store: the bound buffers are its memory.
+        exe->weights_store = weights->store;
+        return BOOM_OK;
+      },
+      err_out);
+}
+
+boom_status boom_executable_set_capture(boom_executable *exe, int on,
+                                        boom_error **err_out) {
+  return guard(
+      [&]() -> boom_status {
+        if (!exe)
+          return fail_arg(err_out);
+        if (!exe->is_device()) {
+          set_error(err_out, BOOM_ERRKIND_RUNTIME,
+                    "a CPU executable (boom_compile) has no node launches to "
+                    "capture");
+          return BOOM_ERR_UNSUPPORTED;
+        }
+        exe->device->set_capture(on != 0);
+        return BOOM_OK;
+      },
+      err_out);
+}
+
+boom_status boom_executable_memory_stats(const boom_executable *exe,
+                                         boom_memory_stats *stats_out,
+                                         boom_error **err_out) {
+  return guard(
+      [&]() -> boom_status {
+        if (!exe || !stats_out)
+          return fail_arg(err_out);
+        boom_memory_stats stats{};
+        if (exe->is_device()) {
+          const auto m = exe->device->memory_stats();
+          stats.activation_bytes = m.activation_bytes;
+          stats.weight_bytes = m.weight_bytes;
+          stats.scratch_bytes = m.scratch_bytes;
+          stats.total_bytes = m.total_bytes;
+        }
+        *stats_out = stats;
         return BOOM_OK;
       },
       err_out);
@@ -579,7 +767,7 @@ void fill_tensor_info(const sx::TensorType &t, boom_dtype *dtype_out,
     *num_bytes_out = tensor_num_bytes(t);
 }
 
-using DeviceInfo = sonicboom::training::DeviceTensorInfo;
+using DeviceInfo = sonicboom::device::DeviceTensorInfo;
 
 void fill_device_info(const DeviceInfo &t, boom_dtype *dtype_out,
                       int64_t *rank_out, const int64_t **dims_out,

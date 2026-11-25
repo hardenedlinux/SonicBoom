@@ -47,6 +47,7 @@ typedef struct boom_tensor boom_tensor;          /* a float32 tensor (autograd) 
 typedef struct boom_tape boom_tape;              /* a differentiable-op tape        */
 typedef struct boom_param boom_param;            /* a trainable param + AdamW state */
 typedef struct boom_storage boom_storage;        /* a borrowed, read-only view     */
+typedef struct boom_weights boom_weights;        /* a safetensors/GGUF weight store */
 
 /* Status codes. 0 == success; every non-zero value is a failure. */
 typedef enum boom_status {
@@ -219,6 +220,102 @@ boom_status boom_compile(const boom_document *doc, const char *base_dir,
  * such on either build. Release with boom_executable_free. */
 boom_status boom_compile_device(const boom_document *doc, boom_executable **exe_out,
                             boom_error **err_out);
+
+/* Compile a parsed document as a device graph in either mode. `inference` = 0
+ * is exactly boom_compile_device (training); `inference` = 1 compiles a
+ * forward-only graph (the TTS forward mode): it runs the Boom IR Forward pass
+ * phase (dead-node elimination and buffer reuse), takes CUDA-graph capture on
+ * by default, and holds its weights externally. An inference graph declares
+ * each weight as a `(data :bound "<name>")` constant parameter; compile records
+ * the name, dtype and shape and uploads nothing. Every weight is bound from a
+ * weight store with boom_executable_bind_weights before the first run, and a
+ * run with one unbound fails with BOOM_ERR_BINDING naming it. */
+boom_status boom_compile_device_ex(const boom_document *doc, int inference,
+                              boom_executable **exe_out, boom_error **err_out);
+
+/* --- Weight store (inference) ---------------------------------------------- */
+
+/* File format of a weight store. AUTO detects GGUF from its magic and reads
+ * anything else as safetensors; an explicit format that the file is not is an
+ * error. */
+typedef enum boom_weight_format {
+  BOOM_WEIGHT_FORMAT_AUTO = 0,
+  BOOM_WEIGHT_FORMAT_SAFETENSORS = 1,
+  BOOM_WEIGHT_FORMAT_GGUF = 2,
+} boom_weight_format;
+
+/* Open a weight store: a safetensors or GGUF file mapped once, whose named
+ * tensors are uploaded to the device as float32 on first use and shared by
+ * every executable bound to the store. `convert_to_f32` converts f16, bf16 and
+ * f64 entries on the host at upload; f32 entries are used as stored, and a
+ * quantized GGUF entry (which the f32 graph cannot read) is reported by name
+ * and type when it is requested. On success *weights_out receives a new handle
+ * (release with boom_weights_free). */
+boom_status boom_weights_open(const char *path, boom_weight_format format,
+                              int convert_to_f32, boom_weights **weights_out,
+                              boom_error **err_out);
+
+/* Release a store handle. An executable bound to the store keeps the store
+ * itself — and therefore the device buffers it bound — alive regardless of the
+ * order of the two frees. NULL is safe. */
+void boom_weights_free(boom_weights *weights);
+
+/* A borrowed host copy of one stored weight as float32: the file's own bytes
+ * when it is f32, a conversion cached in the store otherwise (so it honors the
+ * store's convert_to_f32). The pointer stays valid until the store is freed —
+ * it is the same bytes a device bind uploads. This is how a CPU fallback feeds
+ * one file's weights to the interpreter. An absent name or a stored type the
+ * float32 form cannot represent is BOOM_ERR_WEIGHT. */
+boom_status boom_weights_data_f32(boom_weights *weights, const char *name,
+                                  const void **data_out, uint64_t *bytes_out,
+                                  boom_error **err_out);
+
+/* The stored dtype name, shape and byte count of one entry, before any
+ * conversion: DTYPE_NAME_OUT receives the file's own name ("F32", "F16",
+ * "BF16", "F64", or a GGUF type such as "Q4_K") and DIMS_OUT a borrowed
+ * dimension array. Valid until the store is freed. This is what a caller
+ * checks a graph's declared weight against before binding it, so a shape or
+ * type mismatch is reported with the store's own words (the device bind names
+ * both shapes) rather than as a byte-count difference. An absent name is
+ * BOOM_ERR_WEIGHT. Any output pointer may be NULL if that field is not
+ * needed. */
+boom_status boom_weights_tensor_info(const boom_weights *weights, const char *name,
+                                     const char **dtype_name_out, int64_t *rank_out,
+                                     const int64_t **dims_out,
+                                     uint64_t *num_bytes_out, boom_error **err_out);
+
+/* Bind every external weight of an inference executable from `weights`, by
+ * name, uploading each on first use. The executable keeps the store alive
+ * (see above), and binding again rebinds. A weight the store lacks, whose
+ * shape differs (both shapes are named), or whose stored type cannot be
+ * supplied is BOOM_ERR_BINDING. A training graph has no external weights and
+ * binds vacuously. */
+boom_status boom_executable_bind_weights(boom_executable *exe,
+                                         boom_weights *weights,
+                                         boom_error **err_out);
+
+/* Turn CUDA-graph capture of the node launches on (1) or off (0). Inference
+ * graphs default it on; training graphs default from SONICBOOM_TRAIN_GRAPH.
+ * Turning capture off releases a captured graph; turning it on lets the next
+ * run capture. The captured launch sequence is invalidated by rebinding a
+ * weight. A CPU executable has no node launches and fails with
+ * BOOM_ERR_UNSUPPORTED. */
+boom_status boom_executable_set_capture(boom_executable *exe, int on,
+                                        boom_error **err_out);
+
+/* Device memory an executable holds, in bytes, by what it is for. */
+typedef struct boom_memory_stats {
+  uint64_t activation_bytes; /* activation slots (the buffer-reuse assignment) */
+  uint64_t weight_bytes;     /* bound external weights (owned by the store)   */
+  uint64_t scratch_bytes;    /* compile-time scratch                          */
+  uint64_t total_bytes;      /* their sum                                     */
+} boom_memory_stats;
+
+/* Fill `*stats_out` for a device executable (training or inference). A CPU
+ * executable (boom_compile) reports zero for every field. */
+boom_status boom_executable_memory_stats(const boom_executable *exe,
+                                         boom_memory_stats *stats_out,
+                                         boom_error **err_out);
 
 /* --- I/O introspection (bind) ---------------------------------------------- */
 

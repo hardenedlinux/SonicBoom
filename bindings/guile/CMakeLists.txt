@@ -216,6 +216,20 @@ if(GUILE_EXECUTABLE)
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-executable-cache.scm)
 
+  # guile-compile exercises (sonicboom compile): tracing a forward function
+  # into one inference graph whose weights are (data :bound ...) parameters,
+  # binding them from a generated safetensors store, computing a known answer
+  # on the CPU interpreter, and the diagnostics for a missing weight, a shape
+  # mismatch, a non-f32 weight, a data-dependent branch and a freed handle.
+  add_test(
+    NAME guile-compile
+    COMMAND ${CMAKE_COMMAND} -E env
+            GUILE_AUTO_COMPILE=0
+            LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-compile.scm)
+
   # guile-trace-lower lowers a traced forward graph onto the S-Expr v0.1
   # vocabulary and executes it through libsonicboom.so (`run-s-expr`); same
   # shared-library dependency as guile-nn.

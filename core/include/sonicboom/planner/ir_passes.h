@@ -37,7 +37,8 @@
 // FuseResidualEpiloguePass (decode) and
 // RmsNormMmqPass, GeluMulMmqPass, SiluMulMmqPass (prefill), and
 // PruneByDemandPass (the demand-driven pruning of the consumer resolution,
-// which runs before either phase); a phase that does not contain a named pass
+// which runs before either phase) and DeadNodeEliminationPass (forward); a
+// phase that does not contain a named pass
 // simply ignores it. A disabled pass can also remove a
 // later pass's fusion — the passes run in sequence over one graph, and the
 // Quantize nodes QuantizeOncePass inserts are what RmsNormQuantizePass and
@@ -65,10 +66,15 @@ namespace sonicboom::planner {
 // the base position cannot express.
 //
 // Training is the pipeline for a traced forward+backward graph
-// (core/src/training/device_graph.cpp): the training vocabulary has none of the
+// (core/src/device/graph.cpp): the training vocabulary has none of the
 // inference folds' inputs, so the phase carries only the passes that are
 // semantic-neutral for it — today BufferReusePass, whose in-place marks the
 // device executor may honour but need not.
-enum class IrPassPhase { Decode, Prefill, Verify, Training };
+//
+// Forward is the pipeline for a traced forward-only graph (the same executor's
+// inference mode): dead-node elimination — nothing reads the node and it has no
+// effect, so neither its kernel nor its buffer is needed — then the same
+// buffer reuse.
+enum class IrPassPhase { Decode, Prefill, Verify, Training, Forward };
 
 } // namespace sonicboom::planner
