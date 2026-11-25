@@ -1910,7 +1910,7 @@ const void* upload_bytes(const void* host, size_t bytes) {
 
   void* dptr = nullptr;
   if (cudaMalloc(&dptr, bytes) != cudaSuccess) return nullptr;
-  if (cudaMemcpy(dptr, host, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+  if (!planner::device::upload(host, reinterpret_cast<uint64_t>(dptr), bytes)) {
     cudaFree(dptr);
     return nullptr;
   }

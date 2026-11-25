@@ -24,6 +24,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <string_view>
+#include <utility>
+
+#include <unistd.h>
 
 namespace sonicboom::planner {
 
@@ -223,6 +226,11 @@ ExpertPool::~ExpertPool() {
   prefetch_staging_ = nullptr;
   if (staging_) device::staging_destroy(staging_);
   staging_ = nullptr;
+  // The copies above have drained; the host expert bytes can go pageable
+  // again.
+  for (const auto& r : host_registered_)
+    device::host_unregister_pages(r.first, r.second);
+  host_registered_.clear();
   for (uint64_t& h : handles_) {
     if (h) device::release(h, 0);
     h = 0;
@@ -388,7 +396,68 @@ std::expected<std::unique_ptr<ExpertPool>, std::string> ExpertPool::create(
                  static_cast<unsigned long long>(pool->n_slots_),
                  static_cast<unsigned long long>(slot_bytes),
                  static_cast<unsigned long long>(pool_bytes >> 20));
+  pool->register_host_experts();
   return pool;
+}
+
+void ExpertPool::register_host_experts() {
+  // Off with SONICBOOM_EXPERT_DIRECT_DMA=0; the staged path is unchanged.
+  const char* env = std::getenv("SONICBOOM_EXPERT_DIRECT_DMA");
+  if (env && *env &&
+      (std::strcmp(env, "0") == 0 || std::strcmp(env, "off") == 0 ||
+       std::strcmp(env, "no") == 0))
+    return;
+  // A block's expert views are slices of two GGUF tensors (the merged gate+up
+  // tensor and the down tensor), so the spans merge into a handful of ranges.
+  // They are page-aligned first: the registration is page-granular, and two
+  // ranges sharing a page would be refused as overlapping.
+  const long page_long = ::sysconf(_SC_PAGESIZE);
+  const uintptr_t page =
+      page_long > 0 ? uintptr_t(page_long) : uintptr_t(4096);
+  std::vector<std::pair<uintptr_t, uintptr_t>> spans;
+  spans.reserve(3 * gate_of_.size());
+  const auto add = [&spans, page](
+                       const std::vector<const quant::QuantizedTensor*>& v) {
+    for (const quant::QuantizedTensor* t : v) {
+      if (!t || !t->valid()) continue;
+      const std::span<const std::byte> bytes = t->data();
+      if (bytes.empty()) continue;
+      const uintptr_t b = reinterpret_cast<uintptr_t>(bytes.data());
+      const uintptr_t e = b + bytes.size();
+      spans.emplace_back(b & ~(page - 1), (e + page - 1) & ~(page - 1));
+    }
+  };
+  add(gate_of_);
+  add(up_of_);
+  add(down_of_);
+  if (spans.empty()) return;
+  std::sort(spans.begin(), spans.end());
+  std::vector<std::pair<uintptr_t, uintptr_t>> merged;
+  for (const auto& s : spans) {
+    if (!merged.empty() && s.first <= merged.back().second)
+      merged.back().second = std::max(merged.back().second, s.second);
+    else
+      merged.push_back(s);
+  }
+  uint64_t total = 0;
+  uint64_t pinned = 0;
+  for (const auto& r : merged) {
+    const uint64_t n = r.second - r.first;
+    total += n;
+    const void* p = reinterpret_cast<const void*>(r.first);
+    // A refused range (the driver will not pin that much) keeps the staged
+    // path for its uploads; it is not an error.
+    if (!device::host_register_pages(p, n)) continue;
+    host_registered_.emplace_back(p, n);
+    pinned += n;
+  }
+  if (stats_enabled())
+    std::fprintf(stderr,
+                 "expert pool: %zu host ranges registered for direct DMA, "
+                 "%llu of %llu MiB pinned\n",
+                 host_registered_.size(),
+                 static_cast<unsigned long long>(pinned >> 20),
+                 static_cast<unsigned long long>(total >> 20));
 }
 
 std::expected<void, std::string> ExpertPool::select(

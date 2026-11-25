@@ -45,7 +45,10 @@
 //
 // The copies go through a pinned, double-buffered staging pipeline (device::
 // Staging): the host fills a pinned half, the half travels on a dedicated copy
-// stream, and events order it against the compute stream. The arrays are zeroed
+// stream, and events order it against the compute stream. When the pool can
+// pin the reader's expert bytes in place (register_host_experts), an upload is
+// one direct DMA from the reader buffer instead, with no host memcpy. The
+// arrays are zeroed
 // once at creation; a slot's read-ahead tail is still zeroed when it is filled,
 // because a smaller matrix may follow a larger one there. SONICBOOM_EXPERT_STAGE_KB
 // sizes the staging buffer (default 16384 KiB; the tests use 64).
@@ -63,6 +66,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sonicboom::planner {
@@ -168,6 +172,13 @@ class ExpertPool {
 
   std::expected<void, std::string> allocate(uint64_t pool_bytes);
 
+  // Pin the routed experts' host bytes in place (device::host_register_pages)
+  // so their uploads are one direct DMA each instead of a host memcpy into the
+  // staging half plus a DMA. Ranges the driver refuses are left pageable, and
+  // those uploads keep the staged path. SONICBOOM_EXPERT_DIRECT_DMA=0 turns
+  // the registration off; the ranges live until the pool is destroyed.
+  void register_host_experts();
+
   // The slot select()/prefetch() would evict for this node's `needed` keys:
   // lowest aging use, then oldest stamp, then lowest index; empty slots first.
   // -1 when every slot holds a needed key.
@@ -210,7 +221,9 @@ class ExpertPool {
   // Per global key: 1 when prefetch() brought it in and no select() has used it
   // yet (so evicting it is a wasted upload).
   std::vector<uint8_t> prefetched_;
-
+  // The host expert ranges registered in place for direct copies, as passed to
+  // device::host_register_pages(); unregistered at destruction.
+  std::vector<std::pair<const void*, uint64_t>> host_registered_;
   Stats stats_;
 };
 

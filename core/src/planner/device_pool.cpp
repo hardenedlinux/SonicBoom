@@ -32,7 +32,10 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
+
+#include <unistd.h>
 
 namespace sonicboom::planner::device {
 
@@ -66,6 +69,41 @@ struct Block {
 };
 std::unordered_map<uint64_t, Block> g_blocks;
 Stats g_stats;
+
+// Host byte ranges pinned in place for direct H2D copies (host_register_pages).
+// [begin, end) are page-aligned and lie inside the caller's allocation, so a
+// page the driver pins is never shared with another registration here.
+struct HostRange {
+  uintptr_t begin;
+  uintptr_t end;
+};
+std::vector<HostRange> g_host_ranges;  // guarded by g_mutex
+
+uintptr_t page_size() {
+  static const uintptr_t page = [] {
+    const long v = ::sysconf(_SC_PAGESIZE);
+    return v > 0 ? uintptr_t(v) : uintptr_t(4096);
+  }();
+  return page;
+}
+
+// True when [p, p + bytes) intersects a registered range without lying wholly
+// inside one. upload() stages such a copy through ordinary memory: the driver
+// refuses a pageable H2D copy whose source only partly overlaps pinned pages
+// (cudaErrorInvalidValue). Called with no lock held.
+bool host_partially_registered(const void* p, uint64_t bytes) noexcept {
+  const uintptr_t b = reinterpret_cast<uintptr_t>(p);
+  const uintptr_t e = b + bytes;
+  try {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    for (const HostRange& r : g_host_ranges)
+      if (b < r.end && e > r.begin)
+        return !(b >= r.begin && e <= r.end);
+    return false;
+  } catch (...) {
+    return false;
+  }
+}
 
 thread_local uint64_t t_owner = 0;
 std::atomic<uint64_t> g_next_owner{1};
@@ -207,8 +245,28 @@ void release(uint64_t handle, uint64_t bytes) {
 bool upload(const void* host, uint64_t handle, uint64_t bytes) {
 #ifdef SONICBOOM_USE_CUDA
   if (!host || handle == 0 || bytes == 0) return false;
-  return cudaMemcpy(reinterpret_cast<void*>(handle), host, bytes,
-                    cudaMemcpyHostToDevice) == cudaSuccess;
+  if (host_partially_registered(host, bytes)) {
+    // A pageable copy whose source straddles the edge of a registered range
+    // fails with cudaErrorInvalidValue (measured: the first bytes of the tensor
+    // after an expert share the expert range's last pinned page). Reader tensors
+    // are 32-byte aligned, so the tensors either side of a registered range
+    // share a page with it by construction. Stage the bytes in ordinary memory
+    // instead: this is a load-time weight upload, never a per-step copy.
+    std::vector<std::byte> tmp(static_cast<size_t>(bytes));
+    std::memcpy(tmp.data(), host, static_cast<size_t>(bytes));
+    if (cudaMemcpy(reinterpret_cast<void*>(handle), tmp.data(), bytes,
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+      (void)cudaGetLastError();  // reported by the return value
+      return false;
+    }
+    return true;
+  }
+  if (cudaMemcpy(reinterpret_cast<void*>(handle), host, bytes,
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
+    (void)cudaGetLastError();
+    return false;
+  }
+  return true;
 #else
   (void)host; (void)handle; (void)bytes;
   return false;
@@ -241,6 +299,80 @@ bool device_copy(uint64_t src, uint64_t dst, uint64_t bytes) {
 #else
   (void)src; (void)dst; (void)bytes;
   return false;
+#endif
+}
+
+bool host_register_pages(const void* p, uint64_t bytes) {
+#ifdef SONICBOOM_USE_CUDA
+  if (!p || bytes == 0) return false;
+  const uintptr_t pg = page_size();
+  const uintptr_t begin = reinterpret_cast<uintptr_t>(p) & ~(pg - 1);
+  const uintptr_t end =
+      (reinterpret_cast<uintptr_t>(p) + bytes + pg - 1) & ~(pg - 1);
+  {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    for (const HostRange& r : g_host_ranges)
+      if (begin >= r.begin && end <= r.end) return true;  // already pinned
+  }
+  if (cudaHostRegister(reinterpret_cast<void*>(begin), end - begin,
+                       cudaHostRegisterDefault) != cudaSuccess) {
+    // The refusal (e.g. a read-only file mapping the driver will not pin) is
+    // handled by leaving the range pageable. Clear the driver's error first:
+    // it is sticky, and an unrelated cudaGetLastError() later in the process
+    // would otherwise report this refusal.
+    (void)cudaGetLastError();
+    return false;
+  }
+  // The registration is the source of a copy only; the host keeps writing these
+  // bytes exactly as before, so a caller that registered the same pages twice
+  // (two pools over one weights object) is folded into one range.
+  std::lock_guard<std::mutex> lk(g_mutex);
+  g_host_ranges.push_back(HostRange{begin, end});
+  return true;
+#else
+  (void)p; (void)bytes;
+  return false;
+#endif
+}
+
+bool host_is_registered(const void* p, uint64_t bytes) noexcept {
+#ifdef SONICBOOM_USE_CUDA
+  if (!p || bytes == 0) return false;
+  try {
+    const uintptr_t pg = page_size();
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(p) & ~(pg - 1);
+    const uintptr_t end =
+        (reinterpret_cast<uintptr_t>(p) + bytes + pg - 1) & ~(pg - 1);
+    std::lock_guard<std::mutex> lk(g_mutex);
+    for (const HostRange& r : g_host_ranges)
+      if (begin >= r.begin && end <= r.end) return true;
+    return false;
+  } catch (...) {  // a noexcept query: never let the lock surface an error
+    return false;
+  }
+#else
+  (void)p; (void)bytes;
+  return false;
+#endif
+}
+
+void host_unregister_pages(const void* p, uint64_t bytes) {
+#ifdef SONICBOOM_USE_CUDA
+  if (!p || bytes == 0) return;
+  const uintptr_t pg = page_size();
+  const uintptr_t begin = reinterpret_cast<uintptr_t>(p) & ~(pg - 1);
+  const uintptr_t end =
+      (reinterpret_cast<uintptr_t>(p) + bytes + pg - 1) & ~(pg - 1);
+  std::lock_guard<std::mutex> lk(g_mutex);
+  for (auto it = g_host_ranges.begin(); it != g_host_ranges.end(); ++it) {
+    if (it->begin != begin || it->end != end) continue;
+    g_host_ranges.erase(it);
+    if (cudaHostUnregister(reinterpret_cast<void*>(begin)) != cudaSuccess)
+      (void)cudaGetLastError();  // teardown: a refusal is not a later error
+    return;
+  }
+#else
+  (void)p; (void)bytes;
 #endif
 }
 
@@ -342,8 +474,11 @@ bool staging_upload(Staging* s, const void* host, uint64_t handle,
 #ifdef SONICBOOM_USE_CUDA
   if (!s || (!host && bytes != 0) || handle == 0) return false;
   if (bytes == 0) return true;
-  // Test hook: SONICBOOM_EXPERT_UPLOAD_DELAY_US spaces the issued chunks, so a
-  // caller that assumes a fixed upload rate fails visibly. Off unless set.
+  // Test hooks: SONICBOOM_EXPERT_UPLOAD_DELAY_US spaces the issued copies by a
+  // fixed amount, and SONICBOOM_EXPERT_UPLOAD_JITTER_US=<seed>:<max_us> adds a
+  // seeded random sleep of up to max_us to each. Both exist so a caller whose
+  // result depends on upload timing fails visibly; an output must be
+  // bit-identical with either (or both) on. Off unless set.
   static const uint64_t delay_us = [] {
     const char* env = std::getenv("SONICBOOM_EXPERT_UPLOAD_DELAY_US");
     if (!env || !*env) return uint64_t{0};
@@ -351,7 +486,51 @@ bool staging_upload(Staging* s, const void* host, uint64_t handle,
     const unsigned long long v = std::strtoull(env, &end, 10);
     return (end == env || *end != '\0') ? uint64_t{0} : uint64_t(v);
   }();
+  struct Jitter {
+    uint64_t max_us = 0;
+    uint64_t state = 0x9E3779B97F4A7C15ull;
+  };
+  static Jitter jitter = [] {
+    Jitter j;
+    const char* env = std::getenv("SONICBOOM_EXPERT_UPLOAD_JITTER_US");
+    if (!env || !*env) return j;
+    char* end = nullptr;
+    const unsigned long long seed = std::strtoull(env, &end, 10);
+    if (end == env || *end != ':') return Jitter{};
+    const unsigned long long max_us = std::strtoull(end + 1, &end, 10);
+    if (*end != '\0') return Jitter{};
+    j.max_us = uint64_t(max_us);
+    j.state = uint64_t(seed) * 0x9E3779B97F4A7C15ull + 0x1234567ull;
+    if (j.state == 0) j.state = 1;
+    return j;
+  }();
+  const auto sleep_after_copy = [] {
+    if (jitter.max_us != 0) {
+      jitter.state ^= jitter.state >> 12;
+      jitter.state ^= jitter.state << 25;
+      jitter.state ^= jitter.state >> 27;
+      const uint64_t r = jitter.state * 0x2545F4914F6CDD1Dull;
+      std::this_thread::sleep_for(
+          std::chrono::microseconds(r % (jitter.max_us + 1)));
+    }
+    if (delay_us != 0)
+      std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+  };
   const unsigned char* src = static_cast<const unsigned char*>(host);
+  if (host_is_registered(src, bytes)) {
+    // Direct DMA out of the registered host bytes: no host memcpy, no pinned
+    // half. The event still marks the end of the copy on the copy stream, so
+    // commit()/fence() order it against the compute stream as usual.
+    if (cudaMemcpyAsync(reinterpret_cast<void*>(handle), src, bytes,
+                        cudaMemcpyHostToDevice, s->copy) != cudaSuccess ||
+        cudaEventRecord(s->ev[s->cur], s->copy) != cudaSuccess) {
+      (void)cudaGetLastError();  // reported by the return value
+      return false;
+    }
+    s->pending[s->cur] = true;
+    sleep_after_copy();
+    return true;
+  }
   uint64_t off = 0;
   while (off < bytes) {
     if (s->used == s->half) {
@@ -361,7 +540,10 @@ bool staging_upload(Staging* s, const void* host, uint64_t handle,
         // The half is about to be overwritten by the host. With the default
         // 16 MiB this is the reuse of the other half between nodes; a small
         // staging buffer (the tests use 64 KiB) reaches it mid-node.
-        if (cudaEventSynchronize(s->ev[s->cur]) != cudaSuccess) return false;
+        if (cudaEventSynchronize(s->ev[s->cur]) != cudaSuccess) {
+          (void)cudaGetLastError();  // reported by the return value
+          return false;
+        }
         s->pending[s->cur] = false;
       }
     }
@@ -370,14 +552,15 @@ bool staging_upload(Staging* s, const void* host, uint64_t handle,
         s->pinned + static_cast<uint64_t>(s->cur) * s->half + s->used;
     std::memcpy(slot, src + off, static_cast<size_t>(chunk));
     if (cudaMemcpyAsync(reinterpret_cast<void*>(handle + off), slot, chunk,
-                        cudaMemcpyHostToDevice, s->copy) != cudaSuccess)
+                        cudaMemcpyHostToDevice, s->copy) != cudaSuccess ||
+        cudaEventRecord(s->ev[s->cur], s->copy) != cudaSuccess) {
+      (void)cudaGetLastError();  // reported by the return value
       return false;
-    if (cudaEventRecord(s->ev[s->cur], s->copy) != cudaSuccess) return false;
+    }
     s->pending[s->cur] = true;
     s->used += chunk;
     off += chunk;
-    if (delay_us != 0)
-      std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+    sleep_after_copy();
   }
   return true;
 #else

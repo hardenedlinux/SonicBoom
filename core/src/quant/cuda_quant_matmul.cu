@@ -692,8 +692,9 @@ const void* upload_weight(const QuantizedTensor& W) {
 
   void* dptr = nullptr;
   if (cudaMalloc(&dptr, bytes + kWeightTailPad) != cudaSuccess) return nullptr;
-  if (cudaMemset(static_cast<char*>(dptr) + bytes, 0, kWeightTailPad) != cudaSuccess ||
-      cudaMemcpy(dptr, host, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+  if (cudaMemset(static_cast<char*>(dptr) + bytes, 0, kWeightTailPad) !=
+          cudaSuccess ||
+      !planner::device::upload(host, reinterpret_cast<uint64_t>(dptr), bytes)) {
     cudaFree(dptr);
     return nullptr;
   }
@@ -713,7 +714,7 @@ const void* upload_bytes(const void* host, size_t bytes) {
 
   void* dptr = nullptr;
   if (cudaMalloc(&dptr, bytes) != cudaSuccess) return nullptr;
-  if (cudaMemcpy(dptr, host, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+  if (!planner::device::upload(host, reinterpret_cast<uint64_t>(dptr), bytes)) {
     cudaFree(dptr);
     return nullptr;
   }

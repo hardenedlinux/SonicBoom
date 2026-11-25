@@ -65,6 +65,19 @@ bool upload(const void* host, uint64_t handle, uint64_t bytes);      // H2D
 bool download(uint64_t handle, void* host, uint64_t bytes);          // D2H
 bool device_copy(uint64_t src, uint64_t dst, uint64_t bytes);        // D2D
 
+// Host bytes pinned in place for the staging pipeline's direct copies. A range
+// registered here can be the source of an asynchronous H2D copy as it sits --
+// no host memcpy into the pinned half and no second copy of the model in a
+// pinned arena. The expert pool registers the GGUF reader's in-RAM expert bytes
+// once at load; the registration rounds out to page boundaries, so the caller
+// passes the same pointer and length to register and to unregister. A range the
+// driver refuses (not enough pinnable memory) is not registered and keeps the
+// staged path. host_is_registered() is false for a range that crosses the edge
+// of a registered one. Without CUDA registration fails and the query is false.
+bool host_register_pages(const void* p, uint64_t bytes);
+bool host_is_registered(const void* p, uint64_t bytes) noexcept;
+void host_unregister_pages(const void* p, uint64_t bytes);
+
 // Zero-fill a device buffer. Runs on the current stream (see
 // core/src/nn/cuda_stream.h), so it is capturable into a CUDA Graph. On the
 // legacy default stream this is synchronous, matching the old cudaMemset.
@@ -90,7 +103,10 @@ bool memset_device(uint64_t handle, int value, uint64_t bytes);
 //
 // The only host wait is the reuse of a pinned half whose previous copy has not
 // completed yet (cudaEventQuery/Sync at that point); the default 16 MiB holds
-// a whole node's misses, so it is not reached within a node.
+// a whole node's misses, so it is not reached within a node. An upload whose
+// bytes lie entirely in a range registered with host_register_pages() is sent
+// straight from the host bytes: no host memcpy and no pinned half consumed
+// (the half bookkeeping is simply left alone for that call).
 struct Staging;  // opaque; the CUDA types stay in device_pool.cpp
 
 // `bytes` of pinned host memory (split in two). Returns null without a device.
