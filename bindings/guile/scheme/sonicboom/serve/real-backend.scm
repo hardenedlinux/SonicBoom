@@ -46,13 +46,15 @@
 (define (session-history session)
   (reverse (real-session-rev-history session)))
 
-;; The GGUF architecture the C ABI reports ("gemma4", "qwen2") -> the chat
-;; template family. This is the ONE place the two names are matched: everything
+;; The GGUF architecture the C ABI reports ("gemma4", "qwen2", "qwen35moe")
+;; -> the chat template family. Qwen3.5/3.6 MoE keeps the Qwen ChatML template
+;; (the GGUF's own template names <|im_start|>/<|im_end|>), so it selects the
+;; same family. This is the ONE place the two names are matched: everything
 ;; downstream (prompt formatting, turn markers, stop tokens) is driven by the
 ;; family the loaded model selected, not by the file name or a flag.
 (define (family-for-arch arch)
   (cond ((string=? arch "gemma4") 'gemma)
-        ((string=? arch "qwen2") 'qwen)
+        ((or (string=? arch "qwen2") (string=? arch "qwen35moe")) 'qwen)
         (else (error "no chat template for this model architecture" arch))))
 
 (define (load-real-model config)
