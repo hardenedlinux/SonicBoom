@@ -219,6 +219,9 @@ server's usage count and seconds is the wall time from request to [DONE]."
         (unless (= (response-code resp) 200)
           (die "serve-codeedit: /v1/chat/completions -> ~a"
                (response-code resp)))
+        ;; Under LC_ALL=C the default port encoding is ASCII; the stream is
+        ;; UTF-8 JSON and the answers may be any script.
+        (set-port-encoding! body-port "UTF-8")
         (let loop ((chunks '()) (gen #f) (done #f))
           (let ((line (read-line body-port)))
             (cond
@@ -318,9 +321,13 @@ Returns: nothing; exits non-zero on a failed request or a missing turn."
                 (gen (list-ref res 1))
                 (seconds (list-ref res 2))
                 (hash (hex64 (fnv1a-64 text))))
+           ;; Bytes, not a textual port: the default output encoding under
+           ;; LC_ALL=C is ASCII and would replace every non-ASCII character
+           ;; with '?' (which would also collapse the comparison's text).
            (call-with-output-file
                (format #f "~a/~a.~a.txt" out-dir arm-name index)
-             (lambda (p) (display text p)))
+             (lambda (p) (put-bytevector p (string->utf8 text)))
+             #:binary #t)
            (format #t "turn=~a gen_tokens=~a seconds=~a hash=~a~%"
                    index gen seconds hash)
            (set! gen-sum (+ gen-sum gen))
