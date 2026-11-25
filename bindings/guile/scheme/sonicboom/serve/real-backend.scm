@@ -12,6 +12,7 @@
 (define-module (sonicboom serve real-backend)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
+  #:use-module (srfi srfi-13)
   #:use-module (srfi srfi-34)
   #:use-module (system foreign)
   #:use-module (rnrs bytevectors)
@@ -96,9 +97,53 @@
     (context-length . ,(real-model-context-length model))
     (eos-tokens . ,(real-model-eos-tokens model))))
 
+;; The hand-written family templates are the model's own GGUF template where
+;; it is model-specific:
+;;
+;;  - Qwen3.5/3.6 trims every message's content and, with thinking off, opens
+;;    the assistant turn with an empty think block. This server has no
+;;    reasoning channel, so thinking is always off. The block is a 'special
+;;    segment: <think> and </think> are vocabulary tokens, and llama.cpp's
+;;    tokenizer (parse_special on) turns them into those single ids.
+;;  - Qwen2.5 has a default system turn ("You are a helpful assistant.") when
+;;    the request has no system message of its own.
+;;
+;; Both are what llama.cpp's template renders for the same request, byte for
+;; byte and token for token, which is what lets a benchmark compare the two
+;; engines on the same prompt.
+(define qwen35moe-thinking-off-block "<think>\n\n</think>\n\n")
+(define qwen2-default-system "You are a helpful assistant.")
+
+(define (trim-message-contents messages)
+  (map (lambda (m)
+         (map (lambda (kv)
+                (if (and (string=? (car kv) "content") (string? (cdr kv)))
+                    (cons (car kv) (string-trim-both (cdr kv)))
+                    kv))
+              m))
+       messages))
+
+(define (add-qwen2-default-system messages)
+  (if (any (lambda (m) (member (message-ref m "role") '("system" "developer")))
+           messages)
+      messages
+      (cons (list (cons "role" "system") (cons "content" qwen2-default-system))
+            messages)))
+
 (define (real-render-chat model messages tools tool-choice)
-  (render-chat-template-segments (real-model-family model) messages
-                                 #:tools tools #:tool-choice tool-choice))
+  (let* ((arch (real-model-arch model))
+         (messages (cond ((string=? arch "qwen35moe")
+                          (trim-message-contents messages))
+                         ((string=? arch "qwen2")
+                          (add-qwen2-default-system messages))
+                         (else messages)))
+         (segments (render-chat-template-segments (real-model-family model)
+                                                 messages
+                                                 #:tools tools
+                                                 #:tool-choice tool-choice)))
+    (if (string=? arch "qwen35moe")
+        (append segments (list (cons 'special qwen35moe-thinking-off-block)))
+        segments)))
 
 ;; The template's own markers ('special segments) are parsed as the vocabulary's
 ;; control tokens; everything else — the message text, including a "<turn|>" a

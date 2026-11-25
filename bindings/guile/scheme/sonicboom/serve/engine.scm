@@ -27,7 +27,9 @@
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
   #:use-module (ice-9 match)
+  #:use-module (ice-9 binary-ports)
   #:use-module (ice-9 threads)
+  #:use-module (rnrs bytevectors)
   #:use-module (sonicboom serve backend)
   #:use-module (sonicboom serve sessions)
   #:use-module (sonicboom serve chat-template)
@@ -591,6 +593,29 @@ PyTorch: none"
     (lambda () (wait-turn! engine ticket) (thunk))
     (lambda () (engine-drop! engine ticket))))
 
+;; An opt-in record of the prompt a request was actually tokenized from:
+;; SONICBOOM_SERVE_PROMPT_TRACE=<dir> makes every accepted request write the
+;; rendered prompt's bytes to <dir>/<n>.txt (UTF-8) and its token ids to
+;; <dir>/<n>.ids (one line, space separated). It is off unless the variable is
+;; set, so the normal path only reads the environment. It exists so a
+;; cross-engine benchmark can show every engine was fed the same prompt; the
+;; ids are the very list prefill receives.
+(define prompt-trace-counter 0)
+
+(define (prompt-trace-write! segments tokens)
+  (let ((dir (getenv "SONICBOOM_SERVE_PROMPT_TRACE")))
+    (when (and dir (not (string-null? dir)))
+      (set! prompt-trace-counter (+ prompt-trace-counter 1))
+      (let ((base (format #f "~a/~5,'0d" dir prompt-trace-counter)))
+        (call-with-output-file (string-append base ".txt")
+          (lambda (port)
+            (put-bytevector port (string->utf8 (segments->string segments))))
+          #:binary #t)
+        (call-with-output-file (string-append base ".ids")
+          (lambda (port)
+            (for-each (lambda (t) (display t port) (display " " port)) tokens)
+            (newline port)))))))
+
 (define (run-request engine request on-event)
   (let* ((id (chat-request-model request))
          (model (or (engine-model engine id) (throw 'model-not-found id)))
@@ -623,6 +648,7 @@ PyTorch: none"
                                 #:frequency-penalty (chat-request-frequency-penalty request))))
     (when (>= n-prompt ctx)
       (throw 'context-length-exceeded n-prompt ctx))
+    (prompt-trace-write! prompt-segments prompt-tokens)
     (bump! engine 'requests 1)
     (let* ((entry (pool-acquire! pool prompt-tokens))
            (session (pool-entry-session entry))

@@ -17,10 +17,28 @@
 ;; llama-codeedit: the code-edit turns through llama-server.
 ;;
 ;; Ten frozen edit requests (tools/bench/codeedit: NN.instruction, NN.file
-;; and manifest.tsv), each its own stateless /completion request: the prompt
-;; is the instruction bytes followed by the file bytes, and n_predict is the
-;; file's own token count from codeedit_bench's output for the same model.
-;; Greedy (temperature 0, seed 1234), cache_prompt on, ignore_eos on.
+;; and manifest.tsv), each its own stateless request whose prompt is the
+;; instruction bytes followed by the file bytes.
+;;
+;; Two request shapes:
+;;
+;;   --chat   /v1/chat/completions with the turn as one user message, so the
+;;            model's own chat template wraps it exactly as SonicBoom's server
+;;            wraps the same turn. max_tokens is the file's own token count
+;;            from codeedit_bench's output for the same model; generation
+;;            stops at the turn-end token, as SonicBoom's does.
+;;   default  raw /completion of the unwrapped prompt with ignore_eos on
+;;            (the reference runner's shape).
+;;
+;; Greedy (temperature 0, seed 1234), cache_prompt on. A chat run passes
+;; enable_thinking:false both to the server and per request, which is what a
+;; Qwen3.5/3.6 template needs to emit its empty think block.
+;;
+;; --canonical-dir DIR makes every turn prove its prompt before it is timed:
+;; the server renders the same message through /apply-template and tokenizes
+;; the result through /tokenize, and both the bytes and the ids must equal
+;; DIR/NN.txt and DIR/NN.ids (written by the cross-engine comparison's prompt
+;; snapshot). The server's reported prompt_tokens must equal the id count too.
 ;;
 ;; The server is started here and stopped at the end:
 ;;
@@ -35,7 +53,7 @@
 ;; Usage:
 ;;   guile tools/bench/llama-codeedit.scm --server PATH --model GGUF
 ;;        --data DIR --ctx CTX --gen-tokens FILE --arm off|ngram-mod
-;;        --reps N --out DIR [--moe-args TEXT]
+;;        --reps N --out DIR [--moe-args TEXT] [--chat] [--canonical-dir DIR]
 ;;
 ;; Output, one line per turn per rep, then one line per rep:
 ;;   turn=NN rep=R prompt_n=P predicted_n=G predicted_ms=T
@@ -46,7 +64,7 @@
              (ice-9 format)
              (ice-9 rdelim)
              (json)
-             ((rnrs bytevectors) #:select (utf8->string))
+             ((rnrs bytevectors) #:select (utf8->string string->utf8))
              (srfi srfi-1)
              (srfi srfi-13)
              (web client)
@@ -57,6 +75,14 @@
 (define data-dir #f)
 (define out-dir #f)
 (define arm-name #f)
+(define server-path #f)
+(define model-path #f)
+(define ctx-size #f)
+(define gen-file #f)
+(define reps 1)
+(define moe-args "")
+(define chat-mode? #f)
+(define canonical-dir #f)
 
 (define (die fmt . args)
   (apply format (current-error-port) fmt args)
@@ -137,6 +163,68 @@
       (lambda (resp body)
         (values (response-code resp) body)))))
 
+;; The same request, parsed as JSON. (web client) hands the body back as a
+;; string or as bytes depending on the response headers; both are UTF-8 JSON.
+(define (http-json-body method path body)
+  (call-with-values (lambda () (http-json method path body))
+    (lambda (code resp-body)
+      (unless (= code 200)
+        (die "llama-codeedit: ~a -> ~a" path code))
+      (json->scm (open-input-string
+                  (if (string? resp-body)
+                      resp-body
+                      (utf8->string resp-body)))))))
+
+(define (jref-ids obj)
+  (map (lambda (x) (if (number? x) x (jref x "id" #f)))
+       (vector->list (jref obj "tokens" #()))))
+
+(define (read-ids path)
+  (call-with-input-file path
+    (lambda (p)
+      (let lp ((acc '()))
+        (let ((x (read p)))
+          (if (eof-object? x) (reverse acc) (lp (cons x acc))))))))
+
+;; The chat body a timed turn sends. The template kwargs are the same on the
+;; server's command line; repeating them here keeps the body the one the
+;; snapshot tool renders.
+(define (chat-body content max-tokens)
+  `(("messages" . #((("role" . "user") ("content" . ,content))))
+    ("max_tokens" . ,max-tokens)
+    ("temperature" . 0.0)
+    ("top_k" . 1)
+    ("top_p" . 1.0)
+    ("min_p" . 0.0)
+    ("repeat_penalty" . 1.0)
+    ("seed" . 1234)
+    ("cache_prompt" . #t)
+    ("stream" . #t)
+    ("stream_options" . (("include_usage" . #t)))
+    ("chat_template_kwargs" . (("enable_thinking" . #f)))))
+
+;; Prove this turn's prompt is the canonical one: the server's own /apply-template
+;; and /tokenize must reproduce DIR/NN.txt and DIR/NN.ids byte for byte.
+;; Returns the canonical id count for the prompt_tokens check.
+(define (canonical-check index content)
+  (let* ((base (format #f "~a/~a" canonical-dir index))
+         (want-text (slurp (string-append base ".txt")))
+         (want-ids (read-ids (string-append base ".ids")))
+         (got-text (jref (http-json-body 'POST "/apply-template"
+                                         (chat-body content 1))
+                         "prompt" #f))
+         (got-ids (jref-ids (http-json-body 'POST "/tokenize"
+                                            `(("content" . ,got-text)
+                                              ("add_special" . #t)
+                                              ("parse_special" . #t))))))
+    (unless (string=? got-text want-text)
+      (die "llama-codeedit: turn ~a rendered a different prompt than ~a"
+           index (string-append base ".txt")))
+    (unless (equal? got-ids want-ids)
+      (die "llama-codeedit: turn ~a tokenized to different ids than ~a"
+           index (string-append base ".ids")))
+    (length want-ids)))
+
 (define (server-healthy?)
   (catch #t
     (lambda ()
@@ -174,6 +262,13 @@
                              "--port" (number->string port-number))
                        (if (string=? arm "ngram-mod")
                            (list "--spec-type" "ngram-mod")
+                           '())
+                       ;; A thinking model answers directly only when its
+                       ;; template is told thinking is off; the flag is the
+                       ;; same one run-llama-chat.sh passes.
+                       (if chat-mode?
+                           (list "--chat-template-kwargs"
+                                 "{\"enable_thinking\":false}")
                            '())
                        (if (string-null? moe-args)
                            '()
@@ -238,6 +333,9 @@
         (let ((code (response-code resp)))
           (unless (= code 200)
             (die "llama-codeedit: /completion -> ~a" code))
+          ;; Under LC_ALL=C the default port encoding is ASCII; the stream is
+          ;; UTF-8 JSON and the answers may be any script.
+          (set-port-encoding! body-port "UTF-8")
           (let loop ((chunks '()) (final #f))
             (let ((line (read-line body-port)))
               (cond
@@ -261,39 +359,98 @@
                       (loop (if c (cons c chunks) chunks) final))))))
                (else (loop chunks final))))))))))
 
+;; One /v1/chat/completions request, streamed, with the turn as one user
+;; message. Returns (text predicted-n prompt-tokens predicted-ms); the
+;; predicted figures are the server's own timings for the request, and
+;; prompt-tokens is the count it evaluated (cached + processed).
+(define (complete-chat content n-predict)
+  (let ((uri (build-uri 'http #:host "127.0.0.1" #:port port-number
+                        #:path "/v1/chat/completions")))
+    (call-with-values
+        (lambda ()
+          (http-request uri
+                        #:method 'POST
+                        #:headers '((content-type application/json))
+                        #:body (scm->json-string (chat-body content n-predict))
+                        #:streaming? #t))
+      (lambda (resp body-port)
+        (unless (= (response-code resp) 200)
+          (die "llama-codeedit: /v1/chat/completions -> ~a"
+               (response-code resp)))
+        ;; Under LC_ALL=C the default port encoding is ASCII; the stream is
+        ;; UTF-8 JSON and the answers may be any script.
+        (set-port-encoding! body-port "UTF-8")
+        (let loop ((chunks '()) (usage #f) (timings #f) (done #f))
+          (let ((line (read-line body-port)))
+            (cond
+             ((eof-object? line)
+              (unless done
+                (die "llama-codeedit: stream ended without a stop chunk"))
+              (unless timings
+                (die "llama-codeedit: the server sent no timings"))
+              (list (apply string-append (reverse chunks))
+                    (or (and (pair? usage) (jref usage "prompt_tokens" #f))
+                        (jref timings "prompt_n" 0))
+                    (jref timings "predicted_n" 0)
+                    (jref timings "predicted_ms" 0.0)))
+             ((string-prefix? "data: " line)
+              (let* ((payload (string-trim-both (substring line 6)))
+                     ;; [DONE] is not JSON; it ends the OpenAI SSE stream and
+                     ;; must be recognised before anything parses the line.
+                     (obj (and (not (string-null? payload))
+                               (not (string=? payload "[DONE]"))
+                               (json->scm (open-input-string payload)))))
+                (cond
+                 ((string=? payload "[DONE]") (loop chunks usage timings #t))
+                 ((not obj) (loop chunks usage timings done))
+                 ((jref obj "stop" #f) (loop chunks usage timings obj))
+                 (else
+                  (let* ((u (jref obj "usage" #f))
+                         (tm (jref obj "timings" #f))
+                         (choices (jref obj "choices" #()))
+                         (choice (and (vector? choices)
+                                      (> (vector-length choices) 0)
+                                      (vector-ref choices 0)))
+                         (delta (and choice (jref choice "delta" #f)))
+                         (c (and delta (jref delta "content" #f))))
+                    (loop (if (string? c) (cons c chunks) chunks)
+                          (if (pair? u) u usage)
+                          (if (pair? tm) tm timings)
+                          done))))))
+             (else (loop chunks usage timings done)))))))))
+
 (define (parse-args args)
-  (let loop ((rest args) (server #f) (model #f) (ctx #f) (gen-file #f)
-             (arm #f) (reps #f) (moe-args ""))
+  (let loop ((rest args))
     (cond
      ((null? rest)
-      (unless (and server model data-dir ctx gen-file arm reps)
+      (unless (and server-path model-path data-dir ctx-size gen-file arm-name)
         (die "usage: llama-codeedit.scm --server PATH --model GGUF --data DIR ~
-             --ctx CTX --gen-tokens FILE --arm off|ngram-mod --reps N --out DIR"))
-      (unless (or (string=? arm "off") (string=? arm "ngram-mod"))
-        (die "llama-codeedit: --arm must be off or ngram-mod"))
-      (list server model ctx gen-file arm reps moe-args))
+             --ctx CTX --gen-tokens FILE --arm off|ngram-mod --reps N --out DIR ~
+             [--moe-args TEXT] [--chat] [--canonical-dir DIR]"))
+      (unless (or (string=? arm-name "off") (string=? arm-name "ngram-mod"))
+        (die "llama-codeedit: --arm must be off or ngram-mod")))
      ((string=? (car rest) "--server")
-      (loop (cddr rest) (cadr rest) model ctx gen-file arm reps moe-args))
+      (set! server-path (cadr rest)) (loop (cddr rest)))
      ((string=? (car rest) "--model")
-      (loop (cddr rest) server (cadr rest) ctx gen-file arm reps moe-args))
+      (set! model-path (cadr rest)) (loop (cddr rest)))
      ((string=? (car rest) "--data")
-      (set! data-dir (cadr rest))
-      (loop (cddr rest) server model ctx gen-file arm reps moe-args))
+      (set! data-dir (cadr rest)) (loop (cddr rest)))
      ((string=? (car rest) "--ctx")
-      (loop (cddr rest) server model (string->number (cadr rest)) gen-file arm
-            reps moe-args))
+      (set! ctx-size (string->number (cadr rest))) (loop (cddr rest)))
      ((string=? (car rest) "--gen-tokens")
-      (loop (cddr rest) server model ctx (cadr rest) arm reps moe-args))
+      (set! gen-file (cadr rest)) (loop (cddr rest)))
      ((string=? (car rest) "--arm")
-      (loop (cddr rest) server model ctx gen-file (cadr rest) reps moe-args))
+      (set! arm-name (cadr rest)) (loop (cddr rest)))
      ((string=? (car rest) "--reps")
-      (loop (cddr rest) server model ctx gen-file arm
-            (string->number (cadr rest)) moe-args))
+      (set! reps (string->number (cadr rest))) (loop (cddr rest)))
      ((string=? (car rest) "--out")
-      (set! out-dir (cadr rest))
-      (loop (cddr rest) server model ctx gen-file arm reps moe-args))
+      (set! out-dir (cadr rest)) (loop (cddr rest)))
      ((string=? (car rest) "--moe-args")
-      (loop (cddr rest) server model ctx gen-file arm reps (cadr rest)))
+      (set! moe-args (cadr rest)) (loop (cddr rest)))
+     ((string=? (car rest) "--chat")
+      (set! chat-mode? #t) (loop (cdr rest)))
+     ((string=? (car rest) "--canonical-dir")
+      (set! canonical-dir (cadr rest)) (loop (cddr rest)))
      (else (die "llama-codeedit: unknown option ~a" (car rest))))))
 
 ;; One rep: every turn, in order; returns (gen . ms) sums and the contents.
@@ -309,14 +466,27 @@
          (unless gen-entry
            (die "llama-codeedit: no gen_tokens for turn ~a" index))
          (let* ((gen (cdr gen-entry))
-                (res (complete prompt gen add-special))
+                ;; With --canonical-dir the timed server itself must render and
+                ;; tokenize this turn to the snapshot's bytes and ids.
+                (want-n (and canonical-dir (canonical-check index prompt)))
+                (res (if chat-mode?
+                         (complete-chat prompt gen)
+                         (complete prompt gen add-special)))
                 (text (list-ref res 0))
                 (prompt-n (list-ref res 1))
                 (predicted-n (list-ref res 2))
                 (predicted-ms (list-ref res 3)))
+           (when (and want-n (not (= prompt-n want-n)))
+             (die "llama-codeedit: turn ~a: the server evaluated ~a prompt ~
+                  tokens, the canonical prompt has ~a"
+                  index prompt-n want-n))
+           ;; Bytes, not a textual port: the default output encoding under
+           ;; LC_ALL=C is ASCII and would replace every non-ASCII character
+           ;; with '?' (which would also collapse the comparison's text).
            (call-with-output-file
                (format #f "~a/~a.rep~a.~a.txt" out-dir arm-name rep index)
-             (lambda (p) (display text p)))
+             (lambda (p) (put-bytevector p (string->utf8 text)))
+             #:binary #t)
            (format #t "turn=~a rep=~a prompt_n=~a predicted_n=~a predicted_ms=~a~%"
                    index rep prompt-n predicted-n predicted-ms)
            (set! gen-sum (+ gen-sum predicted-n))
@@ -326,33 +496,29 @@
             rep (if (> ms-sum 0.0) (/ (* gen-sum 1000.0) ms-sum) 0.0))))
 
 (define (main)
-  (let* ((parsed (parse-args (cdr (command-line))))
-         (server (list-ref parsed 0))
-         (model (list-ref parsed 1))
-         (ctx (list-ref parsed 2))
-         (gen-file (list-ref parsed 3))
-         (arm (list-ref parsed 4))
-         (reps (list-ref parsed 5))
-         (moe-args (list-ref parsed 6))
-         (turns (read-turns))
+  (parse-args (cdr (command-line)))
+  (when (and canonical-dir (not chat-mode?))
+    (die "llama-codeedit: --canonical-dir needs --chat (the snapshot is a chat prompt)"))
+  (let* ((turns (read-turns))
          (gens (read-gen-tokens gen-file)))
-    (set! arm-name arm)
     (system (format #f "mkdir -p ~a" (shell-quote out-dir)))
     (let ((pidfile (format #f "~a/server.pid" out-dir))
-          (logfile (format #f "~a/server_~a.log" out-dir arm)))
-      (if (string=? arm "ngram-mod")
+          (logfile (format #f "~a/server_~a.log" out-dir arm-name)))
+      (if (string=? arm-name "ngram-mod")
           ;; A fresh server per rep: the n-gram container is per server and
           ;; would otherwise carry one rep's output into the next.
           (let loop ((rep 0) (pid #f))
             (when (< rep reps)
               (when pid (stop-server pid))
-              (let ((pid (start-server server model ctx arm pidfile logfile moe-args)))
+              (let ((pid (start-server server-path model-path ctx-size arm-name
+                                       pidfile logfile moe-args)))
                 (run-rep turns gens rep)
                 (loop (+ rep 1) pid)))
             (when pid (stop-server pid)))
           ;; The no-spec arm keeps one server for the run; it starts with an
           ;; empty cache.
-          (let ((pid (start-server server model ctx arm pidfile logfile moe-args)))
+          (let ((pid (start-server server-path model-path ctx-size arm-name
+                                   pidfile logfile moe-args)))
             (let loop ((rep 0))
               (when (< rep reps)
                 (run-rep turns gens rep)

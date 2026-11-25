@@ -102,7 +102,7 @@ is `models/qwen2.5-7b-instruct-1m-q4_k_m.gguf` served as `qwen2.5-7b`, with a
 context length of 16384 and one pooled session; `--model` / `--model-id` /
 `--context-length` / `--max-sessions` override them).
 The chat-template family is selected from the GGUF architecture (`gemma4` →
-`gemma`, `qwen2` → `qwen`), stop tokens are the union of the model's EOS ids
+`gemma`, `qwen2` and `qwen35moe` → `qwen`), stop tokens are the union of the model's EOS ids
 and the template's end-of-turn markers, and sessions are KV-cache handles from
 `make-session` / `prefill!` / `generate-tokens`. `--backend real` is the
 default; `tools/test-api-server.sh` is the committed smoke test for this path,
@@ -136,7 +136,17 @@ Hand-written Scheme per family, no Jinja (`chat-template.scm`):
 - **gemma**: `<bos><start_of_turn>user\n…<end_of_turn>\n<start_of_turn>model\n`;
   no system role, the system text (and the tools block) open the first user
   turn;
-- **qwen**: ChatML `<|im_start|>role\n…<|im_end|>\n`.
+- **qwen**: ChatML `<|im_start|>role\n…<|im_end|>\n`. A `qwen35moe`
+  (Qwen3.5/3.6) model gets the empty `<think>\n\n</think>\n\n` block after
+  `<|im_start|>assistant\n`, as its own template renders with thinking off:
+  the server has no reasoning-content channel, and this is the byte-for-byte
+  prompt llama.cpp's template produces with `enable_thinking: false`. The
+  block is text, not control tokens.
+
+The engine can record what it tokenized: with `SONICBOOM_SERVE_PROMPT_TRACE`
+set to a directory, every accepted request writes the rendered prompt bytes to
+`<n>.txt` and the token ids prefill receives to `<n>.ids` there. It is off
+unless set; it is meant for cross-engine prompt-identity checks.
 
 Tools follow the Qwen2.5 convention for both families: a `# Tools` section
 listing one JSON signature per line inside `<tools></tools>`, and calls as

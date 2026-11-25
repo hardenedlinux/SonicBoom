@@ -12,6 +12,8 @@
 
 (use-modules (srfi srfi-1)
              (srfi srfi-64)
+             (ice-9 binary-ports)
+             (ice-9 ftw)
              (ice-9 match)
              (rnrs bytevectors)
              (json)
@@ -291,6 +293,50 @@
   (engine-drop! engine t1)
   (engine-drop! engine t2)
   (test-equal "dropped tickets leave the queue" 0 (assq-ref (engine-stats engine) 'waiting)))
+
+;;; --- the prompt trace ----------------------------------------------------------
+
+;; SONICBOOM_SERVE_PROMPT_TRACE records, per accepted request, the rendered
+;; prompt's bytes and the ids prefill receives. Off unless the variable is set.
+(let* ((dir (format #f "/tmp/sonicboom-prompt-trace-~a" (getpid)))
+       (model (load-model backend '((id . "t") (family . qwen))))
+       (traced (make-engine (list model)))
+       (messages (list (msg "user" "Hi")))
+       (ask (lambda ()
+              (engine-generate traced
+                               (make-chat-request #:model "t" #:messages messages
+                                                  #:temperature 0 #:max-tokens 2)
+                               (lambda _ #t))))
+       (files (lambda ()
+                (scandir dir (lambda (f) (not (member f '("." ".."))))))))
+  (define (read-ids path)
+    (call-with-input-file path
+      (lambda (p)
+        (let lp ((acc '()))
+          (let ((x (read p)))
+            (if (eof-object? x) (reverse acc) (lp (cons x acc))))))))
+  (catch #t (lambda () (rmdir dir)) (lambda _ #f))
+  (mkdir dir)
+  (unsetenv "SONICBOOM_SERVE_PROMPT_TRACE")
+  (ask)
+  (test-equal "no trace without the variable" '() (files))
+  (setenv "SONICBOOM_SERVE_PROMPT_TRACE" dir)
+  (ask)
+  (unsetenv "SONICBOOM_SERVE_PROMPT_TRACE")
+  (test-equal "one pair of files per accepted request" '("00001.ids" "00001.txt")
+    (sort (files) string<?))
+  (test-equal "the trace holds the rendered prompt bytes"
+    (render-chat-template 'qwen messages)
+    (call-with-input-file (format #f "~a/00001.txt" dir)
+      (lambda (p) (utf8->string (get-bytevector-all p)))))
+  (test-equal "the trace holds the ids prefill receives"
+    (tokenize-chat model (render-chat-template-segments 'qwen messages))
+    (read-ids (format #f "~a/00001.ids" dir)))
+  (ask)
+  (test-equal "unsetting the variable stops the trace" '("00001.ids" "00001.txt")
+    (sort (files) string<?))
+  (for-each (lambda (f) (delete-file (format #f "~a/~a" dir f))) (files))
+  (rmdir dir))
 
 ;;; --- incremental detokenization ------------------------------------------------
 
