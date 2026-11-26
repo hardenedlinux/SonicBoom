@@ -144,9 +144,9 @@ PyTorch: none"
 (define (fingerprint-for-model model-id model-path)
   "The fingerprint for a reply from model-id whose file is model-path.
 
-The record is the server scope plus model (the file's SHA-256 prefix, or
-\"none\") and id, an FNV-1a over the record's canonical text. Two servers agree
-exactly when id agrees.
+The record is the server scope plus model (\"sha256:<prefix>\" of the file, or
+\"none:<model-id>\" when there is no file) and id, an FNV-1a over the record's
+canonical text. Two servers agree exactly when id agrees.
 
 Args:
   model-id: the served model id string.
@@ -155,7 +155,7 @@ Returns: an alist with string keys.
 Example:
   (use-modules (sonicboom serve fingerprint))
   (assoc-ref (fingerprint-for-model \"m\" #f) \"model\")
-  => \"none\"
+  => \"none:m\"
 PyTorch: none"
   (let* ((sha (model-sha-prefix model-path))
          (record

@@ -42,6 +42,11 @@
 ;;; ---------------------------------------------------------------------------
 ;;; The records
 
+;; A stored style holds a style's identity, its model and its steering vector.
+;;
+;; The optional prompt material is a system message and a list of exemplars.
+;; style-id, style-version, style-model and style-layer read the corresponding
+;; entries. style-layer is #f for a card-only style, which carries no vector.
 (define-record-type <style>
   (%make-style id version model system exemplars layer vector created)
   style?
@@ -74,6 +79,9 @@ Example:
 PyTorch: none"
   (and (style-layer style) #t))
 
+;; The in-memory style table maps a style id to its current version.
+;;
+;; A mutex guards the hash for concurrent server threads.
 (define-record-type <style-registry>
   (%make-style-registry table lock)
   style-registry?
@@ -362,7 +370,7 @@ Example:
                   '((id . \"dry\") (version . 1) (model . \"m\")
                     (system . \"Write plainly.\") (exemplars . ()) (layer . #f))
                   model)))
-    (assq-ref (style-json style) \"id\"))
+    (assoc-ref (style-json style) \"id\"))
   => \"dry\"
 PyTorch: none"
   `(("id" . ,(style-id style))
@@ -424,7 +432,7 @@ Example:
      '((id . \"dry\") (version . 1) (model . \"m\") (system . \"Write plainly.\")
        (exemplars . ()) (layer . #f))
      model)
-    (car (resolve-style-choice reg '((\"id\" . \"dry\")) \"m\" 1.0)))
+    (car (car (resolve-style-choice reg '((\"id\" . \"dry\")) \"m\" 1.0))))
   => ((\"role\" . \"system\") (\"content\" . \"Write plainly.\"))
 Note: an unknown id raises (style-not-found id); a version other than the
 stored one raises (style-version-mismatch id want got); a model other than the

@@ -349,11 +349,9 @@ PyTorch: none"
 Args:
   model: a model.
 Returns: a positive integer.
-Example:
-  (use-modules (sonicboom serve backend) (sonicboom serve real-backend))
-  (model-embedding (load-model (make-real-backend ...) ...))
-  => 2560
-Note: only a backend that provides embedding can answer this.
+Note: only a backend that provides embedding can answer this. There is no
+Example block here: the call needs a loaded model and a GPU, which this
+documentation's examples do not build.
 PyTorch: none"
   (let ((proc (%backend-embedding (model-backend model))))
     (unless proc
@@ -385,12 +383,9 @@ Args:
   tokens: a list of token ids.
   layer: a block index, counted from 0.
 Returns: a bytevector of (length TOKENS) * (model-embedding MODEL) f32 values.
-Example:
-  (use-modules (sonicboom serve backend) (sonicboom serve real-backend))
-  (bytevector? (residual-capture (load-model (make-real-backend ...) ...)
-                                 '(360 361) 0))
-  => #t
-Note: only a backend that provides residual-capture can answer this.
+Note: only a backend that provides residual-capture can answer this. There is no
+Example block here: the call needs a loaded model and a GPU, which this
+documentation's examples do not build.
 PyTorch: none"
   (let ((proc (%backend-residual (model-backend model))))
     (unless proc

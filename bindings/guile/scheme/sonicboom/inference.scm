@@ -526,12 +526,11 @@ Args:
   vec: the vector: a bytevector of native f32 values, or a list/vector of
        reals, of length (model-embedding model).
 Returns: unspecified.
-Example:
-  (use-modules (sonicboom inference))
-  (set-steering! session 17 (make-bytevector (* 4 (model-embedding model)) 0))
 PyTorch: none
 Note: Generation is deterministic for a fixed (prompt, seed, vector) and
-identical with speculative decoding on or off."
+identical with speculative decoding on or off. There is no Example: block:
+the call needs a loaded model and a live session, which this documentation's
+examples do not build."
   (let* ((bv (steering-vector-bv vec))
          (n (quotient (bytevector-length bv) 4))
          (err-slot (make-slot)))
