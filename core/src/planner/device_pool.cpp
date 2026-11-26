@@ -175,6 +175,27 @@ uint64_t acquire(uint64_t bytes) {
   }
   void* p = nullptr;
   if (cudaMalloc(&p, size) != cudaSuccess) {
+    // The parked blocks are dead weight to the driver until the next request
+    // of their exact size. A request that does not fit is the moment to hand
+    // them back and retry once: a session's later turns ask for new extent
+    // classes while the earlier turns' buffers sit parked, and on a device
+    // holding a full expert pool that growth is what exhausts it. Buffers the
+    // runtime still holds are untouched, and a capture must not see cudaFree.
+    if (!sonicboom::cuda::boom_capturing()) {
+      std::unordered_set<uint64_t> parked;
+      for (const auto& kv : g_blocks)
+        if (!kv.second.live) parked.insert(kv.first);
+      if (!parked.empty()) {
+        free_blocks_locked(parked);
+        if (cudaMalloc(&p, size) == cudaSuccess) {
+          const uint64_t h = reinterpret_cast<uint64_t>(p);
+          g_blocks[h] = Block{size, t_owner, true};
+          g_stats.live_blocks++;
+          g_stats.live_bytes += size;
+          return h;
+        }
+      }
+    }
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
     std::fprintf(stderr, "[device-pool] acquire %llu bytes failed: %s "

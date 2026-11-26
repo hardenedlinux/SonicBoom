@@ -2771,6 +2771,16 @@ static bool spec_time_steps() {
   return v;
 }
 
+// A device buffer the pool could not serve latches CUDA's last error. The
+// GGML-derived kernels return the previous error from cudaFuncSetAttribute and
+// abort on it, so after a handled out-of-memory failure the error is consumed
+// here. Any other error stays latched: a real fault must still be reported by
+// the launch that hits it.
+static void clear_cuda_oom() {
+  if (cudaPeekAtLastError() == cudaErrorMemoryAllocation)
+    (void)cudaGetLastError();
+}
+
 static uint64_t run_spec_program_steps(
     const Gemma4Model& m, DecodeRuntime& rt, const GreedyProgramDesc& p,
     uint64_t token, uint64_t pos, std::span<int64_t> tokens, uint64_t step,
@@ -2901,6 +2911,13 @@ static uint64_t run_spec_program_steps(
     spec_emit = 0.0;
     spec_window = 0;
   };
+  // A verify that cannot execute (its buffers do not fit the device pool)
+  // costs the call its speculation, not its tokens: from then on the loop
+  // takes the plain step and never orders another verify. The failed verify
+  // had already pushed the fed token into the drafter's index, so the next
+  // iteration must not push the same token twice.
+  bool verify_unavailable = false;
+  bool push_skip = false;
 
   while (step < limit) {
     ++g_spec_counters.iterations;
@@ -2918,7 +2935,8 @@ static uint64_t run_spec_program_steps(
     // launch, overlapping the GPU. A k = 0 iteration therefore costs exactly
     // the spec-off one-decode-step function plus the n-gram index write the
     // next proposal needs, never host table work in front of a launch.
-    bool pushed = false;
+    bool pushed = push_skip;
+    push_skip = false;
     const auto ensure_pushed = [&] {
       if (!pushed) {
         drafter->push(token);
@@ -3101,6 +3119,16 @@ static uint64_t run_spec_program_steps(
       finish_warm = false;
       bootstrap_iter = false;
     }
+    // A verify that failed to execute is not retried under the same memory
+    // pressure: the plain step is the floor this loop can always run.
+    if (verify_unavailable) {
+      k = 0;
+      warm = false;
+      measure = false;
+      finish_warm = false;
+      bootstrap_iter = false;
+      if (adaptive) policy.warm_next = -1;
+    }
 
     if (k == 0) {
       // The plain step is exactly the spec-off loop's one-decode-step
@@ -3221,11 +3249,22 @@ static uint64_t run_spec_program_steps(
             std::chrono::steady_clock::now() - verify_t0)
             .count();
     if (!verify_ok) {
-      std::cerr << "[spec] the verify step failed at position " << L << "\n";
+      std::cerr << "[spec] the verify step failed at position " << L
+                << "; falling back to plain steps\n";
       // A failed verify may have left some scans tentative; drop them so the
-      // session's states are back at their committed position.
+      // session's states are back at their committed position. The rows it
+      // did write lie at and past L, where the plain steps that follow
+      // overwrite them in order (the same rollback rejected drafts take).
       if (model_has_recurrent_state(m)) verify_resolve_states(m, session, 0);
-      break;
+      // A buffer the device pool could not serve (e.g. under a pool that has
+      // taken all free VRAM) latches CUDA's last error; the GGML-derived
+      // kernels return the previous error from cudaFuncSetAttribute and would
+      // abort on it. The failure is handled here, so consume the error before
+      // the next launch.
+      clear_cuda_oom();
+      verify_unavailable = true;
+      push_skip = pushed;
+      continue;
     }
     // A real (non warm-up) verify prices its own k. A dense recipe's verify
     // has a captured program whose event pair reads back without waiting (its
@@ -5286,6 +5325,10 @@ static bool run_verify_step(const Gemma4Model& m,
     rt->cuda->set_recurrent_tentative(false);
     if (!res) {
       std::cerr << tag << "execute failed: " << res.error().message << "\n";
+      // A failed allocation has latched an out-of-memory error; the caller
+      // handles the failure, so do not leave it for the next launch to abort
+      // on (a real device fault stays latched).
+      clear_cuda_oom();
       return false;
     }
   }
