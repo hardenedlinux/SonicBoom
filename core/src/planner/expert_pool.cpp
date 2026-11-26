@@ -475,7 +475,9 @@ void ExpertPool::register_host_experts() {
   for (const auto& r : merged) {
     const uint64_t n = r.second - r.first;
     total += n;
-    const void* p = reinterpret_cast<const void*>(r.first);
+    // The range was recorded as an address; the cast back is the handle the
+    // driver pinned, not arithmetic.
+    const void* p = reinterpret_cast<const void*>(r.first);  // NOLINT(performance-no-int-to-ptr)
     // A refused range (the driver will not pin that much) keeps the staged
     // path for its uploads; it is not an error.
     if (!device::host_register_pages(p, n)) continue;

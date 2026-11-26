@@ -138,9 +138,9 @@ WeightStore::open(const fs::path& path, const WeightStoreOptions& options) {
     if (!reader)
       return std::unexpected("safetensors '" + path.string() + "': " +
                              reader.error().message);
-    store->st_.emplace(std::move(*reader));
-    for (const safetensors::TensorInfo& t : store->st_->tensors()) {
-      auto data = store->st_->tensor_data(t);
+    safetensors::Reader& st = store->st_.emplace(std::move(*reader));
+    for (const safetensors::TensorInfo& t : st.tensors()) {
+      auto data = st.tensor_data(t);
       if (!data)
         return std::unexpected("safetensors '" + path.string() +
                                "': tensor '" + t.name +
@@ -159,9 +159,9 @@ WeightStore::open(const fs::path& path, const WeightStoreOptions& options) {
     if (!reader)
       return std::unexpected("GGUF '" + path.string() + "': " +
                              reader.error().message);
-    store->gguf_.emplace(std::move(*reader));
-    for (const gguf::TensorInfo& t : store->gguf_->tensors()) {
-      auto data = store->gguf_->tensor_data(t);
+    gguf::Reader& gr = store->gguf_.emplace(std::move(*reader));
+    for (const gguf::TensorInfo& t : gr.tensors()) {
+      auto data = gr.tensor_data(t);
       if (!data)
         return std::unexpected("GGUF '" + path.string() + "': tensor '" +
                                t.name + "' has no readable data range");
@@ -251,7 +251,6 @@ std::uint64_t WeightStore::device_buffer(
     return 0;
   }
   const std::uint64_t n = numel_of(want_shape);
-  const std::uint64_t bytes = static_cast<std::uint64_t>(n) * sizeof(float);
   std::vector<float> scratch;
   std::vector<float>* convert_into = &scratch;
   bool cached_convert = false;
@@ -276,6 +275,7 @@ std::uint64_t WeightStore::device_buffer(
              "a device buffer";
   return 0;
 #else
+  const std::uint64_t bytes = static_cast<std::uint64_t>(n) * sizeof(float);
   const std::uint64_t buf = training::detail::dev_alloc(bytes);
   if (buf == 0) {
     if (error)
@@ -300,8 +300,17 @@ const void* WeightStore::f32_bytes_of(std::string_view name, const Entry& e,
                                       std::uint64_t n, bool convert,
                                       std::vector<float>* out,
                                       std::string* error) const {
+  // Every caller checks Entry::dtype before asking for float32 bytes; the
+  // guard makes that contract local and keeps the reads below in one place.
+  if (!e.dtype) {
+    if (error)
+      *error = "weight '" + std::string(name) + "' is stored as " + e.type_name +
+               ", which the float32 weight store cannot supply";
+    return nullptr;
+  }
+  const sx::DType dtype = *e.dtype;
   const std::uint64_t bytes = n * sizeof(float);
-  if (*e.dtype == sx::DType::Float32) {
+  if (dtype == sx::DType::Float32) {
     if (e.num_bytes != bytes) {
       if (error)
         *error = "weight '" + std::string(name) + "' holds " +
@@ -312,8 +321,8 @@ const void* WeightStore::f32_bytes_of(std::string_view name, const Entry& e,
     }
     return e.data;
   }
-  if (*e.dtype != sx::DType::Float16 && *e.dtype != sx::DType::BFloat16 &&
-      *e.dtype != sx::DType::Float64) {
+  if (dtype != sx::DType::Float16 && dtype != sx::DType::BFloat16 &&
+      dtype != sx::DType::Float64) {
     if (error)
       *error = "weight '" + std::string(name) + "' is stored as " + e.type_name +
                "; only float32, float16, bfloat16 and float64 can be supplied";
@@ -325,7 +334,7 @@ const void* WeightStore::f32_bytes_of(std::string_view name, const Entry& e,
                "; open the store with convert_to_f32 to convert it to float32";
     return nullptr;
   }
-  const std::uint64_t esz = sx::dtype_size(*e.dtype);
+  const std::uint64_t esz = sx::dtype_size(dtype);
   if (e.num_bytes != n * esz) {
     if (error)
       *error = "weight '" + std::string(name) + "' is " +
@@ -337,11 +346,11 @@ const void* WeightStore::f32_bytes_of(std::string_view name, const Entry& e,
   out->resize(n);
   const std::byte* p = e.data;
   for (std::uint64_t i = 0; i < n; ++i) {
-    if (*e.dtype == sx::DType::Float16) {
+    if (dtype == sx::DType::Float16) {
       std::uint16_t h;
       std::memcpy(&h, p + i * 2, sizeof h);
       (*out)[i] = half_to_float(h);
-    } else if (*e.dtype == sx::DType::BFloat16) {
+    } else if (dtype == sx::DType::BFloat16) {
       std::uint16_t b;
       std::memcpy(&b, p + i * 2, sizeof b);
       const std::uint32_t bits = static_cast<std::uint32_t>(b) << 16;
