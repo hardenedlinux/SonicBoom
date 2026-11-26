@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
+#
+# repro-conformance: does an OpenAI-compatible server give the same bytes for
+# the same request and seed?
+#
+# It sends a chat set and a code-edit set, each request several times, and
+# reports one pass/fail count per property:
+#
+#   seed returned             the reply names the seed it was given
+#   same seed, repeated       two sequential runs are byte-identical
+#   under 2 background clients  a run during 2 other clients equals the
+#   under 4 background clients  no-load run (and so does one during 4)
+#   shared prefix, repeated   two runs of a prompt behind a common prefix are
+#                             byte-identical
+#   peer process, same seed   (only with --peer-url) a second server returns
+#                             the baseline's bytes for the same request
+#
+# "Bytes" means the reply's choices[0].message.content, compared exactly. IDs,
+# timestamps and usage are not part of a reply's reproducibility.
+#
+# The comparison is deliberately engine-agnostic: any server that speaks
+# POST /v1/chat/completions can be measured, and the table is the result.
+# No server is started or stopped here.
+#
+# Usage:
+#   tools/repro-conformance --base-url http://127.0.0.1:8000 \
+#       --model gemma-4-E4B-it-Q5_K_M --label sonicboom --out DIR
+#
+#   --peer-url URL   a second instance of the same engine and model
+#   --count N        requests per set (default 6)
+#   --max-tokens T   reply budget per test request (default 24)
+#   --timeout S      per-request timeout in seconds (default 300)
+#   --set chat|codeedit   only one set (repeatable; default both)
+#
+# With --out DIR it writes DIR/raw.jsonl: one line per HTTP call with the
+# condition, set, index, run, seed, request body, status and raw response.
+
+import argparse
+import hashlib
+import json
+import random
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+CHAT = [
+    "Explain in two sentences why the sky is blue.",
+    "Write a four-line poem about a lighthouse at dawn.",
+    "Name three uses for a paper clip and explain each in one sentence.",
+    "Summarise the plot of Hamlet in three sentences.",
+    "Describe a thunderstorm in one paragraph.",
+    "Explain the difference between latency and throughput in two sentences.",
+]
+
+CODEEDIT = [
+    "Add a docstring and type hints to this function. Return the whole file.\n\n"
+    "```python\ndef add(a, b):\n    return a + b\n```",
+    "Rename `tmp` to a descriptive name everywhere. Return the whole file.\n\n"
+    "```python\ndef mean(xs):\n    tmp = sum(xs)\n    return tmp / len(xs)\n```",
+    "Handle the empty-list case and return the whole file.\n\n"
+    "```python\ndef first(xs):\n    return xs[0]\n```",
+    "Replace the manual loop with a comprehension. Return the whole file.\n\n"
+    "```python\ndef squares(xs):\n    out = []\n    for x in xs:\n        out.append(x * x)\n    return out\n```",
+    "Make the function return None on a missing key instead of raising.\n"
+    "Return the whole file.\n\n"
+    "```python\ndef get(d, key):\n    return d[key]\n```",
+    "Fix the off-by-one error and return the whole file.\n\n"
+    "```python\ndef head(xs, n):\n    return xs[:n + 1]\n```",
+]
+
+# A shared prefix for the prefix pass. It is deliberately long enough to make
+# the server keep it: the second run of each prompt then reuses its KV.
+PREFIX = """\
+Project notes, revision 4. The service keeps a catalog of models, a queue of
+requests and a pool of sessions. A session holds a tokenizer state, a KV cache
+and the tokens produced so far. A request is admitted to the queue, waits for
+the device, prefills its prompt and decodes tokens until an end-of-turn token
+or its budget is reached. The queue is bounded; a request that arrives when it
+is full is rejected with 429. The pool is bounded too; a session that is not
+used for a while may be dropped, and its cache is rebuilt on the next request.
+Prefix reuse means the tokens already in a session are kept when a new request
+starts with the same tokens. The scheduler compares the new prompt with the
+session's tokens and keeps the longest common prefix, so a shared system
+message is paid for once per session rather than once per request. Model
+switches unload the current model, load the requested one, and reset the
+sessions that belonged to the unloaded model. The image model is separate: it
+has its own job type, its own queue entry and its own cancellation path; a
+cancelled job is removed before its result is written. Memory accounting asks
+the driver for the free bytes before and after each request and records both.
+The request log keeps counters, not content: prompt and completion token
+counts, queue and switch milliseconds, free memory at the start and the end.
+Everything that can change the bytes of a reply is supposed to be named: the
+engine's version and commit, the numerics profile, the GPU and driver, the
+tuning tables and the model file. A seed is only meaningful when the
+temperature is above zero; a greedy request is an argmax and ignores it. The
+same request and seed should then produce the same bytes, whether the prefix
+was cold or reused, whether the queue was empty or busy, and in a second
+process on the same machine. These notes are the shared prefix for the
+reproducibility conformance run: they make every request in the prefix pass
+start with the same several hundred tokens, so the server has a cache worth
+reusing and the pass measures what happens when it does. Nothing in these
+notes is an instruction to the model; they are context. Repeat them verbatim.
+"""
+
+DISTRACT = [
+    "Tell me a fact about volcanoes.",
+    "Write a sentence about the number seven.",
+    "Name a country and its capital.",
+    "Describe the colour green in one sentence.",
+]
+
+
+def post(base, body, timeout):
+    """POST one JSON body; return (status, parsed_or_None, raw_text)."""
+    payload = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        base.rstrip("/") + "/v1/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        return e.code, None, raw
+    except Exception as e:  # connection refused, timeout, ...
+        return 0, None, repr(e)
+    try:
+        return status, json.loads(raw), raw
+    except json.JSONDecodeError:
+        return status, None, raw
+
+
+def content_of(parsed):
+    try:
+        return parsed["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def seed_field(parsed):
+    """The reply's echoed seed: (name, value), or (None, None)."""
+    for name in ("seed", "sonicboom_seed"):
+        if isinstance(parsed, dict) and name in parsed:
+            return name, parsed[name]
+    return None, None
+
+
+def fingerprint_id(parsed):
+    """The reply's SonicBoom fingerprint id, or None for another engine."""
+    try:
+        return parsed["sonicboom"]["fingerprint"]["id"]
+    except (KeyError, TypeError):
+        return None
+
+
+class Runner:
+    def __init__(self, base, model, max_tokens, timeout, out):
+        self.base = base
+        self.model = model
+        self.max_tokens = max_tokens
+        self.timeout = timeout
+        self.out = out
+        self.lock = threading.Lock()
+        self.seed_name = None
+
+    def body(self, prompt, seed):
+        return {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.8,
+            "top_p": 0.95,
+            "max_tokens": self.max_tokens,
+            "seed": seed,
+            "stream": False,
+        }
+
+    def call(self, condition, set_name, index, run, prompt, seed):
+        body = self.body(prompt, seed)
+        t0 = time.monotonic()
+        status, parsed, raw = post(self.base, body, self.timeout)
+        seconds = time.monotonic() - t0
+        content = content_of(parsed) if parsed else None
+        name, value = seed_field(parsed) if parsed else (None, None)
+        if name and self.seed_name is None:
+            self.seed_name = name
+        fp = fingerprint_id(parsed) if parsed else None
+        sha = (hashlib.sha256(content.encode("utf-8")).hexdigest()
+               if content is not None else None)
+        record = {
+            "engine": self.base,
+            "condition": condition,
+            "set": set_name,
+            "index": index,
+            "run": run,
+            "seed": seed,
+            "status": status,
+            "seconds": round(seconds, 3),
+            "content_sha256": sha,
+            "content_len": len(content) if content is not None else None,
+            "seed_field": name,
+            "seed_value": value,
+            "fingerprint": fp,
+            "request": body,
+            "response": parsed if parsed is not None else raw,
+        }
+        if self.out:
+            with self.lock, open(self.out, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return record
+
+
+class Background:
+    """Other clients hammering the server while a foreground call runs."""
+
+    def __init__(self, runner, clients):
+        self.runner = runner
+        self.clients = clients
+        self.stop = threading.Event()
+        self.threads = []
+        self.count = 0
+        self.lock = threading.Lock()
+
+    def _loop(self, n):
+        rng = random.Random(1000 + n)
+        while not self.stop.is_set():
+            prompt = DISTRACT[rng.randrange(len(DISTRACT))]
+            seed = rng.randrange(1, 2**31)
+            self.runner.call("background", "distract", n, 0, prompt, seed)
+            with self.lock:
+                self.count += 1
+
+    def __enter__(self):
+        for n in range(self.clients):
+            t = threading.Thread(target=self._loop, args=(n,), daemon=True)
+            t.start()
+            self.threads.append(t)
+        time.sleep(0.5)  # let them get into their first requests
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        for t in self.threads:
+            t.join(timeout=10)
+        return False
+
+
+def run_set(runner, set_name, prompts, count, peer):
+    """Run one set through every condition; return the per-property result."""
+    rng = random.Random(20261126 + (0 if set_name == "chat" else 1))
+    seeds = [rng.randrange(1, 2**31) for _ in range(count)]
+    prompts = prompts[:count]
+    res = {
+        "seed": [0, 0, []],
+        "repeat": [0, 0, []],
+        "load2": [0, 0, []],
+        "load4": [0, 0, []],
+        "prefix": [0, 0, []],
+        "peer": [0, 0, []],
+    }
+
+    def note(key, ok, detail):
+        res[key][0 if ok else 1] += 1
+        if not ok:
+            res[key][2].append(detail)
+
+    # Baseline: two sequential runs, no load.
+    base = {}
+    base_fps = {}
+    recs_at = {}
+    for i, prompt in enumerate(prompts):
+        a = runner.call("baseline", set_name, i, 1, prompt, seeds[i])
+        b = runner.call("baseline", set_name, i, 2, prompt, seeds[i])
+        base[i] = a["content_sha256"]
+        base_fps[i] = a["fingerprint"]
+        recs_at[(set_name, i)] = a
+        detail = f"{set_name}[{i}] run1={a['status']} run2={b['status']}"
+        ok = (a["content_sha256"] is not None
+              and a["content_sha256"] == b["content_sha256"])
+        note("repeat", ok, detail)
+        name, value = a["seed_field"], a["seed_value"]
+        note("seed", name is not None and value == seeds[i],
+             f"{set_name}[{i}] field={name} value={value} asked={seeds[i]}")
+
+    # Load: the same body while other clients run.
+    for clients, key in ((2, "load2"), (4, "load4")):
+        with Background(runner, clients) as bg:
+            for i, prompt in enumerate(prompts):
+                r = runner.call(f"{clients}-clients", set_name, i, 1,
+                                prompt, seeds[i])
+                note(key,
+                     r["content_sha256"] is not None
+                     and r["content_sha256"] == base[i],
+                     f"{set_name}[{i}] got={r['status']} "
+                     f"bg_requests={bg.count}")
+        print(f"  ({set_name}, {clients} clients: {bg.count} background "
+              f"requests)", file=sys.stderr)
+
+    # Prefix: every prompt behind the same long prefix, twice.
+    for i, prompt in enumerate(prompts):
+        p = PREFIX + "\n\n" + prompt
+        a = runner.call("prefix", set_name, i, 1, p, seeds[i])
+        b = runner.call("prefix", set_name, i, 2, p, seeds[i])
+        note("prefix",
+             a["content_sha256"] is not None
+             and a["content_sha256"] == b["content_sha256"],
+             f"{set_name}[{i}] run1={a['status']} run2={b['status']}")
+
+    # Peer process: a second instance of the same engine and model. When the
+    # replies carry a SonicBoom fingerprint, the two processes must also name
+    # the same scope; otherwise the comparison is outside the guarantee.
+    if peer:
+        peer_runner = Runner(peer, runner.model, runner.max_tokens,
+                             runner.timeout, runner.out)
+        for i, prompt in enumerate(prompts):
+            r = peer_runner.call("peer", set_name, i, 1, prompt, seeds[i])
+            b = recs_at.setdefault((set_name, i), None)
+            detail = f"{set_name}[{i}] got={r['status']}"
+            ok = r["content_sha256"] is not None and \
+                r["content_sha256"] == base[i]
+            peer_fp = r["fingerprint"]
+            base_fp = base_fps.get(i)
+            if peer_fp and base_fp and peer_fp != base_fp:
+                ok = False
+                detail += f" fingerprint base={base_fp} peer={peer_fp}"
+            note("peer", ok, detail)
+        runner.seed_name = runner.seed_name or peer_runner.seed_name
+
+    res["_fingerprint"] = sorted({fp for fp in base_fps.values() if fp})
+    return res
+
+
+PROPERTIES = [
+    ("seed returned", "seed"),
+    ("same seed, repeated", "repeat"),
+    ("under 2 background clients", "load2"),
+    ("under 4 background clients", "load4"),
+    ("shared prefix, repeated", "prefix"),
+    ("peer process, same seed", "peer"),
+]
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="repro-conformance",
+        description="Check seeded generation against an OpenAI-compatible "
+                    "server. The table is the result; no server is started.")
+    ap.add_argument("--base-url", required=True)
+    ap.add_argument("--peer-url", default=None)
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--label", default=None,
+                    help="engine name for the report (default: the URL)")
+    ap.add_argument("--count", type=int, default=6)
+    ap.add_argument("--max-tokens", type=int, default=24)
+    ap.add_argument("--timeout", type=float, default=300.0)
+    ap.add_argument("--set", action="append", choices=("chat", "codeedit"),
+                    dest="sets")
+    ap.add_argument("--out", default=None,
+                    help="directory for raw.jsonl (created; no other file is "
+                         "written)")
+    args = ap.parse_args()
+    label = args.label or args.base_url
+
+    out_file = None
+    if args.out:
+        import os
+        os.makedirs(args.out, exist_ok=True)
+        out_file = os.path.join(args.out, "raw.jsonl")
+        open(out_file, "w").close()
+
+    runner = Runner(args.base_url, args.model, args.max_tokens,
+                    args.timeout, out_file)
+    sets = args.sets or ["chat", "codeedit"]
+    results = {}
+    for name, prompts in (("chat", CHAT), ("codeedit", CODEEDIT)):
+        if name not in sets:
+            continue
+        print(f"{label}: running the {name} set "
+              f"({min(args.count, len(prompts))} requests)", file=sys.stderr)
+        results[name] = run_set(runner, name, prompts, args.count,
+                                args.peer_url)
+
+    seed_name = runner.seed_name or "none"
+    fingerprints = sorted({fp for name in results
+                           for fp in results[name].pop("_fingerprint")})
+    print()
+    print(f"engine: {label}  model: {args.model}  "
+          f"base: {args.base_url}" +
+          (f"  peer: {args.peer_url}" if args.peer_url else ""))
+    print(f"seed field: {seed_name}")
+    if fingerprints:
+        print("fingerprint: " + (", ".join(fingerprints)
+                                 if len(fingerprints) == 1
+                                 else "varies (" + ", ".join(fingerprints) + ")"))
+    header = f"{'property':30s}"
+    for name in results:
+        header += f"{name:>14s}"
+    print(header)
+    failures = []
+    for title, key in PROPERTIES:
+        if key == "peer" and not args.peer_url:
+            continue
+        line = f"{title:30s}"
+        for name in results:
+            ok, bad, details = results[name][key]
+            line += f"{ok:>7d}/{ok + bad:<6d}"
+            if bad:
+                failures.append((name, title, details[:2]))
+        print(line)
+    if failures:
+        print()
+        print("first failures:")
+        for name, title, details in failures:
+            for d in details:
+                print(f"  {name} / {title}: {d}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
