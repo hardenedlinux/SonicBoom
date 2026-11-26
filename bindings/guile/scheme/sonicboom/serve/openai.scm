@@ -188,6 +188,30 @@ PyTorch: none"
       (tool-call-schema
        (find (lambda (t) (equal? (ref (ref t "function") "name") tool-choice)) tools)))))))
 
+;; sonicboom.style: an id, an optional version and an optional alpha. The
+;; registry resolves it to the engine's style value at admission, so a bad or
+;; unknown id is answered with the catalogue's error, not here. -> an alist or
+;; #f.
+(define (check-style v)
+  (cond
+   ((or (not v) (eq? v 'null)) #f)
+   ((not (object? v)) (invalid "sonicboom.style must be an object" "sonicboom"))
+   (else
+    (let* ((id (ref v "id"))
+           (version (ref v "version"))
+           (alpha (ref v "alpha")))
+      (unless (and (string? id) (not (string-null? id)))
+        (invalid "sonicboom.style.id is required" "sonicboom"))
+      (when (and version (not (and (integer? version) (exact? version)
+                                   (>= version 1))))
+        (invalid "sonicboom.style.version must be a positive integer" "sonicboom"))
+      (unless (or (not alpha) (and (number? alpha) (<= (abs alpha) 10)))
+        (invalid "sonicboom.style.alpha must be a number between -10 and 10"
+                 "sonicboom"))
+      (list (cons "id" id)
+            (cons "version" version)
+            (cons "alpha" (if alpha (exact->inexact alpha) 1.0)))))))
+
 (define (check-stop v)
   (match v
     (#f '())
@@ -286,6 +310,10 @@ Note: a bad body raises (openai-error status type message param)."
                               (v (number-in "frequency_penalty" v -2 2))))
          (tools (check-tools (ref body "tools")))
          (tool-choice (check-tool-choice (ref body "tool_choice") tools))
+         ;; "sonicboom": {"style": {...}} — an extension next to the OpenAI
+         ;; body. The id is checked against the style registry at admission.
+         (style (let ((sb (ref body "sonicboom")))
+                  (and (object? sb) (check-style (ref sb "style")))))
          ;; An explicit response_format is the reply's shape and wins; a forced
          ;; tool call shapes it only when no response_format is asked for.
          (constraint (or (check-response-format (ref body "response_format"))
@@ -298,7 +326,8 @@ Note: a bad body raises (openai-error status type message param)."
                                #:repeat-penalty repeat-penalty
                                #:presence-penalty presence-penalty
                                #:frequency-penalty frequency-penalty
-                               #:constraint constraint)
+                               #:constraint constraint
+                               #:style style)
             (eq? stream #t)
             include-usage)))
 

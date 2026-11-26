@@ -28,9 +28,11 @@
   #:use-module (ice-9 optargs)
   #:use-module (json)
   #:export (load-model free-model! model-arch model-eos model-info
+            model-embedding
             make-session free-session! device-trim!
             set-grammar! set-json-schema! clear-grammar! constraint-state
             json-schema->gbnf
+            set-steering! clear-steering! residual-capture
             prefill! tokenize tokenize-segments detokenize
             generate generate-tokens generate-stream make-sampling-bv
             numerics-profile set-numerics-profile!))
@@ -466,6 +468,119 @@ function's arguments schema."
                                     (slot-ptr err-slot))))))
       (sb-check! st err-slot "json-schema->gbnf")
       (utf8->string (bytevector-range out 0 m)))))
+
+;;; --- style steering ---------------------------------------------------------
+
+;;; A session may add a fixed residual-stream vector after one block (capi.h
+;;; "Style steering"). The engine only injects a vector; what vector a style is
+;;; belongs to the caller. residual-capture is the read side: the residual rows
+;;; of a text let a caller compute the mean difference that defines a vector.
+
+(define (model-embedding model)
+  "The model's residual-stream width.
+
+This is the length set-steering! requires of its vector and the row width of
+a residual-capture result.
+Args:
+  model: a model handle.
+Returns: the width as an exact integer.
+PyTorch: none"
+  (let* ((width (make-bytevector 8 0))          ; uint64_t
+         (err-slot (make-slot)))
+    (sb-check! ((proc 'boom_llm_model_embedding) model
+                (bytevector->pointer width) (slot-ptr err-slot))
+               err-slot "model-embedding")
+    (bytevector-u64-native-ref width 0)))
+
+;; A vector of reals (list or Scheme vector) → native-endian f32 bytes.
+(define (reals->f32-bv reals)
+  (let* ((lst (if (vector? reals) (vector->list reals) reals))
+         (bv (make-bytevector (* 4 (length lst)) 0)))
+    (let loop ((xs lst) (i 0))
+      (unless (null? xs)
+        (bytevector-ieee-single-native-set! bv (* i 4)
+                                            (exact->inexact (car xs)))
+        (loop (cdr xs) (+ i 1))))
+    bv))
+
+(define (steering-vector-bv vec)
+  (cond ((bytevector? vec) vec)
+        ((or (list? vec) (vector? vec)) (reals->f32-bv vec))
+        (else (raise-sonicboom-error
+               BOOM_ERR_BINDING 'binding
+               (string-append
+                "steering vector must be a bytevector of native f32, a list, "
+                "or a vector of reals")))))
+
+(define (set-steering! session layer vec)
+  "Add a residual-stream vector to a session after one block.
+
+The vector is added to every position's residual stream right after block
+layer, for the rest of the session. It is copied. Setting the same layer and
+vector the session already holds is a no-op (its prompt prefix stays valid);
+any other steering change retires the prefix, so call it before prefill!: the
+next prefill re-prefills from position 0.
+Args:
+  session: a session handle.
+  layer: the 0-based block the vector follows.
+  vec: the vector: a bytevector of native f32 values, or a list/vector of
+       reals, of length (model-embedding model).
+Returns: unspecified.
+Example:
+  (use-modules (sonicboom inference))
+  (set-steering! session 17 (make-bytevector (* 4 (model-embedding model)) 0))
+PyTorch: none
+Note: Generation is deterministic for a fixed (prompt, seed, vector) and
+identical with speculative decoding on or off."
+  (let* ((bv (steering-vector-bv vec))
+         (n (quotient (bytevector-length bv) 4))
+         (err-slot (make-slot)))
+    (sb-check! ((proc 'boom_llm_session_set_steering) session layer
+                (bytevector->pointer bv) n (slot-ptr err-slot))
+               err-slot "set-steering!")))
+
+(define (clear-steering! session)
+  "Remove a session's steering vector.
+
+The next prefill re-prefills from position 0 under the plain graph, like a
+steering change also does.
+Args:
+  session: a session handle.
+Returns: unspecified.
+PyTorch: none"
+  ((proc 'boom_llm_session_clear_steering) session))
+
+(define (residual-capture model tokens layer)
+  "The residual stream after one block, for every position of a text.
+
+Runs one prefill pass over the tokens on a throwaway KV cache (this is
+tooling, not a serving path; no session is touched). The rows are
+position-major: row p holds the width floats of token position p.
+Args:
+  model: a model handle.
+  tokens: a list of token ids (see tokenize).
+  layer: the 0-based block to read; the last block is the final hidden state.
+Returns: a bytevector of n * (model-embedding model) native f32 values.
+PyTorch: none
+Note: Needs a CUDA device and a text that fits one prefill segment (the
+sliding-window ring where the model has one)."
+  (let* ((toks (tokens->bv tokens))
+         (ntok (length tokens))
+         (n-slot (make-bytevector 8 0))          ; size_t
+         (err-slot (make-slot))
+         (fn (proc 'boom_llm_residual_capture)))
+    ;; Sizing call (cap 0): fills *n_out (the float count).
+    (let ((st (fn model (bytevector->pointer toks) ntok layer %null-pointer 0
+                 (bytevector->pointer n-slot) (slot-ptr err-slot))))
+      (unless (or (sb-status-ok? st) (= st BOOM_ERR_BINDING))
+        (sb-check! st err-slot "residual-capture")))
+    (let* ((n (bytevector-u64-native-ref n-slot 0))
+           (out (make-bytevector (* 4 n) 0))
+           (st (fn model (bytevector->pointer toks) ntok layer
+                   (bytevector->pointer out) n
+                   (bytevector->pointer n-slot) (slot-ptr err-slot))))
+      (sb-check! st err-slot "residual-capture")
+      out)))
 
 ;;; --- tokenize / detokenize --------------------------------------------------
 

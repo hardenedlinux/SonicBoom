@@ -137,6 +137,8 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::ScaleBy;
   if (name == "gdn_scan")
     return OpKind::GdnScan;
+  if (name == "steer")
+    return OpKind::Steer;
   return std::nullopt;
 }
 
@@ -202,6 +204,7 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::MoeExperts: return "moe_experts";
     case OpKind::ScaleBy: return "scale_by";
     case OpKind::GdnScan: return "gdn_scan";
+    case OpKind::Steer: return "steer";
   }
   return "?";
 }

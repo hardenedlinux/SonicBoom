@@ -18,7 +18,7 @@
 ;;;   create-session / free-session
 ;;;   fork-session session n             -> a new session holding the first n
 ;;;                                         tokens of session (optional)
-;;;   prefill      session token-ids      -> number of reused tokens
+;;;   prefill      session token-ids constraint style -> number of reused tokens
 ;;;   step         session sampler constraint -> next token id
 ;;;   generate     session sampler constraint max-tokens on-token
 ;;;                -> number of tokens produced               (optional)
@@ -63,6 +63,7 @@
             create-session free-session fork-session can-fork?
             session? session-model session-handle
             prefill step generate can-generate? backend-stats
+            model-embedding residual-capture backend-residual?
 
             make-sampler sampler? sampler-temperature sampler-top-p
             sampler-top-k sampler-min-p sampler-seed sampler-repeat-penalty
@@ -94,7 +95,7 @@
   (%make-backend name load-model unload-model model-info tokenize detokenize
                  render-chat tokenize-chat
                  create-session free-session fork-session prefill step
-                 generate stats sampling?)
+                 generate stats sampling? embedding residual)
   backend?
   (name backend-name)
   (load-model %backend-load-model)
@@ -111,7 +112,9 @@
   (step %backend-step)
   (generate %backend-generate)
   (stats %backend-stats)
-  (sampling? backend-sampling?))
+  (sampling? backend-sampling?)
+  (embedding %backend-embedding)
+  (residual %backend-residual))
 
 (define (required who)
   (lambda _ (error "backend procedure not provided:" who)))
@@ -132,7 +135,11 @@
 ;;   free-session   (session)                      -> unspecified
 ;;   fork-session   (session n)                    -> session handle, or #f
 ;;                  for a backend that can't copy a KV prefix (optional)
-;;   prefill        (session token-ids constraint) -> reused count
+;;   prefill        (session token-ids constraint style) -> reused count
+;;                  style is (layer . vector) or #f (optional); the vector is
+;;                  added to the residual stream after that block from prefill
+;;                  on, and a different style than the session last held makes
+;;                  it re-prefill from position 0.
 ;;   step           (session sampler constraint)   -> token id, or #f when the
 ;;                  constraint has closed the reply (nothing left to produce)
 ;;   generate       (session sampler constraint max-tokens on-token)
@@ -164,7 +171,9 @@
                        (step (required 'step))
                        (generate #f)
                        (stats (lambda (model) '()))
-                       (sampling? #f))
+                       (sampling? #f)
+                       (embedding #f)
+                       (residual-capture #f))
   "Create a backend from procedures.
 
 load-model, model-info, tokenize, detokenize, render-chat, create-session,
@@ -188,8 +197,8 @@ Args:
   free-session: keyword; (session-handle) -> unspecified.
   fork-session: keyword; (session-handle n) -> a new handle holding the first n
     tokens, or #f when the backend cannot copy a KV prefix (default #f).
-  prefill: keyword; (session-handle token-ids constraint) -> the number of
-    tokens kept from the previous contents.
+  prefill: keyword; (session-handle token-ids constraint style) -> the number
+    of tokens kept from the previous contents; style is (layer . vector) or #f.
   step: keyword; (session-handle sampler constraint) -> a token id, or #f when
     the constraint has closed the reply.
   generate: keyword; (session-handle sampler constraint max-tokens on-token) ->
@@ -198,6 +207,11 @@ Args:
   stats: keyword; (handle) -> an alist (default: one returning the empty list).
   sampling?: keyword; whether step honours the sampler's parameters (default
     #f).
+  embedding: keyword; (handle) -> the residual-stream width, for a backend that
+    can read residuals (default #f).
+  residual-capture: keyword; (handle token-ids layer) -> a bytevector of
+    native f32 rows (n * width), for a backend that can read residuals
+    (default #f). The style assets build their steering vectors from this.
 Returns: a backend.
 Example:
   (use-modules (sonicboom serve backend))
@@ -211,14 +225,14 @@ Example:
                  #:render-chat (lambda (model messages tools choice) '())
                  #:create-session (lambda (model) 'session)
                  #:free-session (lambda (session) #f)
-                 #:prefill (lambda (session tokens constraint) 0)
+                 #:prefill (lambda (session tokens constraint style) 0)
                  #:step (lambda (session sampler constraint) 0)))
   => \"demo\"
 PyTorch: none"
   (%make-backend name load-model unload-model model-info tokenize detokenize
                  render-chat tokenize-chat
                  create-session free-session fork-session prefill step
-                 generate stats sampling?))
+                 generate stats sampling? embedding residual-capture))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Models and sessions
@@ -328,6 +342,60 @@ Example:
   => #t
 PyTorch: none"
   (backend-sampling? (model-backend model)))
+
+(define (model-embedding model)
+  "The width of MODEL's residual stream (its embedding length).
+
+Args:
+  model: a model.
+Returns: a positive integer.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve real-backend))
+  (model-embedding (load-model (make-real-backend ...) ...))
+  => 2560
+Note: only a backend that provides embedding can answer this.
+PyTorch: none"
+  (let ((proc (%backend-embedding (model-backend model))))
+    (unless proc
+      (error "backend cannot report the embedding length:" (model-id model)))
+    (proc (model-handle model))))
+
+;; Whether this model's backend can capture residual-stream vectors.
+(define (backend-residual? model)
+  "True when MODEL's backend can capture residual-stream vectors.
+
+Args:
+  model: a model.
+Returns: a boolean.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
+  (backend-residual? (load-model (make-mock-backend) '()))
+  => #f
+PyTorch: none"
+  (and (%backend-residual (model-backend model)) #t))
+
+(define (residual-capture model tokens layer)
+  "The residual-stream vectors of TOKENS after block LAYER, as one bytevector.
+
+The vectors are MODEL's hidden states, one per token position, each of the
+embedding length, native little-endian f32.
+
+Args:
+  model: a model.
+  tokens: a list of token ids.
+  layer: a block index, counted from 0.
+Returns: a bytevector of (length TOKENS) * (model-embedding MODEL) f32 values.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve real-backend))
+  (bytevector? (residual-capture (load-model (make-real-backend ...) ...)
+                                 '(360 361) 0))
+  => #t
+Note: only a backend that provides residual-capture can answer this.
+PyTorch: none"
+  (let ((proc (%backend-residual (model-backend model))))
+    (unless proc
+      (error "backend cannot capture residual vectors:" (model-id model)))
+    (proc (model-handle model) tokens layer)))
 
 (define (load-model backend config)
   "Load a model with BACKEND from a config alist.
@@ -555,17 +623,22 @@ PyTorch: none"
                    ((%backend-fork-session (model-backend model))
                     (session-handle session) n))))
 
-(define* (prefill session tokens #:optional (constraint #f))
+(define* (prefill session tokens #:optional (constraint #f) (style #f))
   "Make SESSION hold TOKENS, computing only what it does not already hold.
 
 The longest common prefix of the session's current tokens and TOKENS is kept;
 the rest is computed. With a constraint the grammar is installed before the
-first token after the prompt is sampled.
+first token after the prompt is sampled. With a style the backend adds the
+style's vector to the residual stream at its layer for this and every later
+step, and a different style than the session last held re-computes the whole
+sequence.
 
 Args:
   session: a session.
   tokens: a list of token ids.
   constraint: optional; a constrained-decoding constraint or #f.
+  style: optional; a style steering choice (see (sonicboom serve styles)) or
+    #f for none.
 Returns: the number of tokens kept.
 Example:
   (use-modules (sonicboom serve backend) (sonicboom serve mock-backend))
@@ -576,7 +649,7 @@ Example:
   => 2
 PyTorch: none"
   ((%backend-prefill (model-backend (session-model session)))
-   (session-handle session) tokens constraint))
+   (session-handle session) tokens constraint style))
 
 (define* (step session sampler #:optional (constraint #f))
   "Sample the next token after the sequence SESSION holds, then append it.
@@ -644,7 +717,7 @@ Example:
                        #:render-chat (lambda (model messages tools choice) '())
                        #:create-session (lambda (model) 'session)
                        #:free-session (lambda (session) #f)
-                       #:prefill (lambda (session tokens constraint) 0)
+                       #:prefill (lambda (session tokens constraint style) 0)
                        #:step (lambda (session sampler constraint) 0)
                        #:generate (lambda (session sampler constraint max-tokens
                                           on-token)

@@ -498,6 +498,9 @@ def Boom_MatvecBf16Op : Boom_Op<"matvec_bf16",
 def Boom_AddBiasOp : Boom_Op<"add_bias",
     "add an optional projection bias named by `slot`",
     [NoMemoryEffect, Boom_Elementwise, Boom_RowIndependent]>;
+def Boom_SteerOp : Boom_Op<"steer",
+    "add the session's steering vector (operand 1, [width]) to the residual",
+    [NoMemoryEffect, Boom_Elementwise, Boom_RowIndependent]>;
 def Boom_MulOp : Boom_Op<"mul",
     "elementwise multiply",
     [NoMemoryEffect, Boom_Elementwise, Boom_RowIndependent]>;

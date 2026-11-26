@@ -3312,6 +3312,15 @@ bool add_bias_dev(std::span<const float> bias, const float* x, float* y, int n) 
   return cudaGetLastError() == cudaSuccess;
 }
 
+bool add_bias_ptr_dev(const float* bias, int bias_n, const float* x, float* y,
+                      int n) {
+  if (!available()) return false;
+  if (bias_n <= 0 || n <= 0 || n % bias_n != 0 || !bias || !x || !y) return false;
+  BOOM_NOTE_LAUNCH(add_bias_kernel, grid_for(n), 256, 0, cur_stream());
+  add_bias_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, bias, bias_n, y, n);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 bool scale_dev(const float* x, float s, float* y, int n) {
   if (!available()) return false;
   if (n <= 0 || !x || !y) return false;

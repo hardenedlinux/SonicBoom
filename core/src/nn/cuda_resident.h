@@ -70,6 +70,11 @@ bool add_dev(const float* a, const float* b, float* y, int n);
 // a [rows, width] buffer (mirrors nn::add_bias). The bias is a host span, a
 // bound model weight, uploaded once and cached.
 bool add_bias_dev(std::span<const float> bias, const float* x, float* y, int n);
+// The same add-bias over a bias that already lives on the device ([bias_n]
+// floats), for a vector the backend stages itself (the session's steering
+// vector) rather than a bound model weight. Same divisibility contract.
+bool add_bias_ptr_dev(const float* bias, int bias_n, const float* x, float* y,
+                      int n);
 bool scale_dev(const float* x, float s, float* y, int n);
 
 // y[i] = cap * tanh(x[i] / cap), the final-logit softcap (mirrors nn::softcap's

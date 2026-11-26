@@ -225,6 +225,17 @@ enum class OpKind : uint8_t {
   // `heads_v`, `dim` (S), `kernel` (K) and the phase's row marking ride on
   // node_attrs. Appended last for the same reason as ClipGradNorm.
   GdnScan,
+
+  // Style steering (residual injection). Operands [x, v]: `x` is the residual
+  // stream ([width] when decoding, [rows, width] when prefilling) and `v` is a
+  // [width] float32 vector broadcast over its rows; the result is x + v. The
+  // emitter writes the node after block `layer` only when the session that
+  // asks for the graph carries a steering vector, so a model's graph is
+  // unchanged when no style is set. The vector is a graph input: the CPU
+  // backend reads it, and the CUDA backend keeps it in its own device slot
+  // (staged before the step runs or is captured), like the position slot.
+  // Appended last for the same reason as ClipGradNorm.
+  Steer,
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;

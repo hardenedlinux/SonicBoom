@@ -108,12 +108,31 @@ public:
   virtual ~Phase() = default;
 
   // The whole stack: the embedding, then every block. Returns the residual
-  // stream after the last block.
+  // stream after the last block (or after `stop_layer_`, the capture read).
+  // A steering session's vector joins the stream after its block.
   mlir::Value stack() {
     mlir::Value residual = embed();
-    for (uint32_t l = 0; l < r.blocks.size(); ++l)
+    for (uint32_t l = 0; l < r.blocks.size(); ++l) {
       residual = block(r.blocks[l], l, residual);
+      if (int64_t(l) == steer_layer_) residual = steer_add(residual, l);
+      if (int64_t(l) == stop_layer_) break;
+    }
     return residual;
+  }
+
+  // x + v, the steering vector broadcast over the rows. The node carries the
+  // block it follows so a plan record names the injection point like any other
+  // layer-scoped node.
+  mlir::Value steer_add(mlir::Value x, uint32_t l) {
+    return node(OpKind::Steer, {x, steer_}, "steer" + std::to_string(l),
+                r.width, {layer_a(l)});
+  }
+
+  // The steering vector's graph input, declared (once) when the graph steers.
+  void declare_steer(int64_t layer) {
+    steer_layer_ = layer;
+    if (layer >= 0)
+      steer_ = b.input("steer", {int64_t(r.width)}, sx::DType::Float32);
   }
 
 protected:
@@ -122,6 +141,14 @@ protected:
   std::vector<mlir::Value> kv_;     // the cache handles, by cache index
   std::vector<mlir::Value> state_;  // the recurrent state handles, by index
   mlir::Value inp_{};               // the (scaled) token embedding
+
+  // Style steering: the block the vector follows, and the vector's input.
+  // `steer_layer_` stays -1 unless a graph is built for a steering session.
+  int64_t steer_layer_ = -1;
+  mlir::Value steer_{};
+  // The block the stack ends at (-1: the last block). The residual capture
+  // reads a layer; a serving graph always runs the whole stack.
+  int64_t stop_layer_ = -1;
 
   // ---- what a phase supplies -----------------------------------------------
 
@@ -492,13 +519,15 @@ protected:
 class DecodePhase final : public Phase {
 public:
   DecodePhase(compiler::BoomBuilder& builder, const Recipe& recipe,
-              uint64_t rows)
+              uint64_t rows, int64_t steer_layer = -1)
       : Phase(builder, recipe), rows_(rows),
         mmq_available_(decode_mmq_available()) {
     // The graph's free variables, then the cache handles: block arguments, in
-    // this order.
+    // this order. The steering vector (when the graph steers) follows the two
+    // scalars, so every existing input keeps its position.
     token_id_ = b.input("token_id", {}, sx::DType::Int64);
     pos_ = b.input("pos", {}, sx::DType::Int64);
+    declare_steer(steer_layer);
     kv_.resize(r.caches);
     for (uint32_t c = 0; c < r.caches; ++c)
       kv_[c] = b.kv(c);
@@ -644,12 +673,15 @@ private:
 class PrefillPhase final : public Phase {
 public:
   PrefillPhase(compiler::BoomBuilder& builder, const Recipe& recipe, uint64_t n,
-               bool dynamic_extent)
+               bool dynamic_extent, int64_t steer_layer = -1,
+               int64_t stop_layer = -1)
       : Phase(builder, recipe), n_(n), dynamic_(dynamic_extent) {
     tokens_ = b.input(
         "tokens", {dynamic_ ? mlir::ShapedType::kDynamic : int64_t(n_)},
         sx::DType::Int64);
     start_pos_ = b.input("start_pos", {}, sx::DType::Int64);
+    declare_steer(steer_layer);
+    stop_layer_ = stop_layer;
     kv_.resize(r.caches);
     for (uint32_t c = 0; c < r.caches; ++c)
       kv_[c] = b.kv(c);
@@ -806,7 +838,7 @@ GraphIr emit_decode_ir(const Recipe& recipe, const DecodeGraphSpec& spec) {
   if (spec.rows > 1)
     b.set_row_scale(int64_t(spec.rows), "verify");
 
-  DecodePhase phase(b, recipe, spec.rows);
+  DecodePhase phase(b, recipe, spec.rows, spec.steer_layer);
   const mlir::Value out = phase.head(phase.stack());
 
   // The graph ends at the model's logits. What reads them — and so whether the
@@ -821,15 +853,18 @@ GraphIr emit_decode_ir(const Recipe& recipe, const DecodeGraphSpec& spec) {
   return ir;
 }
 
-GraphIr emit_prefill_ir(const Recipe& recipe, uint64_t n, bool dynamic_extent) {
+GraphIr emit_prefill_ir(const Recipe& recipe, uint64_t n, bool dynamic_extent,
+                        int64_t steer_layer, int64_t stop_layer) {
   GraphIr ir;
   ir.context = std::make_unique<mlir::MLIRContext>();
   if (!recipe_expressible(recipe)) return ir;
   compiler::BoomBuilder b(ir.context.get(), "gemma4_prefill", n);
 
-  PrefillPhase phase(b, recipe, n, dynamic_extent);
+  PrefillPhase phase(b, recipe, n, dynamic_extent, steer_layer, stop_layer);
   const mlir::Value residual = phase.stack();
-  phase.append_caches();
+  // A capture read stops at its layer and appends nothing: the caches are a
+  // side effect of a serving segment, and the capture asks for a residual.
+  if (stop_layer < 0) phase.append_caches();
   b.set_output(residual);
 
   ir.module = b.finish();

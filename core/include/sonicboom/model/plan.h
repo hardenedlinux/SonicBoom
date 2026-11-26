@@ -91,6 +91,11 @@ struct DecodeGraphSpec {
   // leaves the consumer undeclared: the declaration is what a graph-first
   // lowering needs, and the loop is the declaration once the step is its body.
   bool for_program = false;
+  // Style steering: the block whose output receives the session's vector, or
+  // -1 for none. When set, the graph declares an extra `steer` input (a
+  // [width] f32 vector) and emits a Steer node after that block; -1 leaves the
+  // graph exactly as it was.
+  int64_t steer_layer = -1;
 };
 
 // The decode graph for `spec`: the one entry every decode, verify, sampled and
@@ -120,8 +125,35 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n);
 // length is marked with TensorDesc::dynamic_stride_bytes, so one plan can
 // execute a smaller segment by binding the actual length. `n` is the extent
 // the plan is planned and its buffers sized at; run no larger than it.
+//
+// `steer_layer` >= 0 emits the session's steering vector after that block (see
+// DecodeGraphSpec::steer_layer); `stop_layer` >= 0 ends the graph at that
+// block's output, which is how the style tooling reads a layer's residual
+// stream. Both default to -1, which is the graph described above.
 planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n,
                                           bool symbolic);
+planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n,
+                                          bool symbolic, int64_t steer_layer,
+                                          int64_t stop_layer);
+
+// The residual stream after block `layer`, for every position of `tokens`, as
+// one prefill pass on a throwaway KV cache: `out` receives n * embedding_length
+// floats, position-major. `layer` may be the last block (the final hidden state
+// the lm head reads) or any earlier one. This is the read side of style
+// steering: the tooling averages these rows to build a vector, and scores an
+// output by the one it produces. It is measurement/tooling surface, not a
+// serving path: it builds and releases its own caches, never touches a
+// session's, and returns false without CUDA support, on an empty model, or for
+// a layer past the last block.
+bool capture_residual_spine_cuda(const Gemma4Model& m,
+                                 std::span<const uint64_t> tokens,
+                                 int64_t layer, std::span<float> out);
+
+// The same residual capture through the CPU spine (CpuQ8K kernels), for a
+// machine without a device or for the reference arithmetic. Same contract.
+bool capture_residual_spine(const Gemma4Model& m,
+                            std::span<const uint64_t> tokens, int64_t layer,
+                            std::span<float> out);
 
 // Autoregressive greedy decode through the spine: build the graph once, plan it
 // once (StaticPlanner + MemoryPlanner + TransferScheduler + PlanValidator), then

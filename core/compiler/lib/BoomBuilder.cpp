@@ -23,6 +23,7 @@
 
 #include "sonicboom/compiler/BoomTypes.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -672,12 +673,16 @@ static mlir::LogicalResult buildGenerationProgram(mlir::ModuleOp module,
   // first (token_id, pos); by name, so a graph that lists its inputs in another
   // order still lifts correctly.
   mlir::Value firstTokenArg, posArg;
+  int64_t tokenId = -1, posId = -1;
   for (int64_t id : graph.getInputs()) {
     auto desc = descOfId(id);
-    if (desc.getName() == "token_id")
+    if (desc.getName() == "token_id") {
       firstTokenArg = argOfId(id);
-    else if (desc.getName() == "pos")
+      tokenId = id;
+    } else if (desc.getName() == "pos") {
       posArg = argOfId(id);
+      posId = id;
+    }
   }
   if (!firstTokenArg || !posArg)
     return graph.emitOpError()
@@ -756,15 +761,39 @@ static mlir::LogicalResult buildGenerationProgram(mlir::ModuleOp module,
   mlir::Value startPos = body->addArgument(posType, loc);
   mlir::Value firstToken = body->addArgument(tokenType, loc);
   mlir::Value pos0 = body->addArgument(posType, loc);
+  // A free tensor input that is not the token or the position (a steering
+  // session's `steer` vector) is constant over the program: the program takes
+  // it as one block argument per input, in free-id order, and hands it to the
+  // prefill call and every step. No loop-carried value depends on it.
+  llvm::DenseMap<int64_t, mlir::Value> extraArg;
+  for (int64_t id : freeIds) {
+    if (id == tokenId || id == posId) continue;
+    extraArg[id] = body->addArgument(argOfId(id).getType(), loc);
+  }
   llvm::SmallVector<mlir::Value> kvArgs;
   for (mlir::Type kvType : kvTypes)
     kvArgs.push_back(body->addArgument(kvType, loc));
 
   builder.setInsertionPointToEnd(body);
   llvm::SmallVector<mlir::Value> prefillOperands{prompt, startPos};
+  for (int64_t id : freeIds)
+    if (id != tokenId && id != posId) prefillOperands.push_back(extraArg[id]);
   prefillOperands.append(kvArgs);
   boom::PrefillOp::create(builder, loc, prefillOperands,
                           builder.getStringAttr(spec.prefill_graph));
+
+  // A step's operands are its body's block arguments, one for one: the free
+  // tensor variables in ascending id (the carried token and position, then any
+  // program constant such as the steering vector), then the cache handles.
+  auto stepOperandsFor = [&](mlir::Value token, mlir::Value position) {
+    llvm::SmallVector<mlir::Value> ops;
+    ops.reserve(freeIds.size() + kvArgs.size());
+    for (int64_t id : freeIds)
+      ops.push_back(id == tokenId ? token
+                                  : id == posId ? position : extraArg[id]);
+    ops.append(kvArgs);
+    return ops;
+  };
 
   const mlir::Type i64Type = builder.getI64Type();
   mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
@@ -775,13 +804,12 @@ static mlir::LogicalResult buildGenerationProgram(mlir::ModuleOp module,
         builder, loc, mlir::TypeRange{tokenType, posType, i64Type},
         mlir::ValueRange{firstToken, pos0, zero},
         [&](mlir::OpBuilder &b, mlir::Location l, mlir::ValueRange args) {
-          llvm::SmallVector<mlir::Value> stepOperands{args[0], args[1]};
-          stepOperands.append(kvArgs);
           auto step = boom::StepOp::create(
-              b, l, mlir::TypeRange{outType}, stepOperands,
-              graph.getTensorsAttr(), graph.getInputsAttr(),
-              graph.getOutputsAttr(), graph.getDynamicExtentAttr(),
-              graph.getStagesAttr(), /*consumer_resolved=*/mlir::StringAttr());
+              b, l, mlir::TypeRange{outType},
+              stepOperandsFor(args[0], args[1]), graph.getTensorsAttr(),
+              graph.getInputsAttr(), graph.getOutputsAttr(),
+              graph.getDynamicExtentAttr(), graph.getStagesAttr(),
+              /*consumer_resolved=*/mlir::StringAttr());
           // The decode graph's body becomes the step's: the same block
           // arguments, now bound to the loop's SSA values.
           step.getBody().takeBody(graph.getBody());
@@ -840,13 +868,12 @@ static mlir::LogicalResult buildGenerationProgram(mlir::ModuleOp module,
 
           // The plain step: the k == 0 path, and the decode fallback the
           // executor runs instead of a zero-row verify. It owns the graph body.
-          llvm::SmallVector<mlir::Value> stepOperands{args[0], args[1]};
-          stepOperands.append(kvArgs);
           auto step = boom::StepOp::create(
-              b, l, mlir::TypeRange{outType}, stepOperands,
-              graph.getTensorsAttr(), graph.getInputsAttr(),
-              graph.getOutputsAttr(), graph.getDynamicExtentAttr(),
-              graph.getStagesAttr(), /*consumer_resolved=*/mlir::StringAttr());
+              b, l, mlir::TypeRange{outType},
+              stepOperandsFor(args[0], args[1]), graph.getTensorsAttr(),
+              graph.getInputsAttr(), graph.getOutputsAttr(),
+              graph.getDynamicExtentAttr(), graph.getStagesAttr(),
+              /*consumer_resolved=*/mlir::StringAttr());
           step.getBody().takeBody(graph.getBody());
 
           // Verify: the last token and the drafts, at the base position, over

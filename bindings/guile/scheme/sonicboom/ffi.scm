@@ -381,6 +381,8 @@ PyTorch: none"
                                                   (list '* '* size_t '* '*)))
                (boom_llm_model_info . ,(foreign-proc "boom_llm_model_info" int
                                                    (list '* '* size_t '* '*)))
+               (boom_llm_model_embedding . ,(foreign-proc "boom_llm_model_embedding" int
+                                                        (list '* '* '*)))
                (boom_llm_tokenize . ,(foreign-proc "boom_llm_tokenize" int
                                                  (list '* '* size_t '* size_t '* '*)))
                (boom_llm_tokenize_ex . ,(foreign-proc "boom_llm_tokenize_ex" int
@@ -410,6 +412,14 @@ PyTorch: none"
                                                               void (list '*)))
                (boom_llm_session_constraint_state . ,(foreign-proc "boom_llm_session_constraint_state"
                                                                  int (list '* '* '* '*)))
+               ;; style steering (session residual bias) — see capi.h
+               (boom_llm_session_set_steering . ,(foreign-proc "boom_llm_session_set_steering"
+                                                            int (list '* int '* size_t '*)))
+               (boom_llm_session_clear_steering . ,(foreign-proc "boom_llm_session_clear_steering"
+                                                              void (list '*)))
+               (boom_llm_residual_capture . ,(foreign-proc "boom_llm_residual_capture"
+                                                        int (list '* '* size_t int '* size_t
+                                                                  '* '*)))
                ;; image generation (MOSS-Image) — see capi.h boom_image_*
                (boom_image_model_load . ,(foreign-proc "boom_image_model_load" int
                                                      (list '* '* '*)))

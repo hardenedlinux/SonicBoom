@@ -44,6 +44,7 @@
             chat-request-min-p chat-request-seed chat-request-repeat-penalty
             chat-request-presence-penalty
             chat-request-frequency-penalty chat-request-constraint
+            chat-request-style chat-request-with-style
 
             engine-admit! engine-run engine-run-job engine-drop! engine-generate
             engine-ticket-wait-ms engine-stats
@@ -58,10 +59,15 @@
 ;;
 ;; The fields are model (a model id), messages, tools, tool-choice, max-tokens
 ;; (#f: up to the context length), stop (a list of strings), temperature, top-p,
-;; top-k, min-p, seed, repeat-penalty, presence-penalty, frequency-penalty and
-;; constraint, with an accessor named after each. An omitted sampling parameter
-;; is neutral: temperature 0 (greedy), top-p 1, no top-k, no min-p, seed 0,
-;; repeat-penalty 1 (off) and no penalties.
+;; top-k, min-p, seed, repeat-penalty, presence-penalty, frequency-penalty,
+;; constraint and style, with an accessor named after each. An omitted sampling
+;; parameter is neutral: temperature 0 (greedy), top-p 1, no top-k, no min-p,
+;; seed 0, repeat-penalty 1 (off) and no penalties.
+;;
+;; style is #f or (card-messages layer vector): messages prepended to the
+;; request's own (the style card's fixed prefix), the 0-based block a steering
+;; vector follows, and that vector already scaled to the request's alpha. A
+;; card-only style has #f layer and vector.
 ;;
 ;; Example:
 ;;   (use-modules (sonicboom serve engine))
@@ -71,7 +77,7 @@
 (define-record-type <chat-request>
   (%make-chat-request model messages tools tool-choice max-tokens stop
                       temperature top-p top-k min-p seed repeat-penalty
-                      presence-penalty frequency-penalty constraint)
+                      presence-penalty frequency-penalty constraint style)
   chat-request?
   (model chat-request-model)                ; model id
   (messages chat-request-messages)          ; list of message alists
@@ -88,7 +94,8 @@
   (repeat-penalty chat-request-repeat-penalty) ; 1: off
   (presence-penalty chat-request-presence-penalty)
   (frequency-penalty chat-request-frequency-penalty)
-  (constraint chat-request-constraint))     ; #f or a token filter
+  (constraint chat-request-constraint)     ; #f or a token filter
+  (style chat-request-style))              ; #f or (card-messages layer vector)
 
 ;; Omitted sampling parameters are neutral: temperature 0 (greedy), top-p 1,
 ;; no top-k, no min-p, repeat-penalty 1 and no penalties. A request is thus
@@ -98,7 +105,7 @@
                             (top-p 1.0) (top-k 0) (min-p 0.0) (seed 0)
                             (repeat-penalty 1.0)
                             (presence-penalty 0.0) (frequency-penalty 0.0)
-                            (constraint #f))
+                            (constraint #f) (style #f))
   "Create a chat request.
 
 Every keyword is optional except model and messages; the sampling parameters
@@ -122,6 +129,10 @@ Args:
   presence-penalty: keyword; the presence penalty (default 0.0).
   frequency-penalty: keyword; the frequency penalty (default 0.0).
   constraint: keyword; a constrained-decoding constraint or #f (default #f).
+  style: keyword; #f, or (card-messages layer vector) as one resolved style
+    choice: the card messages prepended to the request's (a fixed prefix the
+    session pool reuses), the layer the steering vector follows, and the
+    vector already scaled to the request's alpha (default #f).
 Returns: a chat request.
 Example:
   (use-modules (sonicboom serve engine))
@@ -130,7 +141,42 @@ Example:
 PyTorch: none"
   (%make-chat-request model messages tools tool-choice max-tokens stop
                       temperature top-p top-k min-p seed repeat-penalty
-                      presence-penalty frequency-penalty constraint))
+                      presence-penalty frequency-penalty constraint style))
+
+(define (chat-request-with-style request style)
+  "A copy of REQUEST whose style is replaced by STYLE.
+
+The serve layer parses a request's style spec from the body and resolves it
+against the style registry once the request is admitted; this swaps the
+resolved value in without rebuilding every other parameter by hand.
+
+Args:
+  request: a chat request.
+  style: the resolved style value, or #f.
+Returns: a chat request.
+Example:
+  (use-modules (sonicboom serve engine))
+  (chat-request-style
+   (chat-request-with-style (make-chat-request #:model \"m\" #:messages '())
+                            #f))
+  => #f
+PyTorch: none"
+  (%make-chat-request (chat-request-model request)
+                      (chat-request-messages request)
+                      (chat-request-tools request)
+                      (chat-request-tool-choice request)
+                      (chat-request-max-tokens request)
+                      (chat-request-stop request)
+                      (chat-request-temperature request)
+                      (chat-request-top-p request)
+                      (chat-request-top-k request)
+                      (chat-request-min-p request)
+                      (chat-request-seed request)
+                      (chat-request-repeat-penalty request)
+                      (chat-request-presence-penalty request)
+                      (chat-request-frequency-penalty request)
+                      (chat-request-constraint request)
+                      style))
 
 ;; The result of one request.
 ;;
@@ -616,13 +662,29 @@ PyTorch: none"
             (for-each (lambda (t) (display t port) (display " " port)) tokens)
             (newline port)))))))
 
+;; A request's style, already resolved (see (sonicboom serve styles)): the
+;; card's messages go before the request's own, as one fixed prefix the session
+;; pool reuses; the steering vector, when there is one, is (layer . vector).
+(define (style-card-messages style)
+  (if style (car style) '()))
+
+(define (style-steering style)
+  (and style
+       (let ((layer (cadr style)) (vector (caddr style)))
+         (and layer vector (cons layer vector)))))
+
 (define (run-request engine request on-event)
   (let* ((id (chat-request-model request))
          (model (or (engine-model engine id) (throw 'model-not-found id)))
          (pool (engine-pool engine id))
+         (style (chat-request-style request))
+         (messages (if style
+                       (append (style-card-messages style)
+                               (chat-request-messages request))
+                       (chat-request-messages request)))
          (tools (chat-request-tools request))
          (prompt-segments
-          (render-chat-segments model (chat-request-messages request)
+          (render-chat-segments model messages
                                 #:tools tools
                                 #:tool-choice (chat-request-tool-choice request)))
          (prompt-tokens (tokenize-chat model prompt-segments))
@@ -674,7 +736,8 @@ PyTorch: none"
         (lambda () #t)
         (lambda ()
           (let ((cached (prefill session prompt-tokens
-                                 (chat-request-constraint request))))
+                                 (chat-request-constraint request)
+                                 (style-steering style))))
             ;; State of the text filter.
             (define buffer "")             ; undecided text
             (define in-call? #f)

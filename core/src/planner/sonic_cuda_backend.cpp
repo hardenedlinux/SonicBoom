@@ -470,6 +470,7 @@ SonicCudaBackend::~SonicCudaBackend() {
   if (token_buf_) g_alloc.deallocate(token_buf_);
   if (pos_buf_) g_alloc.deallocate(pos_buf_);
   if (tokens_buf_) g_alloc.deallocate(tokens_buf_);
+  if (steer_buf_) g_alloc.deallocate(steer_buf_);
   if (pos_ring_) g_alloc.deallocate(pos_ring_);
   if (token_ring_) g_alloc.deallocate(token_ring_);
   if (carry_buf_) g_alloc.deallocate(carry_buf_);
@@ -576,6 +577,37 @@ bool SonicCudaBackend::stage_verify_pos(hal::StepProgram& prog,
   uint64_t pos[kMaxVerifyRows];
   for (int r = 0; r < rows; ++r) pos[r] = start_pos + uint64_t(r);
   return prog.stage_upload(pos_buf_, pos, size_t(rows) * sizeof(uint64_t));
+}
+
+bool SonicCudaBackend::set_steer(std::span<const float> v) {
+  if (v.empty()) return false;
+  // Grow-only: a runtime's steering vector has one fixed width, so the slot is
+  // sized once by the first staging and never reallocated under a capture.
+  if (!steer_buf_ || steer_n_ < v.size()) {
+    if (steer_buf_) g_alloc.deallocate(steer_buf_);
+    // The slot outlives captures: a captured step bakes its address and
+    // replays it without re-acquiring, and a graph recorded while the block
+    // sat on the free list keeps writing it. (Measured: a styled session's
+    // slot came back holding another graph's values when it reused a pooled
+    // block.) Take a fresh allocation, the pool's documented contract for
+    // buffers that outlive captures.
+    const uint64_t h = planner::device::acquire_fresh(
+        uint64_t(v.size()) * sizeof(float));
+    steer_buf_ = hal::Buffer{h, uint64_t(v.size()) * sizeof(float),
+                             hal::DeviceId{0}, hal::MemoryKind::DeviceLocal};
+    steer_n_ = steer_buf_ ? uint64_t(v.size()) : 0;
+    if (!steer_buf_) return false;
+  }
+  const bool ok = g_alloc.copy_to_device(steer_buf_, v.data(),
+                                         uint64_t(v.size()) * sizeof(float));
+  return ok;
+}
+
+bool SonicCudaBackend::stage_steer(hal::StepProgram& prog,
+                                   std::span<const float> v) {
+  if (v.empty() || !steer_buf_ || v.size() != steer_n_) return false;
+  return prog.stage_upload(steer_buf_, v.data(),
+                           uint64_t(v.size()) * sizeof(float));
 }
 
 bool SonicCudaBackend::read_token(float* host) const {
@@ -834,6 +866,8 @@ std::unique_ptr<hal::StepProgram> SonicCudaBackend::record_step(
   capture_res_.sample_params = sample_params_.id;
   capture_res_.sample_window = sample_window_.id;
   capture_res_.sample_cands = sample_cands_.id;
+  capture_res_.steer = steer_buf_.id;
+  capture_res_.steer_n = steer_n_;
   capture_res_.scratch_epoch = sonicboom::cuda::scratch_epoch();
   return prog;
 }
@@ -850,7 +884,8 @@ bool SonicCudaBackend::capture_resources_ok(
       c.token_ring != token_ring_.id || c.carry != carry_buf_.id ||
       c.mask != argmax_mask_.id || c.sample_params != sample_params_.id ||
       c.sample_window != sample_window_.id ||
-      c.sample_cands != sample_cands_.id)
+      c.sample_cands != sample_cands_.id || c.steer != steer_buf_.id ||
+      c.steer_n != steer_n_)
     return false;
   // The two .cu files' file-static scratch: unchanged epoch is confirmed
   // identity; a change is acceptable only when the old allocation was retained
@@ -2614,6 +2649,18 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // covers both. The bias is a bound model weight (host span, uploaded once).
       const std::span<const float> b = fweight(slot);
       ok = !b.empty() && nn::cuda::add_bias_dev(b, dev(in[0]), out, out_n);
+      break;
+    }
+    case OpKind::Steer: {
+      // The residual plus the backend's staged steering vector, broadcast over
+      // the rows. The vector is device state (steer_buf_), staged before the
+      // step or its capture, so the graph input is not read here.
+      if (!steer_buf_) {
+        ok = false;
+        break;
+      }
+      ok = nn::cuda::add_bias_ptr_dev(
+          dev_mut(steer_buf_.id), int(steer_n_), dev(in[0]), out, out_n);
       break;
     }
     case OpKind::Slice: {

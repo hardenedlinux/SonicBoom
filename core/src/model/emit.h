@@ -57,8 +57,14 @@ int64_t decode_list_capacity(const DecodeGraphSpec& spec);
 // `dynamic_extent`, with `n` the extent the graph is built at. The graph ends
 // at the residual stream and appends every owned cache's K and V after the
 // last block.
+//
+// `steer_layer` >= 0 adds the graph's `steer` input to the residual after that
+// block (style steering); `stop_layer` >= 0 ends the graph at that block's
+// output instead of after the last one, which is the residual capture. Both -1
+// is the plain prefill graph.
 GraphIr emit_prefill_ir(const Recipe& recipe, uint64_t n,
-                        bool dynamic_extent = false);
+                        bool dynamic_extent = false, int64_t steer_layer = -1,
+                        int64_t stop_layer = -1);
 
 // Whether a decode or verify matmul can take the mmq lowering in this process:
 // the q8_1 dispatcher and the mmq kernel are both available. Which projections

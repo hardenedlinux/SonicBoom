@@ -151,6 +151,36 @@ struct KvCacheSession {
   // recurrent block.
   std::shared_ptr<void> state_checkpoints;
 
+  // Style steering: the block whose output receives `style_vector`, the
+  // [embedding_width] vector itself, and a digest of (layer, vector) that keys
+  // the runtimes built for it. Model-layer state — the planner never reads
+  // these — kept here because they belong to the session like the cache does,
+  // and because a changed vector needs a differently shaped graph (the emitter
+  // adds a Steer node for the block it names). `style_layer` -1 means no
+  // steering, and `style_digest` is then 0.
+  int32_t style_layer = -1;
+  std::vector<float> style_vector;
+  uint64_t style_digest = 0;
+
+  // Digests (layer, vector) so a runtime key can compare steering without
+  // hashing the vector again (FNV-1a 64 over the bytes). Not part of the model
+  // contract; 0 is never produced for a real vector.
+  static uint64_t style_digest_of(int32_t layer,
+                                  std::span<const float> v) noexcept {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](const unsigned char* p, size_t n) {
+      for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+      }
+    };
+    const uint32_t l = static_cast<uint32_t>(layer);
+    mix(reinterpret_cast<const unsigned char*>(&l), sizeof(l));
+    mix(reinterpret_cast<const unsigned char*>(v.data()),
+        v.size() * sizeof(float));
+    return h == 0 ? 1 : h;
+  }
+
   // RAII release for the runtimes bound to this set (a
   // model::SessionRuntimeOwner). kv_session_allocate stores one when it gives
   // the set an identity, next to `caches` and declared after it, so the owner

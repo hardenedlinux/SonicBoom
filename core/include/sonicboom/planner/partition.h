@@ -76,6 +76,9 @@ inline BackendTag route_op(OpKind op) noexcept {
     case OpKind::MatvecF32:
     case OpKind::MatvecBf16:
     case OpKind::AddBias:
+    // The steering residual add runs the same add-bias kernel over the
+    // backend's own vector slot, on both the host and the device.
+    case OpKind::Steer:
     case OpKind::Mul:
     case OpKind::ScaleBy:
     case OpKind::Scale:

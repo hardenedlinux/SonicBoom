@@ -305,7 +305,7 @@ PyTorch: none"
 
 ;; The mock has no vocabulary and so no grammar support; it ignores the
 ;; constraint. sample-from-logits still applies a procedure constraint in step.
-(define (mock-prefill s tokens _constraint)
+(define (mock-prefill s tokens _constraint _style)
   (let* ((model (ms-model s))
          (new (list->vector tokens))
          (reused (common-prefix-length (ms-tokens s) new))

@@ -137,6 +137,16 @@ public:
   bool set_verify_pos(uint64_t start_pos, int rows);
   bool stage_verify_pos(hal::StepProgram& prog, uint64_t start_pos, int rows);
 
+  // Style steering: stage the session's [width] steering vector into a
+  // persistent device slot. A steering graph's Steer node adds that slot to the
+  // residual (add_bias_ptr_dev), so the vector is backend state like the
+  // position slot rather than a graph input — a captured step stays valid for a
+  // vector that never changes under one runtime. The vector must be staged
+  // before capture; `set_steer` also sizes (and grows) the slot, so the first
+  // call must come before a steering graph is recorded.
+  bool set_steer(std::span<const float> v);
+  bool stage_steer(hal::StepProgram& prog, std::span<const float> v);
+
   // Download the current token id from the persistent device-resident `token_buf_`
   // slot (one float) into `host`. Used after a CUDA Graph replay to recover the
   // argmax result without the executor's host-output path (which is a synchronous
@@ -351,6 +361,8 @@ public:
     uint64_t sample_params = 0;
     uint64_t sample_window = 0;
     uint64_t sample_cands = 0;
+    uint64_t steer = 0;        // 0 when no vector was staged at capture time
+    uint64_t steer_n = 0;
     uint64_t scratch_epoch = 0;
   };
   const CaptureResources& capture_resources() const noexcept {
@@ -399,6 +411,8 @@ private:
   hal::Buffer token_buf_;           // persistent device buffer: current token id (float)
   hal::Buffer pos_buf_;             // persistent device buffer: current position (uint64_t)
   hal::Buffer tokens_buf_;          // persistent device buffer: prefill chunk token ids ([chunk] uint64)
+  hal::Buffer steer_buf_;           // style steering: the session's [width] vector
+  uint64_t steer_n_ = 0;            // its width (0: no vector staged)
   hal::Buffer pos_ring_;            // chunk mode: k positions ([k] uint64_t)
   hal::Buffer token_ring_;          // chunk mode: k emitted tokens ([k] float)
   hal::Buffer carry_buf_;           // chunk mode: the token the chunk's first step reads

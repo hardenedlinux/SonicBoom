@@ -198,8 +198,20 @@
       ;; no candidate list to filter.
       (error "the libsonicboom backend cannot apply a procedure constraint")))))
 
-(define (real-prefill session tokens constraint)
+;; A style is (layer . vector): the residual-stream vector already scaled to the
+;; request's alpha, and the 0-based block it follows. The core keeps it in the
+;; session and adds it at every later step too; a style different from the one
+;; the session last held retires its prefix, which is exactly the re-prefill the
+;; engine then asks for.
+(define (real-apply-style session style)
+  (let ((handle (real-session-handle session)))
+    (if style
+        (inference:set-steering! handle (car style) (cdr style))
+        (inference:clear-steering! handle))))
+
+(define (real-prefill session tokens constraint style)
   (real-apply-constraint session constraint)
+  (real-apply-style session style)
   (let ((reused (inference:prefill! (real-session-handle session) tokens)))
     (set-real-session-rev-history! session (reverse tokens))
     reused))
@@ -315,6 +327,13 @@ Note: the libsonicboom shared library must be loadable by the process."
    #:prefill real-prefill
    #:step real-step
    #:generate real-generate
+   ;; Style assets: the width a steering vector must have, and the residual
+   ;; stream a style's exemplars are measured from.
+   #:embedding (lambda (model)
+                 (inference:model-embedding (real-model-handle model)))
+   #:residual-capture (lambda (model tokens layer)
+                        (inference:residual-capture (real-model-handle model)
+                                                    tokens layer))
    ;; real-step and real-generate pass the sampler to boom_llm_decode's sampled
    ;; session path.
    #:sampling? #t))

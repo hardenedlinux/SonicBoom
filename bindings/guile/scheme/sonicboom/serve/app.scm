@@ -30,6 +30,9 @@
 ;;;                                   answered by chunk JSON messages, "[DONE]"
 ;;;   GET  /sonicboom/models          every served model and its residency
 ;;;   POST /sonicboom/models/:id/load, .../unload   queued device switches
+;;;   GET  /sonicboom/styles          the style assets (card + steering vector)
+;;;   POST /sonicboom/styles          create one (queued: it may measure vectors)
+;;;   DELETE /sonicboom/styles/:id    forget one
 ;;;   GET  /sonicboom/stats           queue, sessions and backend counters
 ;;;   POST /sonicboom/replay/:id      regenerate a stored reply exactly
 ;;;   GET  /sonicboom/history         the replay store as a minimal HTML page
@@ -87,6 +90,7 @@
              (sonicboom serve engine)
              (sonicboom serve residency)
              (sonicboom serve sessions)
+             (sonicboom serve styles)
              (sonicboom serve chat-template)
              (sonicboom serve fingerprint)
              (sonicboom serve openai)
@@ -211,6 +215,11 @@
                  (or (find (lambda (id) (eq? 'chat (residency-kind residency id)))
                            (residency-ids residency))
                      (error "the catalog has no chat model")))
+
+;; The style registry: named, versioned style assets a chat request asks for
+;; with "sonicboom": {"style": {"id", "version", "alpha"}}. In memory; created
+;; under the engine's queue (a vector is measured with the model resident).
+(define styles (make-style-registry))
 
 (define start-time (car (gettimeofday)))
 (define (now) (car (gettimeofday)))
@@ -560,6 +569,21 @@
            "messages" "context_length_exceeded"))
     (('invalid-constraint param message)
      (list 400 "invalid_request_error" message param "invalid_constraint"))
+    (('style-invalid param message)
+     (list 400 "invalid_request_error" message param "invalid_style"))
+    (('style-not-found id)
+     (list 404 "invalid_request_error"
+           (format #f "The style `~a' does not exist" id)
+           "sonicboom" "style_not_found"))
+    (('style-version-mismatch id want got)
+     (list 409 "invalid_request_error"
+           (format #f "The style `~a' is version ~a, not ~a" id got want)
+           "sonicboom" "style_version_mismatch"))
+    (('style-model-mismatch id want got)
+     (list 400 "invalid_request_error"
+           (format #f "The style `~a' was measured under `~a', not `~a'"
+                   id got want)
+           "sonicboom" "style_model_mismatch"))
     ;; A Guile 3 condition raised by a binding module. `catch #t` reports the
     ;; condition itself with the key `%exception`. A &sonicboom-error carries
     ;; the C ABI's message (a failed model load, a generation failure). A
@@ -599,14 +623,27 @@
       ;; backends sample; this guards a future one that does not.
       (unless (backend-sampling? backend)
         (check-greedy-body body))
-      ;; Noted before admission: a rejected request's record still says which
-      ;; model it asked for.
-      (when (current-request-log)
-        (request-log-note! (chat-request-model request) 'chat))
-      (let ((ticket (engine-admit! engine)))
+      ;; The body's style spec is resolved against the registry here, before
+      ;; the request takes a place in the queue: an unknown id is answered now,
+      ;; not when the request reaches the front. Resolution copies the card and
+      ;; the scaled vector into the request; the registry is not needed again.
+      (let* ((raw-style (chat-request-style request))
+             (request
+              (if raw-style
+                  (chat-request-with-style
+                   request
+                   (resolve-style-choice styles raw-style
+                                         (chat-request-model request)
+                                         (assoc-ref raw-style "alpha")))
+                  request)))
+        ;; Noted before admission: a rejected request's record still says which
+        ;; model it asked for.
         (when (current-request-log)
-          (request-log-ticket! (current-request-log) ticket))
-        (values request stream? include-usage? ticket body)))))
+          (request-log-note! (chat-request-model request) 'chat))
+        (let ((ticket (engine-admit! engine)))
+          (when (current-request-log)
+            (request-log-ticket! (current-request-log) ticket))
+          (values request stream? include-usage? ticket body))))))
 
 ;; Run an admitted request, sending its chunks through send-obj (returns #f
 ;; once the client is gone). Ends with "[DONE]" through send-text. CTX is the
@@ -1194,6 +1231,50 @@
   (lambda (rc)
     (response-emit (history-html)
                    #:headers '((content-type . (text/html (charset . "utf-8")))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Style assets. A style is created here under the engine's queue: building
+;;; its steering vector runs the backend's residual capture with the model
+;;; resident. Creating a style again under the same id replaces it. The
+;;; registry is in memory and goes with the process.
+
+(logged-get "/sonicboom/styles" #:mime 'json
+  (lambda (rc)
+    (:mime rc
+           `(("object" . "list")
+             ("data" . ,(list->vector
+                         (map style-json (style-list styles))))))))
+
+(logged-post "/sonicboom/styles"
+  (lambda (rc)
+    (catch #t
+      (lambda ()
+        (let* ((spec (parse-style-create (read-json-body rc)))
+               (id (assq-ref spec 'id))
+               (model-id (assq-ref spec 'model)))
+          (unless (eq? 'chat (residency-kind residency model-id))
+            (throw 'model-not-found model-id))
+          (request-log-note! model-id 'chat)
+          (run-job
+           (lambda ()
+             (residency-ensure! residency model-id)
+             (style-create! styles spec (residency-model residency model-id))))
+          (json-emit 200 (style-json (style-ref styles id)))))
+      (lambda (key . args)
+        (apply error-emit (classify key args))))))
+
+;; A resolved style is copied into each request as it is admitted, so deleting
+;; one stops new requests from using it; requests already running finish.
+(logged-delete "/sonicboom/styles/:id"
+  (lambda (rc)
+    (let ((id (params rc "id")))
+      (catch #t
+        (lambda ()
+          (unless (style-delete! styles id)
+            (throw 'style-not-found id))
+          (json-emit 200 `(("id" . ,id) ("deleted" . #t))))
+        (lambda (key . args)
+          (apply error-emit (classify key args)))))))
 
 (logged-get "/sonicboom/stats" #:mime 'json
   (lambda (rc)

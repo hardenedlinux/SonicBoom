@@ -288,6 +288,9 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
       // The gated DeltaNet scan of a recurrent block runs the SonicBoom-owned
       // CPU kernel against the sequence's state.
       OpKind::GdnScan,
+      // Style steering's residual add (nn::add_bias broadcasting the session's
+      // vector). Only a graph built for a steering session carries the node.
+      OpKind::Steer,
   };
   // VS1 prefetch markers are registered only under the switch that can place
   // them. They carry no outputs and no kernels; the backend executes them as
@@ -378,6 +381,10 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         // The gated DeltaNet scan of a recurrent block runs the SonicBoom-owned
         // CUDA kernel against the sequence's device state.
         OpKind::GdnScan,
+        // Style steering's residual add: add_bias_dev over the backend's
+        // persistent steering slot (the vector is staged there, so the add
+        // never moves a host buffer per step).
+        OpKind::Steer,
     };
     // MMQ1: the prefill dispatch of the same projections onto the
     // compiler-generated int8 tensor-core kernel. Registered only while that

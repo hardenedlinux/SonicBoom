@@ -231,6 +231,9 @@ Endpoints:
 | `POST /v1/images/generations` | MOSS-Image: `{"created", "data": [{"b64_json": …}]}`, each entry a PNG; the header `sonicboom-job-id` names the generation, `stream: true` answers with SSE progress instead |
 | `DELETE /sonicboom/jobs/:id` | cancel a generation by job id: `{"id", "status": "cancelled"}`; 404 `job_not_found` for an unknown or finished job (not OpenAI) |
 | `GET /v1/ws/chat` | WebSocket: one request (the same JSON body) per text message; the reply is the chunk objects as text messages, then `[DONE]`; a bad request gets an `error` object |
+| `GET /sonicboom/styles` | the style assets: per entry `id`, `version`, `model`, `layer` (null for a card-only style), `vector` (whether it has one), `system` (whether it has one), `exemplars` (count) and `created`; the vector itself is not returned (not OpenAI; see "Style assets") |
+| `POST /sonicboom/styles` | create (or replace) a style; queued like a generation because building a vector runs the model; 400 `invalid_style` for a bad body (not OpenAI) |
+| `DELETE /sonicboom/styles/:id` | forget a style: `{"id", "deleted": true}`; 404 `style_not_found` for an unknown id (not OpenAI) |
 | `GET /sonicboom/stats` | engine, pool and backend counters (not OpenAI) |
 | `POST /sonicboom/replay/:replay_id` | regenerate a stored reply from its request body and seed; 404 `replay_not_found` when the id is unknown or no replay store is configured (not OpenAI; see `docs/reproducible-api.md`) |
 | `GET /sonicboom/history` | a minimal HTML page of recent stored replies with seed, model, time and replay/copy-seed links; empty without a replay store (not OpenAI) |
@@ -242,8 +245,9 @@ Request fields: `model`, `messages` (string or text-part content; roles
 `stop` (string or up to 4), `temperature`, `top_p`, `top_k` (extension),
 `min_p` (extension), `seed`, `repeat_penalty` (extension), `presence_penalty`,
 `frequency_penalty`, `n` (1 only), `tools`, `tool_choice`,
-`response_format`. Unknown fields are ignored; a sampling value out of range
-is a 400 naming the parameter.
+`response_format`, `sonicboom` (the extension object: `{"style": {"id",
+"version", "alpha"}}`, see "Style assets"). Unknown fields are ignored; a
+sampling value out of range is a 400 naming the parameter.
 
 Omitted sampling defaults differ from the OpenAI service: **an omitted
 `temperature` is 0 (greedy, not 1.0)**, so a request that says nothing samples
@@ -345,6 +349,108 @@ ends as soon as it is complete instead of padding whitespace up to the bound.
 A tool-call envelope is exact on both sides. Greedy decoding is unchanged
 wherever the unconstrained token is allowed, so a model that answers with
 valid JSON produces the same tokens it would have produced anyway.
+
+### Style assets
+
+A **style** is a named, versioned writing style a request can ask for with
+`"sonicboom": {"style": {"id": …, "version": …, "alpha": …}}`. It has two
+independent halves:
+
+- **card** — a system text plus up to 8 user/assistant exemplar turns, put in
+  front of the request's own messages. They are a fixed prefix, so the session
+  pool reuses them across requests the same way it reuses a conversation.
+- **vector** — a prefill-time steering vector: the mean residual stream at one
+  block over the exemplar replies, minus the same mean over a fixed set of
+  neutral reference sentences (plain factual prose, in
+  `serve/styles.scm`). The difference is added to the residual stream right
+  after that block during prefill and every decode step; `alpha` scales it per
+  request. The registry stores the unscaled vector.
+
+A style created without `layer` has only a card. A vector needs a real backend
+(residual capture and the embedding width; the mock backend cannot build one),
+and building it runs one prefill per exemplar and reference text on a throwaway
+cache — so creation goes through the engine's queue, with the model resident.
+The registry is in memory, like the replay store; it does not survive the
+process. Creating the same id again replaces it; a request that names a
+different `version` than the registry holds is a 409
+`style_version_mismatch`, an unknown id a 404 `style_not_found`, and a style
+measured under another model a 400 `style_model_mismatch` (a steering vector
+is a property of one model's residual space).
+
+Create a style:
+
+```http
+POST /sonicboom/styles
+{"id": "plain", "version": 1, "model": "qwen2.5-7b",
+ "system": "Write in short, plain sentences. State facts directly.",
+ "exemplars": [
+   {"prompt": "Describe the moon.",
+    "reply": "The moon is a rock in the sky. It has no light of its own."},
+   {"prompt": "Explain rain.",
+    "reply": "Rain is water that falls from clouds. It waters the plants."}],
+ "layer": 20}
+```
+
+Omit `layer` for a card-only style (the same request without it), and `system`
+or `exemplars` as wanted — a style needs at least one of them. Use it:
+
+```http
+POST /v1/chat/completions
+{"model": "qwen2.5-7b", "messages": [{"role": "user", "content": "Explain what a river is."}],
+ "sonicboom": {"style": {"id": "plain", "alpha": 0.1}}}
+```
+
+`alpha` defaults to 1.0 (the vector as measured) and is validated to
+[-10, 10]; a negative value steers away from the style. The first request
+under a style computes the card prefix; later ones keep it cached
+(`cached_tokens` shows it). Changing a session's style (including clearing it)
+retires its KV prefix, so the next request re-prefills from position 0.
+
+Generation is deterministic for a given prompt, seed and style, and **identical
+with speculative decoding on or off** — a steered session takes strict decode
+steps, because the speculative verify graphs carry no injection. In exchange,
+a steered decode step is not CUDA-graph-captured today (the vector arrives as
+a per-step host-to-device copy), which is where the speed cost below comes
+from.
+
+**Measured** (RTX 3050, greedy, 5 writing prompts, 64 new tokens max; drift =
+1 − cosine between the final-layer mean residual of the new reply and the
+exemplars' mean under the same model, so 0 is "the style's own register"):
+
+| arm | Qwen2.5-7B, block 20 (drift, per prompt) | decode tok/s |
+|---|---|---|
+| no style | 0.19–0.25 | 40.8 |
+| card only | 0.09–0.21 | 40.0 |
+| card + vector, α 0.05 | 0.094–0.188 | 38.8 |
+| card + vector, α 0.1 | 0.088–0.186 | 37.4 |
+
+The exemplars' own mean sits 0.122 from the neutral references on this model.
+Coherence holds to about **α 0.1 on Qwen2.5-7B block 20** (0.2 and above
+degenerates into repetition); on Qwen3.6-35B-A3B block 20 (the Huihui demo)
+α ≤ 0.3 stays coherent and 1.0 breaks; on Gemma-4-E4B block 28 the drift
+metric saturates (the model's outputs sit close to the exemplars' register
+either way: no style 0.015–0.026, card/vector 0.012–0.034), while the samples
+still show the intended change from markdown lists to short plain sentences.
+Treat the metric as a sanity check, not a tuner: pick α per model by reading
+the output.
+
+Samples, Qwen2.5-7B, prompt "Explain what a river is.":
+
+- no style — "A river is a natural watercourse, typically flowing over land and
+  carrying a significant amount of water. Rivers are formed by various
+  processes…"
+- card only — "A river is a stream of water that flows in a channel. It carries
+  water from high ground to the sea."
+- card + vector α 0.1 — "A river is a stream of water. It flows from one place
+  to another."
+
+The cost of the card prefix is one prefill per prompt at first use, then none
+(reused). The vector costs ~3–7% of decode throughput on Qwen2.5-7B (40.8 →
+37.4 tok/s at α 0.1; the whole loss is the uncaptured step — a plain run with
+CUDA graphs off measures 2.5% slower than the captured one, and a steered run
+measures the same either way). Reproducibility holds inside the usual scope:
+with `temperature` 0.8 and the same seed, two styled requests are
+byte-identical, and a new seed differs.
 
 ### One model on the device
 

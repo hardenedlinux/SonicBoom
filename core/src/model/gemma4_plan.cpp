@@ -423,8 +423,10 @@ static DecodeGraphSpec device_decode_spec(DecodeConsumer consumer,
 // is the same graph a concrete `n` produces plus the dynamic extent record a
 // smaller execution can bind (TensorDesc::dynamic_stride_bytes).
 planner::Graph build_prefill_graph(const Recipe& recipe, uint64_t n,
-                                   bool dynamic_extent) {
-  GraphIr ir = emit_prefill_ir(recipe, n, dynamic_extent);
+                                   bool dynamic_extent, int64_t steer_layer,
+                                   int64_t stop_layer) {
+  GraphIr ir = emit_prefill_ir(recipe, n, dynamic_extent, steer_layer,
+                               stop_layer);
   if (!ir.module)
     return {};
   return lower_graph(*ir.module, dynamic_extent ? n : 0);
@@ -435,8 +437,58 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n,
   return build_prefill_graph(recipe_for(m), n, symbolic);
 }
 
+planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n,
+                                          bool symbolic, int64_t steer_layer,
+                                          int64_t stop_layer) {
+  return build_prefill_graph(recipe_for(m), n, symbolic, steer_layer,
+                             stop_layer);
+}
+
 planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
   return build_gemma4_prefill_graph(m, n, /*symbolic=*/false);
+}
+
+// The CPU residual read (plan.h): one prefill pass over a throwaway cache whose
+// graph stops at `layer`, so the graph's output is that layer's residual rows.
+bool capture_residual_spine(const Gemma4Model& m,
+                            std::span<const uint64_t> tokens, int64_t layer,
+                            std::span<float> out) {
+  if (m.weights.blocks.empty() || tokens.empty()) return false;
+  if (layer < 0 || uint64_t(layer) >= m.weights.blocks.size()) {
+    std::cerr << "[residual] layer " << layer << " outside the model ("
+              << m.weights.blocks.size() << " blocks)\n";
+    return false;
+  }
+  const uint64_t n = tokens.size();
+  const uint64_t d = m.config.embedding_length;
+  if (out.size() < n * d) {
+    std::cerr << "[residual] output too small: " << out.size() << " < "
+              << n * d << "\n";
+    return false;
+  }
+  for (uint64_t t : tokens)
+    if (t >= m.config.vocab_size) return false;
+  std::lock_guard<std::recursive_mutex> exec_lock(execution_mutex());
+  planner::Graph graph =
+      build_gemma4_prefill_graph(m, n, /*symbolic=*/false, /*steer=*/-1,
+                                 /*stop=*/layer);
+  if (graph.nodes.empty()) return false;
+  auto snap = planner::CpuResourceProvider::snapshot({.enumerate_cuda = false});
+  if (!snap) return false;
+  planner::AnalyticalCpuCostModel cost(*snap);
+  auto plan = planner::plan_execution(graph, *snap, cost);
+  if (!plan) return false;
+  planner::SonicBackend backend(m, graph, n);
+  planner::RuntimeExecutor exec(
+      std::map<planner::BackendTag, planner::Backend*>{
+          {planner::BackendTag::Sonic, &backend}});
+  const std::vector<sx::Bytes> in{encode_tokens(tokens), encode_i64(0)};
+  auto res = exec.execute(*plan, *snap, in);
+  if (!res || res->outputs.empty()) return false;
+  const sx::Bytes& hidden = res->outputs[0];
+  if (hidden.size() < n * d * sizeof(float)) return false;
+  std::memcpy(out.data(), hidden.data(), n * d * sizeof(float));
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1375,6 +1427,14 @@ struct DecodeRuntime {
   // (decode_steps_spine_cuda does; B3's reference).
   std::shared_ptr<void> prog_cache;
   GreedyProgramDesc program;                          // the lowered loop (§10)
+  // Style steering: whether the graph steers, and the [width] f32 bytes every
+  // execute of a steering graph supplies as its last `steer` input.
+  bool steers = false;
+  sx::Bytes steer_in;
+  // Append the steering input to a step's input list (a no-op when off).
+  void add_steer(std::vector<sx::Bytes>& in) const {
+    if (steers) in.push_back(steer_in);
+  }
   // Prefill segments by shape-class sizing extent and variant
   // (`extent << 1 | interior`), most-recently used first, capped at
   // kMaxCachedSegments.
@@ -1386,8 +1446,24 @@ struct DecodeRuntime {
 
 // The runtime registry key: every execution runtime is bound to exactly one KV
 // cache set, identified by the session's monotonic cache_id (0 = the anonymous
-// runtime-owned cache of the non-session tooling paths).
-using DecodeKey = std::tuple<const Gemma4Model*, uint64_t, uint64_t>;
+// runtime-owned cache of the non-session tooling paths), and to the session's
+// style steering (0 = none): a steering graph carries an extra Steer node and
+// input, so a runtime built for one vector must not serve another.
+using DecodeKey = std::tuple<const Gemma4Model*, uint64_t, uint64_t, uint64_t>;
+
+// The style identity a session's runtimes are keyed by (0: off).
+static uint64_t session_style_id(const planner::KvCacheSession* s) {
+  return s ? s->style_digest : 0;
+}
+
+// The graph-input bytes of a steering vector, as the executor's `steer` input.
+// A steering graph's input list ends with this one; the device backend ignores
+// it (it reads its own staged slot), the host backend adds it.
+static sx::Bytes encode_steer(std::span<const float> v) {
+  sx::Bytes b(v.size() * sizeof(float));
+  std::memcpy(b.data(), v.data(), b.size());
+  return b;
+}
 
 // A fed decode runtime: the uncaptured decode graph `decode_steps_spine_cuda`
 // drives with caller-supplied tokens. Bound to the session cache from
@@ -1669,6 +1745,7 @@ static int64_t greedy_step(DecodeRuntime& rt, uint64_t token, uint64_t pos,
   std::vector<sx::Bytes> in;
   in.push_back(encode_i64(token));
   in.push_back(encode_i64(pos));
+  rt.add_steer(in);
   auto res = rt.exec->execute(rt.plan, rt.snap, in);
   after_launch();
   if (!res) {
@@ -3254,6 +3331,12 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
       device_decode_spec(DecodeConsumer::Argmax, /*rows=*/1, gather);
   // The program is the declaration: the emitted graph carries none.
   spec.for_program = true;
+  // A session with a style vector steers after its block: the step graph then
+  // declares the extra `steer` input and the runtime supplies its bytes on
+  // every execute (the device backend reads its own staged slot instead).
+  const bool steers = session && session->style_layer >= 0 &&
+                      !session->style_vector.empty();
+  if (steers) spec.steer_layer = session->style_layer;
   // §10: the loop's shape follows SONICBOOM_SPEC — the plain greedy program
   // under an explicit "off", the draft/verify/accept program otherwise. An
   // undecided mode may still become auto at the probe, and the loop shape is
@@ -3318,6 +3401,15 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
       std::map<planner::BackendTag, planner::Backend*>{
           {planner::BackendTag::Sonic, rt->cuda.get()}});
   route_host_tasks(*rt->exec, rt->plan, *rt->cpu);
+  if (steers) {
+    // Stage the vector before any capture or execute: the device Steer node
+    // reads the backend's own slot, and a captured step bakes its address in.
+    // The runtime is keyed by the vector's digest, so it never changes under
+    // the capture.
+    if (!rt->cuda->set_steer(session->style_vector)) return nullptr;
+    rt->steers = true;
+    rt->steer_in = encode_steer(session->style_vector);
+  }
   return rt;
 }
 
@@ -3335,7 +3427,7 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx,
   if (!ensure_device_ready(m)) return nullptr;
   const uint64_t cache_id = session ? session->cache_id : 0;
   if (session && (!session->caches || cache_id == 0)) return nullptr;
-  const DecodeKey key{&m, n_ctx, cache_id};
+  const DecodeKey key{&m, n_ctx, cache_id, session_style_id(session)};
   auto& reg = gather ? g_grammar_runtimes : g_decode_runtimes;
   {
     std::lock_guard<std::mutex> lk(g_registry_mutex);
@@ -3399,6 +3491,7 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx,
         std::vector<sx::Bytes> in;
         in.push_back(encode_i64(0));
         in.push_back(encode_i64(0));
+        rt->add_steer(in);
         auto res = rt->exec->execute(rt->plan, rt->snap, in);
         if (!res) return false;
       }
@@ -3482,6 +3575,7 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx,
             std::vector<sx::Bytes> in;
             in.push_back(encode_i64(0));
             in.push_back(encode_i64(0));
+            rt->add_steer(in);
             return bool(rt->exec->execute(rt->plan, rt->snap, in));
           };
           rt->prog_one = rt->cuda->record_step(run_one);
@@ -3511,7 +3605,8 @@ uintptr_t decode_runtime_identity(const Gemma4Model& m, uint64_t n_ctx,
   std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
   std::lock_guard<std::mutex> lk(g_registry_mutex);
   const auto it =
-      g_decode_runtimes.find(DecodeKey{&m, n_ctx, session.cache_id});
+      g_decode_runtimes.find(
+          DecodeKey{&m, n_ctx, session.cache_id, session_style_id(&session)});
   return it == g_decode_runtimes.end()
              ? 0
              : reinterpret_cast<uintptr_t>(it->second.get());
@@ -3537,6 +3632,12 @@ struct SampledRuntime {
   std::unique_ptr<planner::RuntimeExecutor> exec;
   std::unique_ptr<hal::StepProgram> prog;  // captured sampled decode step
   GreedyProgramDesc program;               // the lowered loop around the step
+  // Style steering, as in DecodeRuntime.
+  bool steers = false;
+  sx::Bytes steer_in;
+  void add_steer(std::vector<sx::Bytes>& in) const {
+    if (steers) in.push_back(steer_in);
+  }
   // The session cache this runtime (and its capture) is bound to.
   std::shared_ptr<void> cache;
   uint64_t cache_id = 0;
@@ -3561,6 +3662,8 @@ static std::unique_ptr<SampledRuntime> build_sampled_runtime(
       device_decode_spec(DecodeConsumer::SampleSelect, /*rows=*/1, gather);
   // The program is the declaration: the emitted graph carries none.
   spec.for_program = true;
+  const bool steers = session.style_layer >= 0 && !session.style_vector.empty();
+  if (steers) spec.steer_layer = session.style_layer;
   compiler::ProgramSpec ps;
   ps.loop = compiler::ProgramSpec::Loop::Plain;
   ps.stochastic = true;
@@ -3595,6 +3698,11 @@ static std::unique_ptr<SampledRuntime> build_sampled_runtime(
       std::map<planner::BackendTag, planner::Backend*>{
           {planner::BackendTag::Sonic, rt->cuda.get()}});
   route_host_tasks(*rt->exec, rt->plan, *rt->cpu);
+  if (steers) {
+    if (!rt->cuda->set_steer(session.style_vector)) return nullptr;
+    rt->steers = true;
+    rt->steer_in = encode_steer(session.style_vector);
+  }
   return rt;
 }
 
@@ -3611,7 +3719,7 @@ static SampledRuntime* get_sampled_runtime(const Gemma4Model& m, uint64_t n_ctx,
   if (!session.caches || session.cache_id == 0 ||
       m.config.vocab_size == 0)
     return nullptr;
-  const DecodeKey key{&m, n_ctx, session.cache_id};
+  const DecodeKey key{&m, n_ctx, session.cache_id, session_style_id(&session)};
   auto& reg = gather ? g_sampled_grammar_runtimes : g_sampled_runtimes;
   {
     std::lock_guard<std::mutex> lk(g_registry_mutex);
@@ -3654,7 +3762,8 @@ static SampledRuntime* get_sampled_runtime(const Gemma4Model& m, uint64_t n_ctx,
   if (cuda_graph_decode_enabled() && !model_has_routed_experts(m) &&
       !model_has_recurrent_state(m)) {
     const uint64_t warm_pos = n_ctx > 0 ? n_ctx - 1 : 0;
-    const std::vector<sx::Bytes> warm_in{encode_i64(0), encode_i64(warm_pos)};
+    std::vector<sx::Bytes> warm_in{encode_i64(0), encode_i64(warm_pos)};
+    rt->add_steer(warm_in);
     auto warm_run = [&]() -> bool {
       return bool(rt->exec->execute(rt->plan, rt->snap, warm_in));
     };
@@ -3664,7 +3773,8 @@ static SampledRuntime* get_sampled_runtime(const Gemma4Model& m, uint64_t n_ctx,
     rt->cuda->set_kv_write_suppressed(false);
     if (warmed) {
       rt->cuda->synchronize();
-      const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(0)};
+      std::vector<sx::Bytes> in{encode_i64(0), encode_i64(0)};
+      rt->add_steer(in);
       auto run = [&]() -> bool {
         return bool(rt->exec->execute(rt->plan, rt->snap, in));
       };
@@ -3914,6 +4024,7 @@ int64_t sampled_step_cuda(const Gemma4Model& m, uint64_t token,
     // node arithmetic is identical.
     if (!rt->cuda->upload_sample(sampling, history)) return -1;
     std::vector<sx::Bytes> in{encode_i64(token), encode_i64(position)};
+    rt->add_steer(in);
     if (!rt->exec->execute(rt->plan, rt->snap, in)) return -1;
   }
   std::vector<nn::Candidate> cands(nn::kSampleCandidates);
@@ -3982,6 +4093,13 @@ struct VerifyRuntime {
   // The bucket this graph was built for: the widest run it serves. A call with
   // `rows` <= rows_capacity stages `rows` tokens padded to this many.
   int rows_capacity = 0;
+  // Style steering, as in DecodeRuntime: a verify must see the same injection
+  // as the plain decode it is checked against.
+  bool steers = false;
+  sx::Bytes steer_in;
+  void add_steer(std::vector<sx::Bytes>& in) const {
+    if (steers) in.push_back(steer_in);
+  }
 };
 
 // One entry per (model, context size, cache set). Index 0/1 are unused: a
@@ -3998,7 +4116,7 @@ struct VerifySet {
   int limit = 0;
 };
 
-static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t>,
+static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t, uint64_t>,
                 std::unique_ptr<VerifySet>>
     g_verify_runtimes;
 
@@ -4025,8 +4143,11 @@ build_verify_runtime(const Gemma4Model& m, uint64_t n_ctx, int rows,
                      const planner::KvCacheSession& session) {
   diag::spec_diag_note_runtime_build();
   auto rt = std::make_unique<VerifyRuntime>();
-  rt->graph = build_decode_graph(
-      m, device_decode_spec(DecodeConsumer::Argmax, uint64_t(rows)));
+  DecodeGraphSpec spec =
+      device_decode_spec(DecodeConsumer::Argmax, uint64_t(rows));
+  const bool steers = session.style_layer >= 0 && !session.style_vector.empty();
+  if (steers) spec.steer_layer = session.style_layer;
+  rt->graph = build_decode_graph(m, spec);
   if (rt->graph.nodes.empty()) return nullptr;
 
   auto snap = planner::CpuResourceProvider::snapshot();
@@ -4054,6 +4175,11 @@ build_verify_runtime(const Gemma4Model& m, uint64_t n_ctx, int rows,
       std::map<planner::BackendTag, planner::Backend*>{
           {planner::BackendTag::Sonic, rt->cuda.get()}});
   route_host_tasks(*rt->exec, rt->plan, *rt->cpu);
+  if (steers) {
+    if (!rt->cuda->set_steer(session.style_vector)) return nullptr;
+    rt->steers = true;
+    rt->steer_in = encode_steer(session.style_vector);
+  }
   return rt;
 }
 
@@ -4070,11 +4196,13 @@ static bool warm_verify_runtime(VerifyRuntime& rt, uint64_t n_ctx, int rows,
                                 bool capture) {
   const uint64_t warm_pos = n_ctx > uint64_t(rows) ? n_ctx - uint64_t(rows) : 0;
   const std::vector<uint64_t> warm(size_t(rows), 0);
-  const std::vector<sx::Bytes> warm_in{encode_i64(0), encode_i64(warm_pos)};
+  std::vector<sx::Bytes> warm_in{encode_i64(0), encode_i64(warm_pos)};
+  rt.add_steer(warm_in);
   auto warm_run = [&]() {
     return bool(rt.exec->execute(rt.plan, rt.snap, warm_in));
   };
-  const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(0)};
+  std::vector<sx::Bytes> in{encode_i64(0), encode_i64(0)};
+  rt.add_steer(in);
   auto run = [&]() {
     return bool(rt.exec->execute(rt.plan, rt.snap, in));
   };
@@ -4247,7 +4375,8 @@ static VerifySet* get_verify_set(const Gemma4Model& m, uint64_t n_ctx,
   // verifies through the prefill path (verify_step_reckless).
   if (spec_mode() == SpecMode::Reckless) return nullptr;
   if (spec_mode() == SpecMode::Off && !g_spec_pricing) return nullptr;
-  const auto key = std::make_tuple(&m, n_ctx, session.cache_id);
+  const auto key = std::make_tuple(&m, n_ctx, session.cache_id,
+                                   session_style_id(&session));
   {
     std::lock_guard<std::mutex> lk(g_registry_mutex);
     auto it = g_verify_runtimes.find(key);
@@ -4291,7 +4420,8 @@ static VerifyRuntime* get_verify_runtime(const Gemma4Model& m, uint64_t n_ctx,
 static int verify_width_limit(const Gemma4Model& m, uint64_t n_ctx,
                               const planner::KvCacheSession& session) {
   if (!session.caches || session.cache_id == 0) return 0;
-  const auto key = std::make_tuple(&m, n_ctx, session.cache_id);
+  const auto key = std::make_tuple(&m, n_ctx, session.cache_id,
+                                   session_style_id(&session));
   std::lock_guard<std::mutex> lk(g_registry_mutex);
   const auto it = g_verify_runtimes.find(key);
   return it == g_verify_runtimes.end() ? 0 : it->second->limit;
@@ -4312,7 +4442,7 @@ static bool verify_priceable(const Gemma4Model& m, uint64_t n_ctx, int rows,
 // built only when speculation runs — but prefix-reuse identity holds regardless
 // of the spec mode, so this path keeps its own set, keyed the same way and
 // built lazily for the widths it actually visits (16 rows and a remainder).
-static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t, int>,
+static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t, uint64_t, int>,
                 std::unique_ptr<VerifyRuntime>>
     g_repro_verify_runtimes;
 
@@ -4321,7 +4451,7 @@ static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t, int>,
 // verify set it has no capture, so each call stages its own token and position.
 // Keeping it here rather than building one per prefill keeps the pp number a
 // measurement of the arithmetic, not of a graph build.
-static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t>,
+static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t, uint64_t>,
                 std::unique_ptr<DecodeRuntime>>
     g_repro_eval_runtimes;
 
@@ -4331,7 +4461,8 @@ static VerifyRuntime* get_repro_verify_runtime(
   if (!ensure_device_ready(m)) return nullptr;
   if (rows < 2 || rows > planner::kMaxVerifyRows) return nullptr;
   if (!session.caches || session.cache_id == 0) return nullptr;
-  const auto key = std::make_tuple(&m, n_ctx, session.cache_id, rows);
+  const auto key = std::make_tuple(&m, n_ctx, session.cache_id,
+                                   session_style_id(&session), rows);
   {
     std::lock_guard<std::mutex> lk(g_registry_mutex);
     auto it = g_repro_verify_runtimes.find(key);
@@ -4363,7 +4494,7 @@ static VerifyRuntime* get_repro_verify_runtime(
 // grammar-driven and independent of speculation, so this set is its own, keyed
 // like the others and built for every reachable width on first use (the first
 // batch pays the replay, not the build).
-static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t>,
+static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t, uint64_t>,
                 std::unique_ptr<VerifySet>>
     g_forced_verify_runtimes;
 
@@ -4375,7 +4506,8 @@ static VerifyRuntime* get_forced_verify_runtime(
   if (!session.caches || session.cache_id == 0) return nullptr;
   const int bucket = verify_bucket_of(rows);
   if (bucket == 0) return nullptr;
-  const auto key = std::make_tuple(&m, n_ctx, session.cache_id);
+  const auto key = std::make_tuple(&m, n_ctx, session.cache_id,
+                                   session_style_id(&session));
   {
     std::lock_guard<std::mutex> lk(g_registry_mutex);
     auto it = g_forced_verify_runtimes.find(key);
@@ -4553,7 +4685,8 @@ static DecodeRuntime* spec_resolve_probe(
     // The probe's verify set is only a measurement; drop it so a decision for
     // off does not keep a second set of device buffers alive.
     std::lock_guard<std::mutex> lk(g_registry_mutex);
-    g_verify_runtimes.erase(std::make_tuple(&m, n_ctx, verify_cache_id));
+    g_verify_runtimes.erase(std::make_tuple(&m, n_ctx, verify_cache_id,
+                                            session_style_id(session)));
   }
   // No runtime is rebuilt here. Runtimes built while the mode was undecided
   // already carry the speculative program (build_decode_runtime), and the
@@ -4633,7 +4766,8 @@ bool decode_steps_spine_cuda(const Gemma4Model& m,
   // It is built once per cache identity and bound to the session's cache from
   // construction (B0.2: no allocate-then-replace).
   if (session.cache_id == 0) return fail("session cache has no identity");
-  const DecodeKey key{&m, session.n_ctx, session.cache_id};
+  const DecodeKey key{&m, session.n_ctx, session.cache_id,
+                      session_style_id(&session)};
   FedRuntime* fr = nullptr;
   {
     std::lock_guard<std::mutex> lk(g_registry_mutex);
@@ -4659,8 +4793,9 @@ bool decode_steps_spine_cuda(const Gemma4Model& m,
     if (!fr->rt->cuda->seed_token(tokens[i]) ||
         !fr->rt->cuda->set_pos(start_pos + i))
       return fail("device slot staging failed");
-    const std::vector<sx::Bytes> in{encode_i64(tokens[i]),
-                                    encode_i64(start_pos + i)};
+    std::vector<sx::Bytes> in{encode_i64(tokens[i]),
+                              encode_i64(start_pos + i)};
+    fr->rt->add_steer(in);
     auto res = fr->rt->exec->execute(fr->rt->plan, fr->rt->snap, in);
     if (!res) {
       std::cerr << "[spec] decode_steps: step " << i
@@ -4772,10 +4907,15 @@ static bool verify_step_reckless(const Gemma4Model& m,
   // A batch segment must be a wrap-free run inside the sliding-window ring
   // (generation's prefill splits there). A verify that would straddle a ring
   // boundary runs the plain decode steps instead: same rows, same positions,
-  // the strict path's arithmetic.
+  // the strict path's arithmetic. A steered session likewise stays on the
+  // strict path: the reckless prefill graph carries no Steer node (and its
+  // runtime registry is not keyed by the steering digest), while the decode
+  // graph the strict steps run is.
   const uint64_t chunk = m.config.sliding_window > 0
                              ? m.config.sliding_window
                              : kDefaultPrefillChunk;
+  if (session.style_layer >= 0 && !session.style_vector.empty())
+    return decode_steps_spine_cuda(m, tokens, start_pos, session, out);
   if (m.config.sliding_window > 0 &&
       (start_pos % chunk) + uint64_t(rows) > chunk)
     return decode_steps_spine_cuda(m, tokens, start_pos, session, out);
@@ -4872,7 +5012,8 @@ static bool run_verify_step(const Gemma4Model& m,
     if (!rt->cuda->set_prefill_tokens(staged) ||
         !rt->cuda->set_verify_pos(start_pos, capacity))
       return fail("staging failed");
-    const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(start_pos)};
+    std::vector<sx::Bytes> in{encode_i64(0), encode_i64(start_pos)};
+    rt->add_steer(in);
     auto res = rt->exec->execute(rt->plan, rt->snap, in);
     if (!res) {
       std::cerr << tag << "execute failed: " << res.error().message << "\n";
@@ -5499,6 +5640,7 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
       std::vector<sx::Bytes> in;
       in.push_back(encode_i64(token));
       in.push_back(encode_i64(pos));
+      rt->add_steer(in);
       rt->cuda->set_pos(pos);
       auto res = rt->exec->execute(rt->plan, rt->snap, in);
       ok = bool(res) && !res->outputs.empty() &&
@@ -5612,6 +5754,7 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
       std::vector<sx::Bytes> in;
       in.push_back(encode_i64(token));
       in.push_back(encode_i64(pos));
+      rt->add_steer(in);
 
       // Stage the position into the device slot read by RoPE / KV-append /
       // attention (Phase 3.2 B4 / CUDA Graphs): the kernels read it in-kernel.
@@ -5832,6 +5975,72 @@ std::optional<planner::PlanRunRecord> record_prefill_plan(
   (void)exec.execute(*plan, *snap, in);
   return rec.finish();
 }
+
+// The CUDA residual read (plan.h): one prefill segment over a throwaway cache,
+// the same lowering and kernels generation's segments use, whose graph stops at
+// `layer` so the segment's output is that layer's residual rows.
+bool capture_residual_spine_cuda(const Gemma4Model& m,
+                                 std::span<const uint64_t> tokens, int64_t layer,
+                                 std::span<float> out) {
+  if (m.weights.blocks.empty() || tokens.empty()) return false;
+  if (layer < 0 || uint64_t(layer) >= m.weights.blocks.size()) {
+    std::cerr << "[residual-cuda] layer " << layer << " outside the model ("
+              << m.weights.blocks.size() << " blocks)\n";
+    return false;
+  }
+  const uint64_t n = tokens.size();
+  const uint64_t d = m.config.embedding_length;
+  const uint64_t chunk = m.config.sliding_window > 0
+                             ? m.config.sliding_window
+                             : kDefaultPrefillChunk;
+  if (n > chunk) {
+    std::cerr << "[residual-cuda] " << n
+              << " tokens do not fit one wrap-free segment (" << chunk << ")\n";
+    return false;
+  }
+  if (out.size() < n * d) {
+    std::cerr << "[residual-cuda] output too small: " << out.size() << " < "
+              << n * d << "\n";
+    return false;
+  }
+  for (uint64_t t : tokens)
+    if (t >= m.config.vocab_size) return false;
+  if (!ensure_device_ready(m)) return false;
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
+  GraphIr ir = emit_prefill_ir(recipe_for(m), n, /*dynamic_extent=*/false,
+                               /*steer_layer=*/-1, /*stop_layer=*/layer);
+  planner::Graph graph = lower_graph(
+      ir, planner::IrPassPhase::Prefill,
+      quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled() &&
+          n >= uint64_t(quant::cuda::mmq_min_n()),
+      /*dynamic_extent=*/0, /*skip_kv_append_fusion=*/false,
+      /*fuse_silu_mul=*/numerics_profile() == NumericsProfile::Standard);
+  if (graph.nodes.empty()) return false;
+  auto snap = planner::CpuResourceProvider::snapshot();
+  if (!snap) return false;
+  planner::AnalyticalCpuCostModel cost(*snap);
+  auto plan = planner::plan_execution(graph, *snap, cost);
+  if (!plan) return false;
+  // A straight, wrap-free run big enough for the segment on every cache.
+  uint64_t n_ctx = n;
+  for (uint32_t l = 0; l < m.config.n_layer_kv(); ++l)
+    n_ctx = std::max<uint64_t>(n_ctx, m.config.layer_config(l).sliding_window);
+  planner::SonicCudaBackend cuda(kv_cache_spec(m.config), graph, n_ctx);
+  cuda.bind_model(m);
+  planner::SonicBackend cpu(m, graph);
+  planner::RuntimeExecutor exec(
+      std::map<planner::BackendTag, planner::Backend*>{
+          {planner::BackendTag::Sonic, &cuda}});
+  route_host_tasks(exec, *plan, cpu);
+  if (!cuda.set_prefill_tokens(tokens) || !cuda.set_pos(0)) return false;
+  const std::vector<sx::Bytes> in{encode_tokens(tokens), encode_i64(0)};
+  auto res = exec.execute(*plan, *snap, in, /*segment_extent=*/n);
+  if (!res || res->outputs.empty()) return false;
+  const sx::Bytes& hidden = res->outputs[0];
+  if (hidden.size() < n * d * sizeof(float)) return false;
+  std::memcpy(out.data(), hidden.data(), n * d * sizeof(float));
+  return true;
+}
 #else
 uint64_t generate_spine_cuda(const Gemma4Model&, uint64_t, uint64_t,
                              std::span<int64_t>, uint64_t,
@@ -5919,6 +6128,11 @@ std::optional<planner::PlanRunRecord> record_prefill_plan(const Gemma4Model&,
 }
 
 std::string cuda_device_identity() { return "unknown"; }
+
+bool capture_residual_spine_cuda(const Gemma4Model&, std::span<const uint64_t>,
+                                 int64_t, std::span<float>) {
+  return false;  // built without CUDA: no device prefill to read
+}
 #endif
 
 // The RAII release for one cache set (defined here, outside the CUDA guard:
@@ -5980,9 +6194,12 @@ static std::unique_ptr<DecodeRuntime> build_eval_runtime(
     const Gemma4Model& m, uint64_t n_ctx, bool raw_logits,
     const planner::KvCacheSession* session = nullptr) {
   auto rt = std::make_unique<DecodeRuntime>();
-  rt->graph = build_decode_graph(
-      m, device_decode_spec(raw_logits ? DecodeConsumer::PrecapLogits
-                                       : DecodeConsumer::Logits));
+  DecodeGraphSpec spec = device_decode_spec(
+      raw_logits ? DecodeConsumer::PrecapLogits : DecodeConsumer::Logits);
+  const bool steers = session && session->style_layer >= 0 &&
+                      !session->style_vector.empty();
+  if (steers) spec.steer_layer = session->style_layer;
+  rt->graph = build_decode_graph(m, spec);
   auto s = planner::CpuResourceProvider::snapshot();
   if (!s) return nullptr;
   rt->snap = std::move(*s);
@@ -6006,6 +6223,11 @@ static std::unique_ptr<DecodeRuntime> build_eval_runtime(
       std::map<planner::BackendTag, planner::Backend*>{
           {planner::BackendTag::Sonic, rt->cuda.get()}});
   route_host_tasks(*rt->exec, rt->plan, *rt->cpu);
+  if (steers) {
+    if (!rt->cuda->set_steer(session->style_vector)) return nullptr;
+    rt->steers = true;
+    rt->steer_in = encode_steer(session->style_vector);
+  }
   return rt;
 }
 
@@ -6016,7 +6238,8 @@ static DecodeRuntime* get_repro_eval_runtime(
     const Gemma4Model& m, uint64_t n_ctx,
     const planner::KvCacheSession& session) {
   if (!session.caches || session.cache_id == 0) return nullptr;
-  const auto key = std::make_tuple(&m, n_ctx, session.cache_id);
+  const auto key = std::make_tuple(&m, n_ctx, session.cache_id,
+                                   session_style_id(&session));
   {
     std::lock_guard<std::mutex> lk(g_registry_mutex);
     auto it = g_repro_eval_runtimes.find(key);
@@ -6096,7 +6319,8 @@ static bool prefill_in_decode_arithmetic(
       if (!rt->cuda->set_prefill_tokens(prompt.subspan(off, rows)) ||
           !rt->cuda->set_verify_pos(pos, int(rows)))
         return false;
-      const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(pos)};
+      std::vector<sx::Bytes> in{encode_i64(0), encode_i64(pos)};
+      rt->add_steer(in);
       auto res = rt->exec->execute(rt->plan, rt->snap, in);
       if (!res) return false;
       // The readback-free path has no natural completion point of its own;
@@ -6116,8 +6340,9 @@ static bool prefill_in_decode_arithmetic(
   if (!eval->cuda->seed_token(prompt[size_t(n - 1)]) ||
       !eval->cuda->set_pos(last_pos))
     return false;
-  const std::vector<sx::Bytes> in{encode_i64(prompt[size_t(n - 1)]),
-                                  encode_i64(last_pos)};
+  std::vector<sx::Bytes> in{encode_i64(prompt[size_t(n - 1)]),
+                            encode_i64(last_pos)};
+  eval->add_steer(in);
   auto res = eval->exec->execute(eval->plan, eval->snap, in);
   if (!res || res->outputs.empty()) return false;
   const sx::Bytes& lo = res->outputs[0];
@@ -6395,8 +6620,16 @@ static uint64_t prefill_decode_cuda_impl(
       auto seg = std::make_unique<PrefillSegment>();
       {
         Phase _b("prefill:segment_build_graph", phase_timing);
-        GraphIr seg_ir = emit_prefill_ir(recipe_for(m), extent,
-                                         /*dynamic_extent=*/symbolic_plans);
+        // A steering session's segments carry the Steer node after its block,
+        // so the prompt's KV is written by the same arithmetic the decode
+        // steps continue from.
+        GraphIr seg_ir = emit_prefill_ir(
+            recipe_for(m), extent,
+            /*dynamic_extent=*/symbolic_plans,
+            (session && session->style_layer >= 0 &&
+             !session->style_vector.empty())
+                ? session->style_layer
+                : -1);
         // The interior variant's output is read by nothing: the declaration
         // lets the compiler keep only the writes (KV appends, state scans).
         if (interior && (!seg_ir.module ||
@@ -6457,6 +6690,12 @@ static uint64_t prefill_decode_cuda_impl(
       // prefill backend has shared both through share_caches from the start.
       seg->cuda->share_caches(*rt->cuda);
       seg->cuda->bind_model(m);
+      // A steering segment's Steer node reads the backend's own slot: stage the
+      // session's vector before any warm-up or capture bakes the address in.
+      if (rt->steers && !seg->cuda->set_steer(session->style_vector)) {
+        std::cerr << "[prefill-cuda] segment steering upload failed\n";
+        return nullptr;
+      }
       seg->exec = std::make_unique<planner::RuntimeExecutor>(
           std::map<planner::BackendTag, planner::Backend*>{
               {planner::BackendTag::Sonic, seg->cuda.get()}});
@@ -6520,6 +6759,7 @@ static uint64_t prefill_decode_cuda_impl(
           std::vector<sx::Bytes> in;
           in.push_back(encode_tokens(first_chunk));
           in.push_back(encode_i64(start_pos));
+          rt->add_steer(in);
           std::expected<planner::ExecutionResult, planner::RuntimeError> res;
           {
             Phase _w("prefill:capture_warmup", phase_timing);
@@ -6534,6 +6774,7 @@ static uint64_t prefill_decode_cuda_impl(
                 std::vector<sx::Bytes> cin;
                 cin.push_back(encode_tokens(first_chunk));
                 cin.push_back(encode_i64(start_pos));
+                rt->add_steer(cin);
                 auto cres = full->exec->execute(full->plan, snap, cin,
                                                 /*segment_extent=*/chunk);
                 return cres.has_value();
@@ -6636,6 +6877,7 @@ static uint64_t prefill_decode_cuda_impl(
       std::vector<sx::Bytes> in;
       in.push_back(encode_tokens(prompt.subspan(off, nseg)));
       in.push_back(encode_i64(pos));
+      rt->add_steer(in);
       auto res = seg->exec->execute(seg->plan, snap, in,
                                     /*segment_extent=*/nseg);
       if (!res) {
@@ -6706,6 +6948,7 @@ static uint64_t prefill_decode_cuda_impl(
       std::vector<sx::Bytes> in;
       in.push_back(encode_i64(p));
       in.push_back(encode_i64(pos));
+      rt->add_steer(in);
       auto res = rt->exec->execute(rt->plan, snap, in);
       if (!res || res->outputs.empty()) return 0;
       const sx::Bytes& lo = res->outputs[0];

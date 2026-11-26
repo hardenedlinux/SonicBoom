@@ -231,8 +231,11 @@ Recipe recipe_for(const Gemma4Model& m);
 planner::Graph build_decode_graph(const Recipe& recipe,
                                   const DecodeGraphSpec& spec);
 // One prefill segment of `n` positions, lowered with no passes; over a dynamic
-// extent bound to `n` when `dynamic_extent`.
+// extent bound to `n` when `dynamic_extent`. `steer_layer` / `stop_layer` follow
+// emit_prefill_ir: >= 0 steers after / ends at that block.
 planner::Graph build_prefill_graph(const Recipe& recipe, uint64_t n,
-                                   bool dynamic_extent = false);
+                                   bool dynamic_extent = false,
+                                   int64_t steer_layer = -1,
+                                   int64_t stop_layer = -1);
 
 } // namespace sonicboom::model

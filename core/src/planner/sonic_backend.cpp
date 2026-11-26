@@ -507,6 +507,15 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       ok = !b.empty() && nn::add_bias(f32(inputs[0]), b, f32_mut(out));
       break;
     }
+    case OpKind::Steer: {
+      // inputs[0] is the residual ([width] when decoding, [n, width] when
+      // prefilling) and inputs[1] the session's [width] steering vector,
+      // broadcast over the rows: the same add-bias kernel AddBias uses, fed
+      // from the graph input instead of a weight slot.
+      const std::span<const float> v = f32(inputs[1]);
+      ok = !v.empty() && nn::add_bias(f32(inputs[0]), v, f32_mut(out));
+      break;
+    }
     case OpKind::Mul: {
       ok = nn::mul(f32(inputs[0]), f32(inputs[1]), f32_mut(out));
       break;

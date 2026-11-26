@@ -2410,6 +2410,18 @@ void boom_llm_model_free(boom_llm_model *model) { delete model; }
 
 void boom_device_trim(void) { model::device_trim(); }
 
+boom_status boom_llm_model_embedding(const boom_llm_model *model,
+                                     uint64_t *width_out,
+                                     boom_error **err_out) {
+  return guard(
+      [&]() -> boom_status {
+        if (!model || !width_out) return fail_arg(err_out);
+        *width_out = model->bundle->model.config.embedding_length;
+        return BOOM_OK;
+      },
+      err_out);
+}
+
 boom_status boom_llm_model_arch(const boom_llm_model *model, char *out, size_t cap,
                             size_t *len_out, boom_error **err_out) {
   return guard(
@@ -3600,6 +3612,113 @@ boom_status boom_llm_session_constraint_state(const boom_llm_session *session,
              (session->grammar->finished() || session->grammar->accepting()))
                 ? 1
                 : 0;
+        return BOOM_OK;
+      },
+      err_out);
+}
+
+// --- Style steering ---------------------------------------------------------
+
+namespace {
+
+// A steering change (set or clear) retires the session's prompt state: the KV
+// rows and the recurrent state were written by the old graph, so the next
+// prefill must start from position 0. The cache itself stays allocated (runtimes
+// keyed by the new digest bind it); only the history is dropped. Callers hold
+// the execution lock.
+void invalidate_session_prefix(boom_llm_session &s) {
+  s.kv.filled_tokens.clear();
+  s.prefill_done = false;
+  s.pending = -1;
+  s.token = 0;
+  s.pos = 0;
+  s.sampled_started = false;
+  s.sampled_history.clear();
+  // The stored first-token logits belong to the abandoned prompt; the next
+  // prefill overwrites them, and decode refuses to run before that prefill.
+  s.prompt.clear();
+  s.prev_prompt.clear();
+}
+
+}  // namespace
+
+boom_status boom_llm_session_set_steering(boom_llm_session *session,
+                                          int32_t layer, const float *vector,
+                                          size_t n, boom_error **err_out) {
+  return guard(
+      [&]() -> boom_status {
+        if (!session || !vector || n == 0) return fail_arg(err_out);
+        SessionRef ref(session);
+        if (!ref) return fail_freed(err_out);
+        std::lock_guard<std::recursive_mutex> exec_lock(
+            model::execution_mutex());
+        const auto &m = session->bundle->model;
+        const uint64_t d = m.config.embedding_length;
+        if (uint64_t(n) != d) {
+          set_error(err_out, BOOM_ERRKIND_BINDING,
+                    "steering vector length does not match the model's "
+                    "embedding length (see boom_llm_model_embedding)");
+          return BOOM_ERR_BINDING;
+        }
+        if (layer < 0 || uint64_t(layer) >= m.weights.blocks.size()) {
+          set_error(err_out, BOOM_ERRKIND_RUNTIME,
+                    "steering layer is outside the model's blocks");
+          return BOOM_ERR_UNSUPPORTED;
+        }
+        // The same steering the session already holds changes nothing, so the
+        // prompt prefix it has computed stays valid: repeated requests under
+        // one style keep their reuse.
+        if (session->kv.style_layer == layer &&
+            session->kv.style_vector.size() == n &&
+            std::equal(session->kv.style_vector.begin(),
+                       session->kv.style_vector.end(), vector)) {
+          return BOOM_OK;
+        }
+        session->kv.style_layer = layer;
+        session->kv.style_vector.assign(vector, vector + n);
+        session->kv.style_digest = planner::KvCacheSession::style_digest_of(
+            layer, std::span<const float>(session->kv.style_vector));
+        invalidate_session_prefix(*session);
+        return BOOM_OK;
+      },
+      err_out);
+}
+
+void boom_llm_session_clear_steering(boom_llm_session *session) {
+  if (!session) return;
+  SessionRef ref(session);
+  if (!ref) return;
+  std::lock_guard<std::recursive_mutex> exec_lock(model::execution_mutex());
+  if (session->kv.style_layer < 0 && session->kv.style_vector.empty()) return;
+  session->kv.style_layer = -1;
+  session->kv.style_vector.clear();
+  session->kv.style_digest = 0;
+  invalidate_session_prefix(*session);
+}
+
+boom_status boom_llm_residual_capture(const boom_llm_model *model,
+                                      const boom_token *tokens, size_t n,
+                                      int32_t layer, float *out, size_t cap,
+                                      size_t *n_out, boom_error **err_out) {
+  return guard(
+      [&]() -> boom_status {
+        if (!model || (n > 0 && !tokens) || !n_out) return fail_arg(err_out);
+        const auto &m = model->bundle->model;
+        const size_t need = n * size_t(m.config.embedding_length);
+        *n_out = need;
+        if (out == nullptr || cap < need) {
+          set_error(err_out, BOOM_ERRKIND_BINDING,
+                    "boom_llm_residual_capture: buffer too small (see *n_out)");
+          return BOOM_ERR_BINDING;
+        }
+        std::vector<uint64_t> ids(tokens, tokens + n);
+        if (!model::capture_residual_spine_cuda(m, ids, layer,
+                                                std::span<float>(out, need))) {
+          set_error(err_out, BOOM_ERRKIND_RUNTIME,
+                    "residual capture failed (no device, empty model, layer "
+                    "outside the model, or a prompt past one prefill segment)");
+          return BOOM_ERR_INTERNAL;
+        }
         return BOOM_OK;
       },
       err_out);

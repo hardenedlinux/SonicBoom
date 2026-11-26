@@ -23,6 +23,7 @@
              (sonicboom serve sessions)
              (sonicboom serve engine)
              (sonicboom serve residency)
+             (sonicboom serve styles)
              (sonicboom serve openai))
 
 (define (msg role content) `(("role" . ,role) ("content" . ,content)))
@@ -395,7 +396,7 @@
                    (list (cons 'text "prompt")))
    #:create-session (lambda (m) (vector (list 100 104 101 102 103 200)))
    #:free-session (lambda (session) #t)
-   #:prefill (lambda (session toks constraint) 0)
+   #:prefill (lambda (session toks constraint style) 0)
    #:step (lambda (session sampler constraint)
             (let ((rest (vector-ref session 0)))
               (if (null? rest)
@@ -559,6 +560,120 @@
   (list "gemma" #t)
   (let ((obj (model-object "g" 'gemma 0)))
     (list (assoc-ref obj "family") (assoc-ref obj "loaded"))))
+
+;;; --- Style assets ----------------------------------------------------------
+
+(test-equal "a card-only style parses"
+  (list "dry" 1 "g" "Write plainly." 0 #f)
+  (let ((s (parse-style-create
+            '(("id" . "dry") ("model" . "g")
+              ("system" . "Write plainly.")))))
+    (list (assq-ref s 'id) (assq-ref s 'version) (assq-ref s 'model)
+          (assq-ref s 'system) (length (assq-ref s 'exemplars))
+          (assq-ref s 'layer))))
+(test-assert "a style with no card and no vector is rejected"
+  (catch 'style-invalid
+    (lambda ()
+      (parse-style-create '(("id" . "x") ("model" . "g")))
+      #f)
+    (lambda (key param message) #t)))
+(test-assert "a bad style id is rejected"
+  (catch 'style-invalid
+    (lambda ()
+      (parse-style-create
+       '(("id" . "a/b") ("model" . "g") ("system" . "x")))
+      #f)
+    (lambda (key param message) #t)))
+
+(define style-registry (make-style-registry))
+(style-create!
+ style-registry
+ '((id . "dry") (version . 3) (model . "g") (system . "Write plainly.")
+   (exemplars . (((prompt . "Say hi.") (reply . "Hello.")))))
+ gemma)
+
+(test-equal "the registry lists and serializes the style"
+  (list "dry" 3 "g" 'null #f 1)
+  (let* ((styles (style-list style-registry))
+         (json (style-json (car styles))))
+    (list (assoc-ref json "id") (assoc-ref json "version")
+          (assoc-ref json "model") (assoc-ref json "layer")
+          (assoc-ref json "vector") (assoc-ref json "exemplars"))))
+
+(define dry-choice
+  (resolve-style-choice style-registry
+                        '(("id" . "dry") ("version" . 3) ("alpha" . 1.0))
+                        "g" 1.0))
+(test-equal "the resolved card is the system text and one user/assistant pair"
+  (list "system" "user" "assistant")
+  (map (lambda (m) (assoc-ref m "role")) (car dry-choice)))
+(test-equal "a card-only style carries no steering"
+  (list #f #f) (list (cadr dry-choice) (caddr dry-choice)))
+(test-assert "a wrong version is refused"
+  (catch 'style-version-mismatch
+    (lambda ()
+      (resolve-style-choice style-registry
+                            '(("id" . "dry") ("version" . 2)) "g" 1.0)
+      #f)
+    (lambda (key id want got) #t)))
+(test-assert "a wrong model is refused"
+  (catch 'style-model-mismatch
+    (lambda ()
+      (resolve-style-choice style-registry '(("id" . "dry")) "q" 1.0)
+      #f)
+    (lambda (key id want got) #t)))
+(test-assert "an unknown style is refused"
+  (catch 'style-not-found
+    (lambda () (resolve-style-choice style-registry '(("id" . "no")) "g" 1.0) #f)
+    (lambda (key id) #t)))
+
+(let* ((plain (engine-generate
+               (make-engine (list gemma))
+               (make-chat-request #:model "g"
+                                  #:messages (list (msg "user" "hello")))
+               (lambda (kind . args) #t)))
+       (styled (engine-generate
+                (make-engine (list gemma))
+                (chat-request-with-style
+                 (make-chat-request #:model "g"
+                                    #:messages (list (msg "user" "hello")))
+                 dry-choice)
+                (lambda (kind . args) #t))))
+  (test-assert "the card is a prefix: the styled prompt is longer"
+    (> (result-prompt-tokens styled) (result-prompt-tokens plain)))
+  (test-equal "the styled request still answers its own turn"
+    "stop" (result-finish-reason styled)))
+
+;; A steering style reaches prefill as (layer . vector): the engine passes it
+;; through untouched, the backend installs it on the session.
+(define seen-style #f)
+(define spy-backend
+  (make-backend
+   #:name "spy"
+   #:load-model (lambda (config) 'handle)
+   #:model-info (lambda (h) '((id . "spy") (family . gemma)
+                              (context-length . 64) (eos-tokens . ())))
+   #:tokenize (lambda (model text) '(1 2))
+   #:detokenize (lambda (model tokens) "x")
+   #:render-chat (lambda (model messages tools choice) (list (cons 'text "p")))
+   #:create-session (lambda (model) 'session)
+   #:free-session (lambda (session) #f)
+   #:prefill (lambda (session tokens constraint style)
+               (set! seen-style style) 0)
+   #:step (lambda (session sampler constraint) #f)))
+
+(engine-generate
+ (make-engine (list (load-model spy-backend '())))
+ (chat-request-with-style
+  (make-chat-request #:model "spy" #:messages (list (msg "user" "hi")))
+  (list '() 3 (make-bytevector 8 0)))
+ (lambda (kind . args) #t))
+(test-equal "a steering style reaches prefill as (layer . vector)"
+  (list 3 (make-bytevector 8 0)) (list (car seen-style) (cdr seen-style)))
+
+(test-assert "delete removes a style" (style-delete! style-registry "dry"))
+(test-assert "a second delete reports nothing to remove"
+  (not (style-delete! style-registry "dry")))
 
 (define failures (test-runner-fail-count (test-runner-current)))
 (test-end "sonicboom-serve-units")

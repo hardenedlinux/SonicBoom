@@ -42,6 +42,9 @@ The prefix `boom_llm_` keeps these functions apart from the S-Expr graph API
 | `step` | `boom_llm_decode` (`max_tokens` 1) | sample, append, return the token; repeated calls continue the same stream |
 | constraint hook | `boom_llm_session_set_grammar`, `boom_llm_session_set_json_schema`, `boom_llm_session_clear_grammar` | installed on the session, restarted by each prefill |
 | `backend-stats` | `boom_llm_model_get_stats` | prefill / reuse / step counters |
+| `model-embedding` (optional) | `boom_llm_model_embedding` | residual width: the steering vector length and the capture row width |
+| `residual-capture` (optional) | `boom_llm_residual_capture` | residual rows of a text at one block, tooling for style vectors |
+| `prefill` style argument (optional) | `boom_llm_session_set_steering`, `boom_llm_session_clear_steering` | one fixed residual vector added after a block, set once per style change |
 
 Chat templates stay out of the ABI on purpose: GGUF carries the template as
 Jinja text (`tokenizer.chat_template`), which SonicBoom does not interpret; the
@@ -155,6 +158,23 @@ void boom_llm_sampler_free(boom_llm_sampler *sampler);
 boom_status boom_llm_step(boom_llm_session *session, boom_llm_sampler *sampler,
                       const boom_llm_constraint *constraint, boom_token *token_out,
                       boom_error **err_out);
+
+/* Style steering (the appending subset the service uses). The vector is added
+ * to the residual stream after block `layer`, for the rest of the session's
+ * life; n must equal the model's embedding length. Any change other than
+ * setting the vector already held retires the session's prompt prefix. */
+boom_status boom_llm_model_embedding(const boom_llm_model *model,
+                                 uint64_t *width_out, boom_error **err_out);
+boom_status boom_llm_session_set_steering(boom_llm_session *session, int32_t layer,
+                                      const float *vector, size_t n,
+                                      boom_error **err_out);
+void boom_llm_session_clear_steering(boom_llm_session *session);
+/* The residual stream after block `layer` of `tokens`, position-major f32,
+ * n * embedding_length floats; two-call sizing, on a throwaway cache. */
+boom_status boom_llm_residual_capture(const boom_llm_model *model,
+                                  const boom_token *tokens, size_t n, int32_t layer,
+                                  float *out, size_t cap, size_t *n_out,
+                                  boom_error **err_out);
 ```
 
 ## 3. Semantics
@@ -207,6 +227,20 @@ boom_status boom_llm_step(boom_llm_session *session, boom_llm_sampler *sampler,
   all-ones buffer, so it is bit-identical to the unmasked path. Without a CUDA device the CPU fallback recomputes the mask per token
   and re-prefills the history (O(n^2)) — the CPU reference path's price, not
   the performance target.
+- **Style steering.** A session may add one fixed f32 vector of
+  `embedding_length` values to the residual stream after a block
+  (`boom_llm_session_set_steering`); the service's style assets derive it as
+  the mean residual difference between two text sets, which
+  `boom_llm_residual_capture` reads out. The vector is an engine feature — the
+  ABI only injects it. Setting the vector the session already holds is a
+  no-op, so repeated requests under one style keep their prompt prefix; any
+  other change retires the prefix (the next `prefill` starts at position 0).
+  A steered session's generation is deterministic per (prompt, seed, vector)
+  and identical with speculative decoding enabled or not: speculative verify
+  graphs carry no injection, so a steered session takes strict decode steps.
+  `boom_llm_residual_capture` runs one prefill on a throwaway cache and
+  touches no session; it needs a device-backed build and a text that fits one
+  prefill segment.
 - **Context.** `prefill` or `step` past `n_ctx` returns `BOOM_ERR_CONTEXT`
   and leaves the session unchanged.
 
@@ -251,6 +285,12 @@ plus the `(sonicboom inference)` wrappers):
   stop token ended the reply) becomes `finish_reason: stop`.
 - a procedure constraint `(candidates) -> candidates` is applied by the mock
   backend's sampler on the host.
+- style steering is `set-steering!` / `clear-steering!` on the session (the
+  serve backend calls them from `prefill`'s style argument), with
+  `model-embedding` and `residual-capture` behind the backend's optional
+  `embedding` / `residual-capture` hooks; `(sonicboom serve styles)` builds
+  the vectors and the HTTP layer resolves `sonicboom.style` against the
+  registry (see `docs/serve-openai.md`, "Style assets").
 
 ## 6. What the core provides
 
@@ -261,6 +301,7 @@ plus the `(sonicboom inference)` wrappers):
 | logit mask before sampling | the session's compiled grammar; the argmax / sampled-select kernel applies its bitmap |
 | tokenizer and EOS ids from GGUF metadata | `boom_llm_tokenize(_ex)`, `boom_llm_detokenize`, `boom_llm_model_eos` |
 | model introspection (not used by the serving path) | `boom_llm_model_info` / `boom_image_model_info`: a JSON document read from the model's own files (header-level), with the architecture, parameter count, quantization mixture, context length, vocabulary size and capability flags; the Guile `model-info` / `image-model-info` bindings return it parsed |
+| style steering and residual capture | a `steer` node the prefill and decode graphs carry after block L (one `add_bias` over the residual rows, the vector in a device slot the backend owns), and the prefill graph truncated after block L for the capture; a steered session runs the executor's uncaptured steps |
 
 Not in the ABI yet: session fork (`boom_llm_session_fork`), a sampler handle
 (`boom_llm_sampler_new` — parameters are passed to each `boom_llm_decode` call

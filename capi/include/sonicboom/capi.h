@@ -875,6 +875,12 @@ boom_status boom_llm_model_eos(const boom_llm_model *model, boom_token *out, siz
 boom_status boom_llm_model_info(const boom_llm_model *model, char *out, size_t cap,
                             size_t *len_out, boom_error **err_out);
 
+/* The model's residual-stream width (top-level embedding length). The length
+ * boom_llm_session_set_steering requires of its vector, and the row width of a
+ * boom_llm_residual_capture result. */
+boom_status boom_llm_model_embedding(const boom_llm_model *model,
+                                 uint64_t *width_out, boom_error **err_out);
+
 /* Tokenize/detokenize with the model's GGUF built-in vocabulary (SPM-style BPE
  * for Gemma 4). tokenize encodes `text` (UTF-8, `len` bytes) into token ids
  * with <bos> prepended (llama-tokenize add_special); detokenize renders `tokens`
@@ -1001,6 +1007,47 @@ void boom_llm_session_clear_grammar(boom_llm_session *session);
 boom_status boom_llm_session_constraint_state(const boom_llm_session *session,
                                           int *active_out, int *complete_out,
                                           boom_error **err_out);
+
+/* --- Style steering --------------------------------------------------------
+ *
+ * A session may add a fixed [embedding_length] f32 vector to the residual
+ * stream right after block `layer` (0-based, over the model's transformer
+ * blocks), for the rest of its life. The vector is an engine-level feature:
+ * this surface only injects it; how a caller derives it (e.g. the mean residual
+ * difference between two text sets) is the caller's business, and
+ * boom_llm_residual_capture below is the read side of that recipe.
+ *
+ * `n` must equal the model's embedding length, `layer` must name an existing
+ * block. The vector is copied. Setting the same layer and vector the session
+ * already holds is a no-op, so its prompt prefix stays valid. Any other
+ * steering change invalidates the session's prompt prefix (its KV rows were
+ * written without — or with another — vector), so the next boom_llm_prefill
+ * re-prefills from position 0; the token history is cleared, and
+ * boom_llm_decode before a new prefill fails as it does for a fresh session.
+ *
+ * Generation is deterministic for a given (prompt, seed, steering vector), and
+ * identical whether or not speculative decoding is enabled: speculative verify
+ * has no steered graph, so a session with a vector takes strict decode steps.
+ * Clearing restores the plain graph.
+ */
+boom_status boom_llm_session_set_steering(boom_llm_session *session, int32_t layer,
+                                      const float *vector, size_t n,
+                                      boom_error **err_out);
+void boom_llm_session_clear_steering(boom_llm_session *session);
+
+/* The residual stream after block `layer`, for every position of `tokens`, as
+ * one prefill pass on a throwaway KV cache (this is measurement/tooling, not a
+ * serving path; it does not touch any session). `out` receives n (tokens) *
+ * embedding_length floats, position-major, f32. Two-call sizing: with out NULL
+ * or cap smaller than that count, *n_out receives the count and the call
+ * answers BOOM_ERR_BINDING. `layer` may be the last block (the final hidden
+ * state the lm head reads) or any earlier one. Requires a device-backed build
+ * and a prompt that fits one prefill segment (the sliding-window ring where the
+ * model has one). */
+boom_status boom_llm_residual_capture(const boom_llm_model *model,
+                                  const boom_token *tokens, size_t n, int32_t layer,
+                                  float *out, size_t cap, size_t *n_out,
+                                  boom_error **err_out);
 
 /* --- Image generation ------------------------------------------------------
  *
