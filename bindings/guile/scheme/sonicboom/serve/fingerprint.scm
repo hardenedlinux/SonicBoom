@@ -9,25 +9,23 @@
 ;;;   engine version and commit   libsonicboom's git tag and commit
 ;;;   numerics profile            strict or standard
 ;;;   GPU model, driver           nvidia-smi's name and driver_version
-;;;   tune-table digest           FNV-1a over every file under the tune root
+;;;   tune-table digest           libsonicboom's boom_tune_digest (the tables,
+;;;                               not the append-only logs)
 ;;;   model                       SHA-256 of the whole GGUF, first 16 hex
 ;;;
 ;;; The digest of that record is its `id`; two servers agree exactly when the
-;;; id agrees. The tune digest is FNV-1a (not SHA-256) so this module needs no
-;;; external hashing for a directory walk; the model hash does use sha256sum,
-;;; once per process and model, because a GGUF is far larger.
+;;; id agrees. The tune digest comes from the library itself, which knows which
+;;; files are tuning tables and which are runtime logs; the model hash uses
+;;; sha256sum, once per process and model, because a GGUF is far larger.
 ;;;
 ;;; None of this is part of the C ABI: it is the serving layer's report about
 ;;; the library and the machine it is running on.
 
 (define-module (sonicboom serve fingerprint)
-  #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-13)
   #:use-module (ice-9 match)
   #:use-module (ice-9 popen)
   #:use-module (ice-9 rdelim)
-  #:use-module (ice-9 ftw)
-  #:use-module (ice-9 binary-ports)
   #:use-module (rnrs bytevectors)
   #:use-module (rnrs arithmetic bitwise)
   #:use-module (sonicboom ffi)
@@ -86,47 +84,6 @@ PyTorch: none"
       ((name driver) (cons (string-trim-both name) (string-trim-both driver)))
       (_ (cons "none" "none")))))
 
-;; Every regular file under DIR, names sorted, each name and content folded
-;; into one FNV-1a stream. A missing DIR is "none".
-(define (tune-digest dir)
-  (if (not (file-exists? dir))
-      "none"
-      (let* ((names (sort (map (lambda (n) (string-append dir "/" n))
-                               (scandir dir (lambda (n) (not (member n '("." ".."))))))
-                          string<?))
-             (bytes
-              (call-with-output-string
-                (lambda (out)
-                  (let walk ((paths names))
-                    (when (pair? paths)
-                      (let ((p (car paths)))
-                        (if (eq? 'directory (stat:type (stat p)))
-                            (walk (append (sort (map (lambda (n) (string-append p "/" n))
-                                                      (scandir p (lambda (n)
-                                                                   (not (member n '("." ".."))))))
-                                                string<?)
-                                          (cdr paths)))
-                            (begin
-                              (display (substring p (string-length dir)) out)
-                              (call-with-input-file p
-                                (lambda (in)
-                                  (let lp ((b (get-u8 in)))
-                                    (unless (eof-object? b)
-                                      (write-char (integer->char b) out)
-                                      (lp (get-u8 in))))))
-                              (walk (cdr paths)))))))))))
-        ;; call-with-output-string keeps characters, one per byte; hash them as
-        ;; UTF-8 so byte 0x80.. does not round-trip through the locale.
-        (string-hash-hex bytes))))
-
-(define (tune-root)
-  (or (getenv "SONICBOOM_TUNE_DIR")
-      (and (getenv "XDG_CACHE_HOME")
-           (string-append (getenv "XDG_CACHE_HOME") "/sonicboom/tune"))
-      (and (getenv "HOME")
-           (string-append (getenv "HOME") "/.cache/sonicboom/tune"))
-      ".sonicboom-tune"))
-
 (define (server-fingerprint)
   "The server-scope part of the fingerprint, computed once per process.
 
@@ -149,7 +106,7 @@ PyTorch: none"
               ("numerics" . ,(symbol->string (numerics-profile)))
               ("gpu" . ,(car gpu))
               ("driver" . ,(cdr gpu))
-              ("tune" . ,(tune-digest (tune-root)))))))
+              ("tune" . ,(tune-digest))))))
   server-scope)
 
 ;;; ---------------------------------------------------------------------------

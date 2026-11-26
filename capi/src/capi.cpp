@@ -62,6 +62,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -474,6 +475,60 @@ const char *boom_build_info(void) {
   // means a caller that retried would still get a usable string.
   static const std::string info = make_build_info();
   return info.c_str();
+}
+
+namespace {
+
+// FNV-1a 64 over bytes, continuing from H.
+uint64_t fnv1a(uint64_t h, const void *data, size_t len) {
+  const auto *p = static_cast<const unsigned char *>(data);
+  for (size_t i = 0; i < len; ++i) {
+    h ^= p[i];
+    h *= 0x100000001b3ULL;
+  }
+  return h;
+}
+
+// The tune-table digest: each table's archive name, a NUL, its bytes (or a
+// fixed marker when the file does not exist), and a NUL, folded in the
+// library's own table order. Hashes tables only — never the append-only logs.
+std::string make_tune_digest() {
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (const auto &table : sonicboom::tune::table_files()) {
+    h = fnv1a(h, table.name.data(), table.name.size());
+    h = fnv1a(h, "\0", 1);
+    std::ifstream in(table.path, std::ios::binary);
+    if (!in) {
+      static constexpr char kMissing[] = "<missing>";
+      h = fnv1a(h, kMissing, sizeof(kMissing) - 1);
+    } else {
+      char buf[65536];
+      while (in.read(buf, sizeof(buf)) || in.gcount() > 0)
+        h = fnv1a(h, buf, static_cast<size_t>(in.gcount()));
+    }
+    h = fnv1a(h, "\0", 1);
+  }
+  char out[17];
+  std::snprintf(out, sizeof(out), "%016llx",
+                static_cast<unsigned long long>(h));
+  return out;
+}
+
+}  // namespace
+
+const char *boom_tune_digest(void) {
+  // Computed on first call and stable afterwards, like boom_build_info: a
+  // server's fingerprint is taken before its first reply, and a digest that
+  // moved as tables were written later would name a scope it no longer
+  // describes. A C ABI function must not let an allocation failure escape.
+  static const std::string digest = [] {
+    try {
+      return make_tune_digest();
+    } catch (...) {
+      return std::string("unavailable");
+    }
+  }();
+  return digest.c_str();
 }
 
 // --- Error inspection -------------------------------------------------------

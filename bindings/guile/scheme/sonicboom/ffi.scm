@@ -24,6 +24,7 @@
             exception-text
             run-s-expr
             build-info
+            tune-digest
             sb-status-ok?
             sb-status->message
             sb-check!
@@ -217,6 +218,7 @@ PyTorch: none"
   (or (%procs)
       (let ((table
              `((boom_build_info . ,(foreign-proc "boom_build_info" '* (list)))
+               (boom_tune_digest . ,(foreign-proc "boom_tune_digest" '* (list)))
                (boom_parse . ,(foreign-proc "boom_parse" int
                                           (list '* size_t '* '*)))
                (boom_compile . ,(foreign-proc "boom_compile" int
@@ -611,6 +613,26 @@ PyTorch: none"
    (with-input-from-string
        (pointer->string ((proc 'boom_build_info)))
      json->scm)))
+
+(define (tune-digest)
+  "The digest of the tuning tables the loaded libsonicboom.so reads.
+
+The C ABI hashes the tuner's table files — per-op choices, the
+reduction-acceptance verdicts and the JIT candidate cache — in a fixed order,
+and reports 16 lowercase hex digits. Append-only runtime logs are not part of
+it. The value is fixed at the library's first call in the process, so ask for
+it before the work it should describe. The library is loaded if it has not
+been yet.
+
+Args:
+  none.
+Returns: a 16-character string.
+Example:
+  (use-modules (sonicboom ffi))
+  (string-length (tune-digest))
+  => 16
+PyTorch: none"
+  (pointer->string ((proc 'boom_tune_digest))))
 
 ;;; --- high-level execution ---------------------------------------------------
 

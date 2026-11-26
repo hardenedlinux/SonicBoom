@@ -71,7 +71,7 @@ bytes. The record is:
 | `numerics` | the resolved numerics profile, `strict` or `standard` |
 | `gpu` | `nvidia-smi`'s GPU name (`none` when unreadable) |
 | `driver` | `nvidia-smi`'s driver version (`none` when unreadable) |
-| `tune` | FNV-1a 64 over the names and contents of every file under the tune root (see below), 16 hex; `none` when the root does not exist |
+| `tune` | `boom_tune_digest()`: FNV-1a 64 over the library's tuning tables — the tuner's per-op choice files, the reduction-acceptance verdicts and the JIT candidate cache — in a fixed order, 16 hex |
 | `model` | `sha256:` + the first 16 hex of the GGUF's SHA-256; for a model with no file (the mock backend) `none:<model-id>` |
 | `id` | FNV-1a 64 over the canonical text of the other fields, 16 hex |
 
@@ -80,6 +80,21 @@ guarantee is: **the same request body and seed, on a server with the same
 fingerprint `id`, produce the same reply bytes** — across requests, across a
 restart, and across two server processes. It does not cross a change in engine
 build, numerics profile, GPU or driver, tune tables, or model file.
+
+The tune digest covers tables, not bookkeeping: the append-only runtime logs
+(`decisions.jsonl`, `fattn-reports.jsonl`) and compiled-kernel artifacts are
+outside it, so two servers that resolve the same choices agree even though
+their logs differ. It is fixed at the library's first call in the process, so
+the serving layer asks for it before the reply it describes.
+
+A **cold** tune root is outside that agreement: a tuner that has not yet
+measured a shape class times its candidates against whatever else is running,
+and two servers that tune the same class concurrently can keep different
+tables — and then different bytes. Their fingerprints differ in `tune`, which
+is the report of exactly that. For output compared across processes, warm the
+tune root once (or pin `SONICBOOM_TUNE_DIR` to a directory already warmed) so
+both processes read the same tables; `tools/repro-conformance`'s peer check
+requires matching fingerprints for this reason.
 
 The tune root is `$SONICBOOM_TUNE_DIR`, else `$XDG_CACHE_HOME/sonicboom/tune`,
 else `$HOME/.cache/sonicboom/tune`. The model hash is `sha256sum` of the whole
@@ -176,6 +191,6 @@ because it does. Specifically:
   serving layer relies on, with real models: determinism across fresh
   processes, prefix reuse identity, KV-capacity independence and
   `SONICBOOM_SPEC=off`/`on` identity.
-- `tools/repro-conformance` (see `third-party-engines/`) checks the same
-  properties through any OpenAI-compatible HTTP server, including
-  llama-server, and records what other engines do.
+- `tools/repro-conformance` checks the same properties through any
+  OpenAI-compatible HTTP server, including llama-server; it starts no server
+  and prints one pass/fail count per property.

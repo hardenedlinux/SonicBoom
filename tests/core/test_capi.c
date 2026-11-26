@@ -566,6 +566,21 @@ static void test_explain(void) {
   boom_error_free(err);
 }
 
+/* boom_tune_digest names the tuning tables (not the runtime logs) as 16 hex
+ * digits and is stable for the process. */
+static void test_tune_digest(void) {
+  const char *digest = boom_tune_digest();
+  check(digest != NULL, "tune digest: returns a string");
+  check(digest != NULL && strlen(digest) == 16,
+        "tune digest: is 16 hex digits");
+  for (size_t i = 0; digest != NULL && digest[i] != '\0'; ++i) {
+    char c = digest[i];
+    check((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'),
+          "tune digest: every character is lowercase hex");
+  }
+  check(boom_tune_digest() == digest, "tune digest: stable for the process");
+}
+
 int main(void) {
   test_end_to_end();
   test_binding_error();
@@ -574,6 +589,7 @@ int main(void) {
   test_llm_prefill_full_reuse();
   test_llm_model_info();
   test_explain();
+  test_tune_digest();
 
   if (g_failures == 0) {
     printf("test_capi OK (C ABI parse/compile/bind/execute/retrieve/release)\n");

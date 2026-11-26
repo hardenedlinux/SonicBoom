@@ -190,6 +190,21 @@ void boom_error_free(boom_error *err);
  * `platform` is the target CPU the library was compiled for, not the builder's. */
 const char *boom_build_info(void);
 
+/* A digest of the tuning tables this process reads: the 16 lowercase hex digits
+ * of an FNV-1a 64 over every table file (the tuner's per-op `<op>.json` files,
+ * the reduction-acceptance verdicts and the JIT candidate cache) in a fixed
+ * order. Returns a static string, valid for the lifetime of the process
+ * ("unavailable" only if the digest could not be allocated).
+ *
+ * It exists so that a reproducibility fingerprint can name the tuning scope
+ * without knowing the cache layout. The digest covers tables, not bookkeeping:
+ * appending to the runtime logs (`decisions.jsonl`, `fattn-reports.jsonl`) or
+ * writing compiled-kernel artifacts does not change it. A table written after
+ * the first call is not reflected — take the digest before the reply it will
+ * describe, as the serving layer does at its first reply. A process with no
+ * tables still has a digest (of their absence). */
+const char *boom_tune_digest(void);
+
 /* --- Parse ----------------------------------------------------------------- */
 
 /* Parse an S-Expr v0.1 document. `text` need not be NUL-terminated; `len` is
