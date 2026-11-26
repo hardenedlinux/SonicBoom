@@ -77,12 +77,24 @@
           ((char=? (string-ref text i) #\;) (loop (skip-line text i)))
           (else i))))
 
+;; A port on PATH that decodes the file as UTF-8, whatever the locale is. The
+;; sources carry non-ASCII text in their docstrings and comments, and a
+;; locale-dependent default decoding (e.g. under LC_ALL=C) would hide the
+;; documentation from the reader.
+(define (open-source-port path)
+  (let ((port (open-input-file path)))
+    (set-port-encoding! port "UTF-8")
+    port))
+
 ;; Returns three values: the text, its lines, and a list of
 ;; (start-line form), in source order.
 (define (read-source path)
-  (let* ((text (call-with-input-file path get-string-all))
+  (let* ((text (call-with-input-file path
+                 (lambda (port)
+                   (set-port-encoding! port "UTF-8")
+                   (get-string-all port))))
          (lines (string-split text #\newline))
-         (port (open-input-file path)))
+         (port (open-source-port path)))
     (let loop ((previous 0) (forms '()))
       (let* ((start (skip-space-and-comments text previous))
              (line (offset->line text start))
