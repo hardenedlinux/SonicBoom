@@ -894,9 +894,27 @@ int64_t spec_choose_budget(std::span<const double> cost_us,
       best_score = s;
     }
   }
-  if (current_k < 0 || current_k > max_k) return best;
-  if (best == current_k) return current_k;
+  if (current_k < 0 || current_k > max_k) {
+    // The shadow gate: with no length in hand, a verify runs only when its
+    // estimated tokens per plain-step-equivalent beat the plain step (score 1)
+    // by more than the margin. The first decision is the one made on the least
+    // evidence; a verify that merely breaks even spends a step's latency on an
+    // estimate and teaches the gate nothing the plain step could not.
+    return best_score > 1.0 + margin ? best : 0;
+  }
   const double current = score(size_t(current_k));
+  if (best == current_k && current > 1.0 + margin) return current_k;
+  if (current <= 1.0 + margin) {
+    // A length that no longer clears the shadow threshold does not stay
+    // chosen on hysteresis. The margin exists to avoid switching on noise,
+    // not to license a verify that merely breaks even: without this, a
+    // marginal length is kept until its score falls below 1 - margin, and
+    // every iteration in that band spends more than the plain step it
+    // replaces. (Measured on a mixture-of-experts recipe: the policy sat on a
+    // k = 1 verify priced at 1.01 while each such verify cost ~1.5x a plain
+    // step for one token.)
+    return best_score > 1.0 + margin ? best : 0;
+  }
   return best_score > current * (1.0 + margin) ? best : current_k;
 }
 
@@ -1553,16 +1571,39 @@ static bool model_has_recurrent_state(const Gemma4Model& m) {
   return has_recurrent_state(recipe_for(m));
 }
 
-// One line per process, the first time a guard sends the run down the plain
-// loop, so the absence of a capture or of speculative steps is visible.
+// The mode a particular model runs under. A recipe with recurrent state has no
+// load-time probe (spec_resolve_probe), so its undecided mode resolves to auto
+// here: the loop's shadow gate prices every draft length from measured verifies
+// and keeps k = 0 whenever a verify does not beat the plain step. Resolving per
+// model, not into g_spec_mode, keeps the process-wide resolved mode of one
+// model from deciding another model's loop shape.
+static SpecMode spec_mode_for(const Gemma4Model& m) {
+  const SpecMode mode = spec_mode();
+  if (mode == SpecMode::Undecided && model_has_recurrent_state(m))
+    return SpecMode::Auto;
+  return mode;
+}
+
+static bool spec_enabled_for(const Gemma4Model& m) {
+  const SpecMode mode = spec_mode_for(m);
+  return mode == SpecMode::On || mode == SpecMode::Auto ||
+         mode == SpecMode::Reckless;
+}
+
+// One line per process, the first time a guarded recipe is generated from, so
+// what the loop gives up for it is visible. A guarded recipe still speculates
+// under an explicit mode or under auto; its recurrent state makes each verify
+// tentative and resolved by the run, and its routed experts refuse the captured
+// single step.
 static void log_plain_loop(const Gemma4Model& m) {
   static std::atomic<bool> logged{false};
   if (logged.exchange(true, std::memory_order_relaxed)) return;
-  std::cerr << "[loop] plain loop (model=" << &m << "):";
+  std::cerr << "[loop] guarded recipe (model=" << &m << "):";
   if (model_has_routed_experts(m))
     std::cerr << " no captured steps (routed experts)";
   if (model_has_recurrent_state(m))
-    std::cerr << " no speculation, no measurement runs (recurrent state)";
+    std::cerr << (spec_enabled_for(m) ? " tentative verifies (recurrent state)"
+                                      : " no speculation (recurrent state)");
   std::cerr << "\n";
 }
 
@@ -1984,6 +2025,21 @@ constexpr int64_t kSpecExploreDepth = 2;
 constexpr uint64_t kSpecProbeRun = 8;
 constexpr uint64_t kSpecProbeEvery = 32;
 
+// Realized-efficiency stop loss. The shadow gate prices a verify from the cost
+// curve, which is a model: measured at load on one row pattern, refined from
+// device time. A workload whose real verifies do not pay anyway (chat text a
+// prompt-lookup drafter cannot copy; a recipe whose residency differs from the
+// load's) would keep spending them. Every speculative iteration's realized
+// work is charged in host wall (propose, verify, and the state resolve after
+// it, on both sides of the comparison): once kSpecLossWindow non-warm verifies
+// have emitted fewer tokens than the same wall would have produced as plain
+// steps, the loop stops verifying for kSpecLossCooldown iterations and then
+// re-learns from scratch. Each later trip doubles the cooldown (32, 64, 128,
+// 256), so a workload that never repeats ends the call nearly plain while one
+// that becomes repetitive deep into a long output is still re-tested.
+constexpr int kSpecLossWindow = 16;
+constexpr uint64_t kSpecLossCooldown = 32;
+
 // Cross-call evidence is capped to the most recent verified rounds: enough to
 // carry a workload's hazards from one turn to the next, small enough that a
 // different workload in the same process (a coding request followed by chat)
@@ -2225,6 +2281,15 @@ static void spec_flush_refined_costs(const Gemma4Model& m) {
 constexpr int kWarmCostReps = 1;
 constexpr int kWarmTimedReps = 3;
 constexpr double kSpecCostLoadBudgetMs = 4000.0;
+// A routed-expert verify streams the union of the experts its rows select, so
+// c(k) grows toward 10-25x a plain step and the band's deep knots cost far more
+// than a dense recipe's. Those are exactly the prices the gate weighs against
+// the plain-step cost, so a routed recipe's measurement gets a larger budget
+// and is priced through the range where a deep verify could still pay; the
+// record is cached per build, so this is a once-per-build cost, never a
+// per-request one. (Measured on Qwen3.6 35B-A3B, pool 2048 MB: the full band
+// needs ~15 s, the decision-relevant part through k = 31 ~7.7 s.)
+constexpr double kSpecCostLoadBudgetMoeMs = 8000.0;
 // The verify set's share of that budget: its graph builds and its
 // warm-ups/captures are paid within this share, the rest belongs to the cost
 // curve. Every row count the verify step can reach (2..kMaxVerifyRows) is
@@ -2336,25 +2401,49 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
                                     DecodeRuntime& rt,
                                     planner::KvCacheSession& session) {
   if (!tune::enabled()) return;
-  // §10: a recipe with recurrent state is never measured. The curve is priced
-  // by replaying verify and plain steps on the live session, and every replay
-  // would advance the state.
-  if (model_has_recurrent_state(m)) return;
   // Reckless verifies through the prefill path, whose price is a different
   // measurement; the decode-dealt curve is not used there.
   if (spec_mode() == SpecMode::Reckless) return;
   if (!session.caches || session.cache_id == 0) return;
+
+  // A recipe with recurrent state is priced too, and nothing it prices may
+  // advance the state: a verify runs tentatively and is resolved (dropped)
+  // after each pass, and every k = 0 pass snapshots the committed state first
+  // and restores it after, so a price leaves the session where it found it.
+  const bool recurrent = model_has_recurrent_state(m);
+  std::shared_ptr<planner::StateSetDev> price_states;
+  std::vector<planner::GdnStateSnapshot> price_snap;
+  if (recurrent) {
+    price_states = rt.cuda->states();
+    if (!price_states || price_states->size() == 0) return;
+  }
 
   // The depth the curve is measured at: bounded, so the whole curve fits the
   // load budget. What the policy compares across lengths is the curve's shape,
   // and the attention term grows with depth for c(0) and c(k) alike. The rows
   // the measurement writes are rows the first prefill overwrites before any
   // attention extent reaches them (the same argument as the V2 probe's rows).
-  const uint64_t pos =
+  // A recurrent verify scans from its state's committed position, so that is
+  // where the curve is measured; at load it is the prompt's boundary.
+  uint64_t pos =
       n_ctx > uint64_t(planner::kMaxVerifyRows)
           ? std::min<uint64_t>(n_ctx - uint64_t(planner::kMaxVerifyRows), 512)
           : 0;
-  const std::vector<uint64_t> feed(size_t(planner::kMaxVerifyRows), 0);
+  if (recurrent) pos = price_states->pos();
+  // A real verify feeds distinct tokens, and on a mixture-of-experts recipe the
+  // union of the experts those rows route to — not the row count alone — is
+  // what its weight streaming pays for. Identical rows would route every row
+  // to the same experts and price c(k) far below what the first real verify
+  // costs (measured: a 46-row verify priced at 1.9x the plain step cost 70x
+  // it). The synthetic rows are spread deterministically over the vocabulary
+  // so the union grows with k, the way an accepted draft run's does.
+  std::vector<uint64_t> feed(size_t(planner::kMaxVerifyRows));
+  {
+    const uint64_t span =
+        m.config.vocab_size > 2 ? uint64_t(m.config.vocab_size) - 1 : 1;
+    for (size_t i = 0; i < feed.size(); ++i)
+      feed[i] = 1 + (uint64_t(i) * 997 + 13) % span;
+  }
   std::vector<int64_t> out(size_t(planner::kMaxVerifyRows), -1);
 
   // Warm-up: build every verify row count the policy can reach and capture the
@@ -2383,27 +2472,56 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
     PricingScope() { g_spec_pricing = true; }
     ~PricingScope() { g_spec_pricing = prev; }
   } pricing_scope;
-  // Build (and capture) the verify runtimes the curve is measured on outside
-  // the cost budget, exactly as a verifying mode's load does. The off mode's
-  // set exists only because the record has to be priced once per build.
-  if (spec_mode() == SpecMode::Off) warm_verify_set(m, n_ctx, session);
-
   tune::trace_event("measure", "spec-length", p.key,
                     spec_kernel_fingerprint(), __builtin_FUNCTION());
 
+  // Build the verify runtimes the curve is measured on outside the cost budget,
+  // exactly as a verifying mode's load does. In the verifying modes the load
+  // warm-up has already built them (a no-op here); this call covers the off
+  // mode, whose set exists only because the record has to be priced once per
+  // build, and any caller that did not warm. It is a one-time session cost, not
+  // a curve measurement: inside the budget below, a mixture-of-experts recipe's
+  // ~19 graph builds spend most of it and the tail is priced by extrapolation
+  // from a two-point curve.
+  (void)verify_priceable(m, n_ctx, int(SpecLengthPolicy::kMax) + 1, session);
+
+  const bool replay_ok =
+      rt.prog && rt.cuda->capture_resources_ok(session.cache_id);
+  const auto plain_us = [&]() -> double {
+    // A plain step commits a recurrent state; the price must not, so the
+    // committed states are saved first and restored after (outside the timer).
+    if (recurrent) {
+      price_snap.clear();
+      for (size_t i = 0; i < price_states->size(); ++i)
+        price_snap.push_back(price_states->state(i).save());
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    double us = -1.0;
+    // The plain step is priced on the same first token the verify's first row
+    // feeds, so the two prices route to the same expert set.
+    if (greedy_step(rt, feed[0], pos, replay_ok, [] {}) >= 0)
+      us = std::chrono::duration<double, std::micro>(
+               std::chrono::steady_clock::now() - t0)
+               .count();
+    if (recurrent) {
+      for (size_t i = 0; i < price_states->size(); ++i)
+        if (!price_states->state(i).restore(price_snap[i])) return -1.0;
+    }
+    return us;
+  };
+  // The decode runtime builds some of its machinery on the first step; pay that
+  // once here, before the clock, so the budget measures prices. The step writes
+  // one KV row at `pos`, which is a row the prefill overwrites (same argument
+  // as `pos` above), and a recurrent state is restored around it.
+  (void)plain_us();
+
+  const double budget_ms = model_has_routed_experts(m)
+                               ? kSpecCostLoadBudgetMoeMs
+                               : kSpecCostLoadBudgetMs;
   const auto t_load = std::chrono::steady_clock::now();
   const auto elapsed_ms = [&] {
     return std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now() - t_load)
-        .count();
-  };
-  const bool replay_ok =
-      rt.prog && rt.cuda->capture_resources_ok(session.cache_id);
-  const auto plain_us = [&]() -> double {
-    const auto t0 = std::chrono::steady_clock::now();
-    if (greedy_step(rt, 0, pos, replay_ok, [] {}) < 0) return -1.0;
-    return std::chrono::duration<double, std::micro>(
-               std::chrono::steady_clock::now() - t0)
         .count();
   };
   std::array<double, size_t(SpecLengthPolicy::kMax) + 1> known{};
@@ -2431,7 +2549,7 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
       const double est_ms =
           double(kWarmCostReps + kWarmTimedReps) * last_us / 1000.0 +
           kSpecCostCaptureMs;
-      if (elapsed_ms() + est_ms > kSpecCostLoadBudgetMs) break;
+      if (elapsed_ms() + est_ms > budget_ms) break;
     }
     const size_t rows = size_t(k) + 1;
     std::vector<double> samples;
@@ -2439,7 +2557,7 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
     bool ok = true;
     for (int i = 0; i < kWarmCostReps + kWarmTimedReps; ++i) {
       if (i == kWarmCostReps && measured >= 2 &&
-          elapsed_ms() >= kSpecCostLoadBudgetMs) {
+          elapsed_ms() >= budget_ms) {
         ok = false;
         break;
       }
@@ -2469,12 +2587,15 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
     known[size_t(k)] = samples[samples.size() / 2];
     last_us = known[size_t(k)];
     ++measured;
+    if (spec_diag_enabled())
+      std::fprintf(stderr, "[spec-cost] knot k=%lld us=%.0f elapsed=%.0fms\n",
+                   (long long)k, known[size_t(k)], elapsed_ms());
   }
   if (spec_diag_enabled()) {
     // The measured points and the budget they consumed, so a diagnostic run can
     // tell a priced length from an interpolated one.
     std::fprintf(stderr, "[spec-cost] n=%d load=%.0fms budget=%.0fms",
-                 measured, elapsed_ms(), kSpecCostLoadBudgetMs);
+                 measured, elapsed_ms(), budget_ms);
     for (int k = 0; k <= SpecLengthPolicy::kMax; ++k)
       if (known[size_t(k)] > 0.0)
         std::fprintf(stderr, " c%d=%.0f", k, known[size_t(k)]);
@@ -2717,10 +2838,12 @@ static uint64_t run_spec_program_steps(
       planner::make_draft_model(cap);
   drafter->push(history);
   // SONICBOOM_SPEC=auto picks k per iteration (B7). The forced-strategy seam
-  // keeps the fixed cap so a test can pin every iteration's shape.
+  // keeps the fixed cap so a test can pin every iteration's shape. A recipe
+  // with recurrent state resolves to auto when its mode is undecided
+  // (spec_mode_for).
   const bool adaptive =
-      !strategy_override && (spec_mode() == SpecMode::Auto ||
-                             spec_mode() == SpecMode::Reckless);
+      !strategy_override && (spec_mode_for(m) == SpecMode::Auto ||
+                             spec_mode_for(m) == SpecMode::Reckless);
   SpecLengthPolicy policy;
   if (adaptive) {
     spec_policy_init(m, session.n_ctx, policy);
@@ -2729,6 +2852,14 @@ static uint64_t run_spec_program_steps(
     // measured. A fresh session learns its own.
     policy.bootstrap_left =
         spec_evidence_load(session, policy) ? 0 : spec_bootstrap_steps();
+    // No bootstrap where the shadow gate decides. The bootstrap spends its
+    // verifies to identify a workload that repeats; on a recipe with recurrent
+    // state the load already priced every length and the gate compares each
+    // verify against the plain step, so an exploration round buys information
+    // the gate measures directly from any verify it orders, at that verify's
+    // own cost. The first verify is still an exploration of its length by the
+    // accept evidence it leaves behind.
+    if (model_has_recurrent_state(m)) policy.bootstrap_left = 0;
   }
   // The valid KV length: everything before `pos` the caller prefilled is
   // resident, and every later step appends exactly the tokens it feeds.
@@ -2751,6 +2882,25 @@ static uint64_t run_spec_program_steps(
   // first iteration starts from whatever the caller left in the slot, so those
   // still stage the token here.
   bool prev_plain = false;
+  // Realized-efficiency stop loss: a plain iteration's host wall (EMA), and
+  // the speculative iterations' wall and emitted tokens since the last trip.
+  double plain_wall_us = 0.0;
+  double spec_wall_us = 0.0;
+  double spec_emit = 0.0;
+  int spec_window = 0;
+  uint64_t stop_trips = 0;
+  uint64_t stop_left = 0;
+  const auto spec_trip_stop_loss = [&] {
+    if (spec_diag_enabled())
+      std::fprintf(stderr, "[spec-loss] realized=%.3f floor_wall_us=%.0f\n",
+                   spec_emit * plain_wall_us / std::max(spec_wall_us, 1.0),
+                   plain_wall_us);
+    ++stop_trips;
+    stop_left = kSpecLossCooldown << std::min<uint64_t>(stop_trips - 1, 3);
+    spec_wall_us = 0.0;
+    spec_emit = 0.0;
+    spec_window = 0;
+  };
 
   while (step < limit) {
     ++g_spec_counters.iterations;
@@ -2796,6 +2946,7 @@ static uint64_t run_spec_program_steps(
     bool measure = false;      // ... whose time is c(k) (its second pass)
     bool finish_warm = false;  // the last measurement: persist after timing
     bool bootstrap_iter = false;  // a bootstrap verify (evidence input)
+    bool loss_plain = false;      // a plain step ordered by the stop loss
     size_t match_n = 0;        // S4: n-gram length behind this proposal
     SpecDiagKind diag_kind = SpecDiagKind::Fixed;
     // Ask the drafter for at most `budget` drafts and price the lookup. The
@@ -2848,7 +2999,14 @@ static uint64_t run_spec_program_steps(
       }
       if (!warm) {
         const uint64_t max_k = std::min<uint64_t>(uint64_t(cap), room);
-        if (adaptive && step == first_step) {
+        if (stop_left > 0) {
+          // The realized-efficiency stop loss is cooling down: a plain step,
+          // and no exploration credit until the cooldown ends.
+          --stop_left;
+          loss_plain = true;
+          k = 0;
+          diag_kind = SpecDiagKind::Plain;
+        } else if (adaptive && step == first_step) {
           // The first generated token must not wait on a verify: an adaptive
           // call starts with one plain step (exactly the spec-off step), so a
           // request's time to first token does not depend on the policy's
@@ -2907,8 +3065,9 @@ static uint64_t run_spec_program_steps(
           }
         }
         // A k = 0 policy iteration earns explore credit (rate-limited), and a
-        // plain iteration advances the spacing counter.
-        if (k == 0 && !bootstrap_iter) {
+        // plain iteration advances the spacing counter. A stop-loss step earns
+        // nothing: the cooldown is a plain stretch, not exploration.
+        if (k == 0 && !bootstrap_iter && !loss_plain) {
           policy.explore_credit = std::min(
               kSpecExploreCreditMilli,
               policy.explore_credit + kSpecExploreRateMilli);
@@ -2965,14 +3124,38 @@ static uint64_t run_spec_program_steps(
                   << "\n";
         break;
       }
-      // The step's readback has drained its replay, so the event pair is
-      // complete; reading it never waits. A timed plain step prices c(0).
-      if (adaptive && !warm && time_step) {
-        double ms = 0.0;
-        if (hal::StepProgram* sp = rt.step_at(L);
-            sp && sp->timing_read(&ms)) {
-          spec_note_step_ms(m, session.n_ctx, 0, ms);
-          spec_refine_cost(m, session.n_ctx, policy, 0);
+      // Realized-efficiency stop loss: a plain iteration's host wall is the
+      // floor a speculative iteration must beat. The warm-up's forced shapes
+      // are not evidence.
+      double wall_us = 0.0;
+      if (adaptive && !warm) {
+        wall_us = std::chrono::duration<double, std::micro>(
+                      std::chrono::steady_clock::now() - iter_start)
+                      .count();
+        plain_wall_us = plain_wall_us > 0.0
+                            ? 0.7 * plain_wall_us + 0.3 * wall_us
+                            : wall_us;
+      }
+      // A plain step prices c(0). A dense recipe's step has a captured program:
+      // its readback has drained the replay, so the event pair is complete and
+      // reading it never waits (taken on a 1-in-16 cadence). A recipe with no
+      // captured step program (routed experts, recurrent state) has no event
+      // pair; its iteration wall — the same span the verify fallback prices
+      // below — is fed every plain step, because the ring needs three readings
+      // before it replaces the load anchor and the wall is already in hand.
+      if (adaptive && !warm) {
+        if (!rt.prog) {
+          if (wall_us > 0.0) {
+            spec_note_step_ms(m, session.n_ctx, 0, wall_us / 1000.0);
+            spec_refine_cost(m, session.n_ctx, policy, 0);
+          }
+        } else if (time_step) {
+          double ms = 0.0;
+          if (hal::StepProgram* sp = rt.step_at(L);
+              sp && sp->timing_read(&ms)) {
+            spec_note_step_ms(m, session.n_ctx, 0, ms);
+            spec_refine_cost(m, session.n_ctx, policy, 0);
+          }
         }
       }
       // S4: a plain step is a proposal of length 0 (the drafter missed or the
@@ -3031,18 +3214,29 @@ static uint64_t run_spec_program_steps(
     rows.assign(size_t(k) + 1, -1);
     const diag::SpecDiagSnapshot diag_before =
         diag_on ? diag::spec_diag_snapshot() : diag::SpecDiagSnapshot{};
-    if (!verify_step_spine_cuda(m, feed, L, session, rows)) {
+    const auto verify_t0 = std::chrono::steady_clock::now();
+    const bool verify_ok = verify_step_spine_cuda(m, feed, L, session, rows);
+    const double verify_wall_us =
+        std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - verify_t0)
+            .count();
+    if (!verify_ok) {
       std::cerr << "[spec] the verify step failed at position " << L << "\n";
       // A failed verify may have left some scans tentative; drop them so the
       // session's states are back at their committed position.
       if (model_has_recurrent_state(m)) verify_resolve_states(m, session, 0);
       break;
     }
-    // A real (non warm-up) verify prices its own k; its sync has completed the
-    // replay, so the event pair reads back without waiting.
+    // A real (non warm-up) verify prices its own k. A dense recipe's verify
+    // has a captured program whose event pair reads back without waiting (its
+    // sync has completed the replay); a recipe with no captured program
+    // (routed experts, recurrent state) has no event pair, and the call's host
+    // wall — it syncs for its token readback — is the price, priced on the
+    // same basis as the plain fallback above.
     if (adaptive && !warm) {
-      const double ms =
+      double ms =
           verify_last_step_ms(m, session.n_ctx, int(feed.size()), session);
+      if (!(ms > 0.0)) ms = verify_wall_us / 1000.0;
       if (ms > 0.0) {
         spec_note_step_ms(m, session.n_ctx, int(k), ms);
         spec_refine_cost(m, session.n_ctx, policy, int(k));
@@ -3131,6 +3325,26 @@ static uint64_t run_spec_program_steps(
         !verify_resolve_states(m, session, uint64_t(emit_n)))
       break;
     if (emit_n == 0) break;
+    // Realized-efficiency stop loss: charge this iteration's host wall and the
+    // tokens it emitted, after the resolve so the recurrent commit is on the
+    // verify's side of the ledger. A window that pays is discarded; a window
+    // that emits fewer tokens than plain steps would have in the same wall
+    // starts a cooldown.
+    if (adaptive && !warm) {
+      spec_wall_us += std::chrono::duration<double, std::micro>(
+                          std::chrono::steady_clock::now() - iter_start)
+                          .count();
+      spec_emit += double(emit_n);
+      if (++spec_window >= kSpecLossWindow) {
+        if (plain_wall_us > 0.0 && spec_emit * plain_wall_us < spec_wall_us) {
+          spec_trip_stop_loss();
+        } else {
+          spec_wall_us = 0.0;
+          spec_emit = 0.0;
+          spec_window = 0;
+        }
+      }
+    }
     for (size_t i = 0; i < emit_n; ++i) {
       tokens[step + i] = int64_t(run[i]);
       if (first_out && step + i == 1)
@@ -4384,7 +4598,7 @@ static std::unique_ptr<VerifySet> build_verify_set(
                  "[spec-cost] verify set rows=2..%d (buckets) built=%d "
                  "warmed=%d captured=%d %.0fms budget=%.0fms\n",
                  build_upto, built, warmed, captured, elapsed_ms(),
-                 kSpecCostLoadBudgetMs);
+                 kSpecVerifySetBudgetMs);
   }
   return built > 0 ? std::move(set) : nullptr;
 }
@@ -4425,8 +4639,13 @@ static VerifySet* get_verify_set(const Gemma4Model& m, uint64_t n_ctx,
 
 static void warm_verify_set(const Gemma4Model& m, uint64_t n_ctx,
                             const planner::KvCacheSession& session) {
-  // §10: no warm-up runs for a recipe with recurrent state.
-  if (model_has_recurrent_state(m)) return;
+  // §10: no warm (or captured) run is executed for a recipe with recurrent
+  // state or routed experts — the former would advance its state, the latter
+  // would stream expert weights. The set's runtimes are still built: skipping
+  // the whole call would put ~19 graph builds inside the first verify, i.e.
+  // inside the first request's decode step. build_verify_set makes the same
+  // decision internally (it warms and captures only the dense path), so the
+  // build is the only work this does for those recipes.
   (void)get_verify_set(m, n_ctx, session);
 }
 
@@ -4670,11 +4889,13 @@ static bool spec_probe_injected(double& plain_ms, double& verify_ms) {
 static DecodeRuntime* spec_resolve_probe(
     const Gemma4Model& m, DecodeRuntime* rt, uint64_t n_ctx, uint64_t pos,
     const planner::KvCacheSession* session) {
-  // §10: a recipe with recurrent state does not speculate. The mode is left
-  // untouched — the probe (or a cached ratio) would otherwise select a loop
-  // shape this model never runs — and the dispatch sites below read the same
-  // predicate, so the speculative program is not run even if the process-wide
-  // mode was resolved by another model.
+  // A recipe with recurrent state has no load-time probe: the probe measures
+  // by decoding on the live session, which a recurrent state cannot repeat.
+  // Its undecided mode resolves per model to auto instead (spec_mode_for): the
+  // loop's shadow gate prices each length from measured verifies and keeps
+  // k = 0 whenever a verify does not beat the plain step. Resolving per model
+  // rather than into g_spec_mode keeps a dense model in the same process free
+  // to probe.
   if (model_has_recurrent_state(m)) return rt;
   if (!rt || env_spec_mode() != SpecMode::Undecided ||
       g_spec_mode != SpecMode::Undecided)
@@ -5643,7 +5864,8 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
               << " bytes < " << (m.config.vocab_size + 7) / 8 << "\n";
     return 0;
   }
-  // §10: the first generate call of a guarded recipe announces the plain loop.
+  // The first generate call of a guarded recipe announces what the loop gives
+  // up for it.
   if (model_has_routed_experts(m) || model_has_recurrent_state(m))
     log_plain_loop(m);
   std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
@@ -5755,13 +5977,14 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   }
 
   const uint32_t chunk = rt->cuda->decode_chunk();
-  // §10: a recipe with recurrent state never runs the speculative program; it
-  // takes the plain program branch below.
+  // §10: a recipe with recurrent state runs the speculative program too, but
+  // only under a mode that resolves to auto (spec_enabled_for): its verifies
+  // are tentative and resolved by the run length, and its draft length is the
+  // shadow gate's decision, never a fixed cap.
   if (masked) {
     // the masked single step above already produced the call's one token
   } else if (ir_program_enabled() && rt->program.valid &&
-             rt->program.speculative && spec_enabled() &&
-             !model_has_recurrent_state(m)) {
+             rt->program.speculative && spec_enabled_for(m)) {
     // The speculative program drives the loop. Its proposals are verified,
     // never trusted, so the token stream is the plain loop's. The drafter is
     // seeded with the session's filled history (the prompt plus the tokens fed
@@ -6479,7 +6702,8 @@ static uint64_t prefill_decode_cuda_impl(
                  "numerics profile\n";
     return 0;
   }
-  // §10: the first generate call of a guarded recipe announces the plain loop.
+  // The first generate call of a guarded recipe announces what the loop gives
+  // up for it.
   if (model_has_routed_experts(m) || model_has_recurrent_state(m))
     log_plain_loop(m);
   // The final logits exist only on the attention prefill path (lm_head over the
@@ -7099,10 +7323,10 @@ static uint64_t prefill_decode_cuda_impl(
                                             rt->cuda->cache_id());
   if (rt->prog && !replay_ok)
     log_capture_refusal("prefill-decode", m, n_ctx, rt->cuda->cache_id());
-  // §10: a recipe with recurrent state never runs the speculative program.
+  // §10: a recipe with recurrent state runs the speculative program under the
+  // mode spec_mode_for resolves for it (auto when undecided).
   if (!dump_logits && ir_program_enabled() && rt->program.valid &&
-      rt->program.speculative && spec_enabled() &&
-      !model_has_recurrent_state(m)) {
+      rt->program.speculative && spec_enabled_for(m)) {
     // The speculative program drives the loop over the same cache the prefill
     // filled: the session's when the caller passed one, otherwise a session
     // published from this runtime's own cache (the one the step capture was
