@@ -142,6 +142,21 @@ bool spec_verify_batch_enabled() {
   return on;
 }
 
+// Verify expert form (V2 ablation). Default: a verify step groups its rows by
+// expert and reads each expert's weights once, in the batched-gemv arithmetic
+// (see MoeRows::GroupedIdentity). With SONICBOOM_MOE_VERIFY_GROUPED=0 the step
+// runs one gemv per (row, expert), the decode form. The two are bit-identical
+// row for row (cuda_moe.h: the per-column arithmetic is the decode gemv's);
+// only the weight traffic, and the launch count, differ. The switch exists to
+// measure what grouping is worth; it is not a numerics mode.
+bool moe_verify_grouped_enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("SONICBOOM_MOE_VERIFY_GROUPED");
+    return !(e && std::string_view(e) == "0");
+  }();
+  return on;
+}
+
 // SONICBOOM_DECODE_FAMILY_TRACE: one line per distinct host call the deployed
 // decode/verify plan makes, so the calls the graph runs can be compared with
 // the warm-up's timed candidates. Deduplicated by (host, type, rows, cols, n,
@@ -3035,6 +3050,14 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       const bool prefill = !verify && batch_attr(nb);
       const uint64_t rows = verify ? uint64_t(vr)
                                    : prefill ? uint64_t(nb) : uint64_t(1);
+      // Verify batches its rows per expert (each weight read once) but must
+      // keep every row equal to its plain decode gemv, so it takes the
+      // identical-arithmetic form; prefill batches the fast way.
+      const nn::cuda::MoeRows moe_rows =
+          prefill ? nn::cuda::MoeRows::Grouped
+                  : verify && moe_verify_grouped_enabled()
+                        ? nn::cuda::MoeRows::GroupedIdentity
+                        : nn::cuda::MoeRows::PerRow;
       if (!in[0].on_device || !in[1].on_device || !in[2].on_device) {
         ok = false;
         break;
@@ -3164,7 +3187,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             dev(in[0]), ids.data(), dev(in[2]),
             static_cast<const int32_t*>((*pool)->selection()),
             (*pool)->selection_host(), views, act, dev_mut(out_handle), rows, k,
-            dim, prefill, pooled, nullptr,
+            dim, moe_rows, pooled, nullptr,
             entry_events.empty() ? nullptr : entry_events.data());
       }
       if (ok && !cpu_miss.empty()) {

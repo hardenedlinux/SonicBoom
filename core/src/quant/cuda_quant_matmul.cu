@@ -5533,8 +5533,13 @@ namespace {
 
 // The batched matmul over a weight copy that is already on the device. Shared
 // by the uploading form (whose cache provides d_w) and the expert pool's slots.
+// `identity` keeps the batch on the arithmetic that is per-column bit-identical
+// to the decode gemv (see matmul_f32_dev_device_weight_identity): the MMQ and
+// cuBLAS tiles reorder the K reduction, so a verify row built on them need not
+// equal the plain decode step it stands for.
 bool matmul_f32_weight_dev(const QuantizedTensor& W, const void* d_w,
-                           const float* X, float* Y, int n) {
+                           const float* X, float* Y, int n,
+                           bool identity = false) {
   if (n == 1) return matvec_f32_weight_dev(W, d_w, X, Y);
   const uint64_t cols = W.dims()[0];
   const uint64_t rows = W.dims()[1];
@@ -5554,7 +5559,8 @@ bool matmul_f32_weight_dev(const QuantizedTensor& W, const void* d_w,
   // matmul_mmq_dev's precondition. A K that is not a multiple of 256 (Qwen
   // 0.5B's 896) stays on MMQ: zero_pad_planes covers its tail plane.
   const bool mmq_type = cols >= 256 && cols % mmq::QK8_1_MMQ == 0;
-  if (q8_1_enabled() && mmq_enabled() && n >= mmq_min_n() && mmq_type)
+  if (!identity && q8_1_enabled() && mmq_enabled() && n >= mmq_min_n() &&
+      mmq_type)
     return matmul_mmq_weight_dev(W, d_w, X, Y, n, {}, nullptr);
 
   // Every prefill n >= mmq_min_n() that does not take MMQ takes the blocked
@@ -5563,7 +5569,7 @@ bool matmul_f32_weight_dev(const QuantizedTensor& W, const void* d_w,
   // per-column invariant, so a position computes the same whether its segment
   // is long or short (prefix-reuse identity). Only when q8_1 is active — the
   // fp32 fallback is the CPU-matching differential path and must stay fp32.
-  if (q8_1_enabled() && cublas_enabled() && n >= mmq_min_n())
+  if (!identity && q8_1_enabled() && cublas_enabled() && n >= mmq_min_n())
     return matmul_f16_cublas_weight_dev(W, d_w, X, Y, n,
                                         /*force_blocked=*/true);
 
@@ -5645,6 +5651,15 @@ bool matmul_f32_dev_device_weight(const QuantizedTensor& W, const void* d_w,
   if (!W.valid() || W.dims().size() != 2 || !d_w || !X || !Y || n <= 0)
     return false;
   return matmul_f32_weight_dev(W, d_w, X, Y, n);
+}
+
+bool matmul_f32_dev_device_weight_identity(const QuantizedTensor& W,
+                                           const void* d_w, const float* X,
+                                           float* Y, int n) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2 || !d_w || !X || !Y || n <= 0)
+    return false;
+  return matmul_f32_weight_dev(W, d_w, X, Y, n, /*identity=*/true);
 }
 
 // Public host-span batched matmul: uploads X, runs the device-resident matmul,

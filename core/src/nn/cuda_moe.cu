@@ -557,7 +557,7 @@ bool moe_experts_dev(const float* x, const int64_t* ids_host,
                      const int32_t* slots_host,
                      const MoeExpertWeights& experts, MoeActivation activation,
                      float* y, uint64_t rows, uint64_t k, uint64_t d,
-                     bool group_by_expert, const MoeExpertPool& pool,
+                     MoeRows mode, const MoeExpertPool& pool,
                      void* stream, const uint64_t* entry_events) {
   if (!quant::cuda::available() || rows == 0 || k == 0 || d == 0 || !x ||
       !ids_host || !weights_dev || !y || !slots_host)
@@ -585,10 +585,10 @@ bool moe_experts_dev(const float* x, const int64_t* ids_host,
   sonicboom::cuda::StreamScope scope(s);
   const int gelu = activation == MoeActivation::GeluFp16 ? 1 : 0;
 
-  if (!group_by_expert) {
-    // Decode / verify: one (row, expert) at a time, the decode gemv per
-    // projection, the activation and the multiply fused into one kernel whose
-    // per-element arithmetic is the host silu/gelu_fp16 + multiply.
+  if (mode == MoeRows::PerRow) {
+    // Decode: one (row, expert) at a time, the decode gemv per projection, the
+    // activation and the multiply fused into one kernel whose per-element
+    // arithmetic is the host silu/gelu_fp16 + multiply.
     float* out = static_cast<float*>(
         scratch(kDecodeOut, rows * k * d * sizeof(float)));
     float* gate =
@@ -645,8 +645,9 @@ bool moe_experts_dev(const float* x, const int64_t* ids_host,
     return cudaGetLastError() == cudaSuccess;
   }
 
-  // Prefill: group the rows by expert in ascending expert order, exactly as the
-  // host form builds its lists (row ascending, the first matching selection).
+  // Grouped (prefill, or verify with the identical arithmetic): group the rows
+  // by expert in ascending expert order, exactly as the host form builds its
+  // lists (row ascending, the first matching selection).
   std::vector<int32_t> row_of;
   std::vector<int32_t> kw_of;
   std::vector<int32_t> offsets(e_count + 1, 0);
@@ -694,7 +695,15 @@ bool moe_experts_dev(const float* x, const int64_t* ids_host,
   if (cudaGetLastError() != cudaSuccess) return false;
 
   // One expert at a time on this stream, ascending: a row's accumulation order
-  // is the expert order, so no atomics are needed.
+  // is the expert order, so no atomics are needed. The verify form takes the
+  // identity batched gemv so a row's projection matches its plain decode gemv
+  // bit for bit; prefill keeps the faster tiled matmul.
+  using MatmulDev = bool (*)(const quant::QuantizedTensor&, const void*,
+                             const float*, float*, int);
+  const MatmulDev matmul_dev =
+      mode == MoeRows::GroupedIdentity
+          ? &quant::cuda::matmul_f32_dev_device_weight_identity
+          : &quant::cuda::matmul_f32_dev_device_weight;
   for (uint64_t e = 0; e < e_count; ++e) {
     const uint64_t begin = uint64_t(offsets[e]);
     const uint64_t n_e = uint64_t(offsets[e + 1]) - begin;
@@ -722,17 +731,17 @@ bool moe_experts_dev(const float* x, const int64_t* ids_host,
     moe_gather_kernel<<<moe_grid(int64_t(n_e * d)), 256, 0, s>>>(
         x, d_row + begin, X, int64_t(n_e), int64_t(d));
     if (cudaGetLastError() != cudaSuccess) return false;
-    if (!quant::cuda::matmul_f32_dev_device_weight(
-            gw, pooled(pool.gate_bytes, pool.gate_stride, slot), X, G, n_i) ||
-        !quant::cuda::matmul_f32_dev_device_weight(
-            uw, pooled(pool.up_bytes, pool.up_stride, slot), X, U, n_i))
+    if (!matmul_dev(gw, pooled(pool.gate_bytes, pool.gate_stride, slot), X, G,
+                    n_i) ||
+        !matmul_dev(uw, pooled(pool.up_bytes, pool.up_stride, slot), X, U,
+                    n_i))
       return false;
     const int ff_i = int(ff * n_e);
     moe_act_mul_kernel<<<moe_grid(ff_i), 256, 0, s>>>(
         G, U, G, ff_i, gelu);
     if (cudaGetLastError() != cudaSuccess) return false;
-    if (!quant::cuda::matmul_f32_dev_device_weight(
-            dw, pooled(pool.down_bytes, pool.down_stride, slot), G, D, n_i))
+    if (!matmul_dev(dw, pooled(pool.down_bytes, pool.down_stride, slot), G, D,
+                    n_i))
       return false;
     moe_scatter_kernel<<<moe_grid(int64_t(n_e * d)), 256, 0, s>>>(
         D, d_row + begin, d_w + begin, y, int64_t(n_e), int64_t(d));

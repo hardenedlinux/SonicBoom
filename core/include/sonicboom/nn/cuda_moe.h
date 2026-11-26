@@ -98,6 +98,14 @@ bool moe_experts(std::span<const float> x, std::span<const int64_t> ids,
                  std::span<float> y, uint64_t rows, bool group_by_expert,
                  const MoeExpertPool* pool = nullptr);
 
+// How the device-resident form walks the selection. PerRow is decode (and any
+// batch whose rows may differ from plain decoding); Grouped is prefill (one
+// batched matmul per expert, the faster tile); GroupedIdentity is verify — the
+// rows are grouped per expert so each weight is read once, but the projection
+// runs the per-column-identical batched gemv, so every row's output is
+// bit-identical to the PerRow form's for that row (the verify contract).
+enum class MoeRows { PerRow, Grouped, GroupedIdentity };
+
 // The device-resident form of the same node. x, weights_dev, y and slots_dev
 // are device buffers, x [rows, d], weights_dev [rows, k], y [rows, d] and
 // slots_dev [rows, k]; y must be zeroed by the caller (the backend issues a
@@ -105,11 +113,13 @@ bool moe_experts(std::span<const float> x, std::span<const int64_t> ids,
 // the host copies of the two routing results (the pool selection reads ids
 // back; slots are the pool's assignment), so the node downloads only the ids.
 //
-// The arithmetic is the host form's: the decode/verify path runs one gemv per
-// (row, expert) and a final j-ascending weighted sum; the prefill path groups
-// the rows by expert and visits the experts in ascending index on one stream,
-// scattering with an explicit __fadd_rn/__fmul_rn. `stream` is an opaque CUDA
-// stream handle (nullptr = the current stream); the kernels run there.
+// The arithmetic is the host form's: the decode path runs one gemv per
+// (row, expert) and a final j-ascending weighted sum; the grouped paths visit
+// the experts in ascending index on one stream, scattering with an explicit
+// __fadd_rn/__fmul_rn, so a row accumulates in that same order. The grouped
+// verify form keeps the batched projection per-column identical to the decode
+// gemv, so its rows are bit-identical to per-row verify. `stream` is an opaque
+// CUDA stream handle (nullptr = the current stream); the kernels run there.
 //
 // `entry_events` (optional, one per (row, expert) in the order of ids/slots) is
 // the pool's completion mark for that selection entry: a nonzero value makes
@@ -121,7 +131,7 @@ bool moe_experts_dev(const float* x, const int64_t* ids_host,
                      const int32_t* slots_host,
                      const MoeExpertWeights& experts, MoeActivation activation,
                      float* y, uint64_t rows, uint64_t k, uint64_t d,
-                     bool group_by_expert, const MoeExpertPool& pool,
+                     MoeRows mode, const MoeExpertPool& pool,
                      void* stream = nullptr,
                      const uint64_t* entry_events = nullptr);
 

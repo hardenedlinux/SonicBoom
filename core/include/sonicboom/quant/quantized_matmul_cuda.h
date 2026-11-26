@@ -147,6 +147,16 @@ bool matvec_f32_dev_device_weight(const QuantizedTensor& W, const void* d_w,
                                   const float* x, float* y);
 bool matmul_f32_dev_device_weight(const QuantizedTensor& W, const void* d_w,
                                   const float* X, float* Y, int n);
+// The batched form restricted to the per-column-identical arithmetic: the q8_1
+// warp-per-row gemv (the decode gemv's vec_dot, shared across the batch), never
+// the MMQ or cuBLAS tile, so column c of Y is bit-identical to
+// matvec_f32_dev_device_weight on column c of X. A caller that must keep one
+// row's result equal to a plain decode step (the verify path) takes this; the
+// weight is still read once per batch. Slower than matmul_f32_dev_device_weight
+// on prefill-sized batches, so prefill keeps the general form.
+bool matmul_f32_dev_device_weight_identity(const QuantizedTensor& W,
+                                           const void* d_w, const float* X,
+                                           float* Y, int n);
 
 // Loader hook for the same cache: record that `dptr` already holds W's packed
 // bytes, so later calls skip the upload. The caller owns the allocation, which
