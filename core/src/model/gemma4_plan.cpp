@@ -2337,6 +2337,10 @@ static int verify_width_limit(const Gemma4Model& m, uint64_t n_ctx,
 // the headroom an unwarmed runtime would claim.
 static bool verify_priceable(const Gemma4Model& m, uint64_t n_ctx, int rows,
                              const planner::KvCacheSession& session);
+// Whether this recipe's verify widths are warmed and captured at load (see the
+// definition with the set below). A recipe that cannot be warmed builds each
+// width lazily, when a verify first reaches it.
+static bool verify_capturable(const Gemma4Model& m);
 
 // Fill the lengths the budget did not reach from the ones it did: linear
 // between measured points, and past the deepest measured point the last
@@ -2483,7 +2487,14 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
   // a curve measurement: inside the budget below, a mixture-of-experts recipe's
   // ~19 graph builds spend most of it and the tail is priced by extrapolation
   // from a two-point curve.
-  (void)verify_priceable(m, n_ctx, int(SpecLengthPolicy::kMax) + 1, session);
+  //
+  // A recipe whose widths are built lazily (routed experts, recurrent state,
+  // decode graph disabled) is not priced here at all: building the envelope at
+  // load costs device memory this load cannot give back, and the policy prices
+  // those widths from the verifies a request actually runs.
+  const bool capturable = verify_capturable(m);
+  if (capturable)
+    (void)verify_priceable(m, n_ctx, int(SpecLengthPolicy::kMax) + 1, session);
 
   const bool replay_ok =
       rt.prog && rt.cuda->capture_resources_ok(session.cache_id);
@@ -2539,7 +2550,10 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
     // A length whose runtime the load did not warm allocates its buffers on
     // this pass. When the warm stopped at the memory floor, that is exactly
     // the allocation that must not happen: leave the knot to interpolation.
-    if (k != 0 && !verify_priceable(m, n_ctx, int(k) + 1, session)) continue;
+    // A recipe whose widths are built lazily is not priced past k = 0 here.
+    if (k != 0 &&
+        (!capturable || !verify_priceable(m, n_ctx, int(k) + 1, session)))
+      continue;
     // The budget is checked before a length is started and before its timed
     // passes: a length whose build would overrun it is abandoned rather than
     // priced from a partial sample. The projection stops a whole length from
@@ -2955,6 +2969,23 @@ static uint64_t run_spec_program_steps(
     const int width_limit = verify_width_limit(m, session.n_ctx, session);
     if (width_limit > 0 && width_limit < usable_bucket)
       usable_bucket = verify_bucket_at_most(width_limit);
+    // A width is usable only if its verify can run now. A captured width has
+    // its buffers resident and is always usable. A recipe with no captured
+    // step builds the width inside the verify, at the width the proposal needs;
+    // with the device below the warm headroom that build cannot succeed, so the
+    // loop prices the width unusable here and takes the plain step instead —
+    // its floor — rather than attempting a verify (and a build) that must fail.
+    while (usable_bucket >= 2) {
+      if (verify_capturable(m)) {
+        if (verify_priceable(m, session.n_ctx, usable_bucket, session)) break;
+      } else {
+        uint64_t free_b = 0;
+        if (!planner::device::free_bytes(&free_b) ||
+            free_b >= kVerifyWarmHeadroomBytes)
+          break;
+      }
+      usable_bucket = verify_bucket_at_most(usable_bucket - 1);
+    }
     const uint64_t room =
         usable_bucket >= 2
             ? std::min<uint64_t>(uint64_t(cap), uint64_t(usable_bucket - 1))
@@ -4419,6 +4450,18 @@ static int verify_row_limit() {
   return verify_bucket_of(cap + 1);
 }
 
+// Whether this recipe's verify widths are warmed and captured at load. A recipe
+// with routed experts or recurrent state cannot be warmed (§10), and with the
+// decode graph disabled nothing can be captured; for those, building the whole
+// envelope at load buys no capture, and each width's backend holds device
+// memory for the life of the process (measured: ~55 MB per width on the 35B
+// MoE), so the widths are built one at a time when a verify first reaches
+// them, under the same headroom rule.
+static bool verify_capturable(const Gemma4Model& m) {
+  return cuda_graph_decode_enabled() && !model_has_routed_experts(m) &&
+         !model_has_recurrent_state(m);
+}
+
 static std::unique_ptr<VerifyRuntime>
 build_verify_runtime(const Gemma4Model& m, uint64_t n_ctx, int rows,
                      const planner::KvCacheSession& session) {
@@ -4524,9 +4567,18 @@ static std::unique_ptr<VerifySet> build_verify_set(
   if (build_upto < 2) return nullptr;
   // Each bucket's warm-up executes a verify step on the session; a recipe with
   // routed experts or recurrent state is neither warmed nor captured (§10).
-  const bool graphs = cuda_graph_decode_enabled() &&
-                      !model_has_routed_experts(m) &&
-                      !model_has_recurrent_state(m);
+  const bool graphs = verify_capturable(m);
+  // A recipe that is not warmed claims no device memory here: its runtimes run
+  // through the executor and allocate their working set on first use. On a
+  // device already below the warm headroom those allocations cannot be served,
+  // so the set is not built at all; every width then prices as unusable and
+  // the loop takes the plain step (the same behaviour as a mode that never
+  // verifies). A dense recipe is covered by the memory floor in the warm loop
+  // below, which measures the same headroom before each warm.
+  uint64_t free_before = 0;
+  (void)planner::device::free_bytes(&free_before);
+  if (!graphs && free_before != 0 && free_before < kVerifyWarmHeadroomBytes)
+    return nullptr;
   const auto t0 = std::chrono::steady_clock::now();
   const auto elapsed_ms = [&] {
     return std::chrono::duration<double, std::milli>(
@@ -4633,11 +4685,14 @@ static std::unique_ptr<VerifySet> build_verify_set(
   }
   set->limit = verify_bucket_at_most(limit_rows);
   if (spec_diag_enabled()) {
+    uint64_t free_b = 0;
+    (void)planner::device::free_bytes(&free_b);
     std::fprintf(stderr,
                  "[spec-cost] verify set rows=2..%d (buckets) built=%d "
-                 "warmed=%d captured=%d %.0fms budget=%.0fms\n",
+                 "warmed=%d captured=%d %.0fms budget=%.0fms free=%llu->%llu\n",
                  build_upto, built, warmed, captured, elapsed_ms(),
-                 kSpecVerifySetBudgetMs);
+                 kSpecVerifySetBudgetMs, (unsigned long long)free_before,
+                 (unsigned long long)free_b);
   }
   return built > 0 ? std::move(set) : nullptr;
 }
@@ -4664,6 +4719,23 @@ static VerifySet* get_verify_set(const Gemma4Model& m, uint64_t n_ctx,
     if (it != g_verify_runtimes.end()) return it->second.get();
   }
 
+  // A recipe that cannot be warmed or captured builds no width here: the set
+  // is registered empty and get_verify_runtime builds each width on first use.
+  // Building the envelope at load would hold one backend's device memory per
+  // width (see verify_capturable) with no capture to amortize it.
+  if (!verify_capturable(m)) {
+    auto set = std::make_unique<VerifySet>();
+    set->cache = session.caches;
+    set->cache_id = session.cache_id;
+    set->limit = 0;  // no built limit: each width is priced when reached
+    std::lock_guard<std::mutex> lk(g_registry_mutex);
+    auto it = g_verify_runtimes.find(key);
+    if (it != g_verify_runtimes.end()) return it->second.get();
+    VerifySet* raw = set.get();
+    g_verify_runtimes.emplace(key, std::move(set));
+    return raw;
+  }
+
   auto set = build_verify_set(m, n_ctx, session);
   if (!set) return nullptr;
   if (tune_resolution_failed("verify set")) return nullptr;
@@ -4680,16 +4752,16 @@ static void warm_verify_set(const Gemma4Model& m, uint64_t n_ctx,
                             const planner::KvCacheSession& session) {
   // §10: no warm (or captured) run is executed for a recipe with recurrent
   // state or routed experts — the former would advance its state, the latter
-  // would stream expert weights. The set's runtimes are still built: skipping
-  // the whole call would put ~19 graph builds inside the first verify, i.e.
-  // inside the first request's decode step. build_verify_set makes the same
-  // decision internally (it warms and captures only the dense path), so the
-  // build is the only work this does for those recipes.
+  // would stream expert weights. Such a recipe builds no width at load at all:
+  // this call only registers the session's (empty) set, and each width is
+  // built when a verify first reaches it (get_verify_runtime).
   (void)get_verify_set(m, n_ctx, session);
 }
 
-// The verify graph for one width, from the session's set. Never builds: every
-// reachable width was built by the load warm-up (see build_verify_set).
+// The verify graph for one width, from the session's set. A capturable
+// recipe's widths were built by the load warm-up (see build_verify_set); a
+// recipe that cannot be captured builds the one width here, on first use, and
+// keeps it only if the device still has the warm headroom afterwards.
 static VerifyRuntime* get_verify_runtime(const Gemma4Model& m, uint64_t n_ctx,
                                          int rows,
                                          const planner::KvCacheSession& session) {
@@ -4698,7 +4770,30 @@ static VerifyRuntime* get_verify_runtime(const Gemma4Model& m, uint64_t n_ctx,
   if (bucket == 0) return nullptr;
   VerifySet* set = get_verify_set(m, n_ctx, session);
   if (!set) return nullptr;
-  return set->rows[size_t(bucket)].get();
+  if (VerifyRuntime* rt = set->rows[size_t(bucket)].get()) return rt;
+  // A capturable set was built whole at load; a null slot there means the
+  // width was trimmed for memory and must not be rebuilt inside a request.
+  if (verify_capturable(m)) return nullptr;
+  uint64_t free_b = 0;
+  if (planner::device::free_bytes(&free_b) &&
+      free_b < kVerifyWarmHeadroomBytes)
+    return nullptr;
+  auto built = build_verify_runtime(m, n_ctx, bucket, session);
+  if (!built) return nullptr;
+  // The build claims a backend's buffers for the life of the process. Keep it
+  // only when the device still has the headroom a later prefill needs; the
+  // discarded runtime's buffers are parked in the pool, so trim them back to
+  // the driver rather than leaving the device that short.
+  if (planner::device::free_bytes(&free_b) &&
+      free_b < kVerifyWarmHeadroomBytes) {
+    built.reset();
+    planner::device::trim();
+    return nullptr;
+  }
+  std::lock_guard<std::mutex> lk(g_registry_mutex);
+  auto& slot = set->rows[size_t(bucket)];
+  if (!slot) slot = std::move(built);
+  return slot.get();
 }
 
 // The widest width the session's set will serve, without building it. 0 when
