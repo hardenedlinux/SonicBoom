@@ -3242,9 +3242,19 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           fweight(slot),
           fweight(static_cast<model::WeightSlot>(slot_dt_i)),
           fweight(static_cast<model::WeightSlot>(slot_a_i))};
-      const auto r = states_->commit(size_t(state_index), uint32_t(layer),
-                                     start, w, dev(in[0]), dev(in[1]),
-                                     dev(in[2]), int(rows), out);
+      // A verify stage leaves the state set to the caller: the scan runs into
+      // scratch and journals its rows, so the accepted prefix can be committed
+      // (or the batch dropped) after the draft decision. A decode step
+      // commits. Both paths run the same kernel row by row, so an accepted
+      // row's state is bit-identical to the plain decode it stands for.
+      const auto r =
+          recurrent_tentative_
+              ? states_->tentative(size_t(state_index), uint32_t(layer),
+                                   start, w, dev(in[0]), dev(in[1]),
+                                   dev(in[2]), int(rows), out)
+              : states_->commit(size_t(state_index), uint32_t(layer), start,
+                                w, dev(in[0]), dev(in[1]), dev(in[2]),
+                                int(rows), out);
       if (!r) return std::unexpected(fail(r.error()));
       ok = true;
       break;

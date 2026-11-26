@@ -84,6 +84,11 @@ class GdnStateDev {
   // Accept the first `keep` rows of the pending tentative scan (1 <= keep <=
   // pending rows).
   std::expected<void, std::string> accept(uint32_t layer, uint64_t keep);
+  // The same, naming the layer the pending scan recorded: a caller that
+  // commits a whole state set after a verify has no per-state layer at hand.
+  std::expected<void, std::string> accept(uint64_t keep) {
+    return accept(journal_layer_, keep);
+  }
 
   // Drop the pending tentative scan; the committed state is unchanged.
   void discard() noexcept;
@@ -118,9 +123,10 @@ class GdnStateDev {
   hal::Buffer journal_al_;
   hal::Buffer scratch_out_;
   uint64_t journal_rows_ = 0;
-  // The pending tentative scan: its weights and position.
+  // The pending tentative scan: its weights, position and block.
   nn::GdnWeights journal_weights_{};
   uint64_t journal_pos_ = 0;
+  uint32_t journal_layer_ = 0;
 
   uint64_t pending_ = 0;
 };
@@ -156,6 +162,9 @@ class StateSetDev {
   std::expected<void, std::string> accept(size_t index, uint32_t layer,
                                           uint64_t keep) {
     return states_[index].accept(layer, keep);
+  }
+  std::expected<void, std::string> accept(size_t index, uint64_t keep) {
+    return states_[index].accept(keep);
   }
   void discard(size_t index) { states_[index].discard(); }
   void reset() {

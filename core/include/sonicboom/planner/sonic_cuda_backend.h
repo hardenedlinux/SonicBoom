@@ -395,6 +395,16 @@ public:
   void set_kv_write_suppressed(bool on) noexcept { kv_write_suppressed_ = on; }
   bool kv_write_suppressed() const noexcept { return kv_write_suppressed_; }
 
+  // Verify rollback seam: while set, execute() runs a GdnScan node as a
+  // tentative scan — scratch and journal, committed state untouched — instead
+  // of a commit. The caller resolves the batch afterwards with
+  // StateSetDev::accept(keep) or discard(). Only a verify graph sets it; a
+  // decode step always commits.
+  void set_recurrent_tentative(bool on) noexcept {
+    recurrent_tentative_ = on;
+  }
+  bool recurrent_tentative() const noexcept { return recurrent_tentative_; }
+
 private:
   const model::Gemma4Model* model_ = nullptr;  // compute model (weights/config), bound via bind_model()
   KvCacheSpec spec_;                           // KV-cache geometry (owned copy)
@@ -442,6 +452,7 @@ private:
   uint64_t segment_extent_ = 0;     // bound prefill segment length (0: static)
   std::unique_ptr<NodeDump> dump_;  // null unless the debug dump is on
   bool kv_write_suppressed_ = false;  // warm-up: skip KV stores (see setter)
+  bool recurrent_tentative_ = false;  // verify: GdnScan runs tentative (see setter)
 
   // The routed experts' per-layer views (3 x experts QuantizedTensor views and
   // the roles they bind), built once per layer and reused by every

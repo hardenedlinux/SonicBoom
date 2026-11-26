@@ -96,6 +96,7 @@ std::expected<void, std::string> GdnState::tentative(
   journal_al_.assign(al.begin(), al.end());
   journal_weights_ = weights;
   journal_pos_ = pos_;
+  journal_layer_ = layer;
   pending_ = qkv.size() / channels(dims_);
   return {};
 }

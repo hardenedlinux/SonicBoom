@@ -125,6 +125,7 @@ void GdnStateDev::swap(GdnStateDev& other) noexcept {
   std::swap(journal_rows_, other.journal_rows_);
   std::swap(journal_weights_, other.journal_weights_);
   std::swap(journal_pos_, other.journal_pos_);
+  std::swap(journal_layer_, other.journal_layer_);
   std::swap(pending_, other.pending_);
 }
 
@@ -233,6 +234,7 @@ std::expected<void, std::string> GdnStateDev::tentative(
 
   journal_weights_ = weights;
   journal_pos_ = pos_;
+  journal_layer_ = layer;
   pending_ = uint64_t(rows);
   return {};
 }

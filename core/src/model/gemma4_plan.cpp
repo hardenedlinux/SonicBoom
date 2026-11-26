@@ -2454,6 +2454,9 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
           us = std::chrono::duration<double, std::micro>(
                    std::chrono::steady_clock::now() - t0)
                    .count();
+        // A price is a repeat of the same rows at the same position: the
+        // tentative recurrent scans are dropped, never committed.
+        if (model_has_recurrent_state(m)) verify_resolve_states(m, session, 0);
       }
       if (us < 0.0) {
         ok = false;
@@ -3030,6 +3033,9 @@ static uint64_t run_spec_program_steps(
         diag_on ? diag::spec_diag_snapshot() : diag::SpecDiagSnapshot{};
     if (!verify_step_spine_cuda(m, feed, L, session, rows)) {
       std::cerr << "[spec] the verify step failed at position " << L << "\n";
+      // A failed verify may have left some scans tentative; drop them so the
+      // session's states are back at their committed position.
+      if (model_has_recurrent_state(m)) verify_resolve_states(m, session, 0);
       break;
     }
     // A real (non warm-up) verify prices its own k; its sync has completed the
@@ -3103,7 +3109,10 @@ static uint64_t run_spec_program_steps(
           policy.bootstrap_left = 0;
       }
     }
-    if (decision.emitted == 0) break;  // the bound was already reached
+    if (decision.emitted == 0) {  // the bound was already reached
+      if (model_has_recurrent_state(m)) verify_resolve_states(m, session, 0);
+      break;
+    }
     // The emit hook sees the run in order before it is committed. A stop
     // inside the batch commits only the tokens it took; the verify rows past
     // them are dead (the same rollback a rejected draft takes), so the
@@ -3115,6 +3124,12 @@ static uint64_t run_spec_program_steps(
       if (emit_n < decision.emitted)
         g_spec_counters.emitted_tokens -= decision.emitted - emit_n;
     }
+    // Resolve the verify's tentative recurrent scans: exactly the rows this
+    // run keeps are committed (the same kernel over the journaled inputs, so
+    // the state matches plain decoding them) and the rest are dropped.
+    if (model_has_recurrent_state(m) &&
+        !verify_resolve_states(m, session, uint64_t(emit_n)))
+      break;
     if (emit_n == 0) break;
     for (size_t i = 0; i < emit_n; ++i) {
       tokens[step + i] = int64_t(run[i]);
@@ -3610,6 +3625,19 @@ uintptr_t decode_runtime_identity(const Gemma4Model& m, uint64_t n_ctx,
   return it == g_decode_runtimes.end()
              ? 0
              : reinterpret_cast<uintptr_t>(it->second.get());
+}
+
+bool kv_session_publish_states(const Gemma4Model& m,
+                               planner::KvCacheSession& session) {
+  if (!model_has_recurrent_state(m)) return false;
+  if (session.states) return true;
+  if (!session.caches || session.cache_id == 0 || session.n_ctx == 0)
+    return false;
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
+  DecodeRuntime* drt = get_decode_runtime(m, session.n_ctx, &session);
+  if (!drt || !drt->cuda->states()) return false;
+  session.states = drt->cuda->states();
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -4968,7 +4996,8 @@ static bool run_verify_step(const Gemma4Model& m,
                             planner::KvCacheSession& session,
                             std::span<const uint64_t> tokens,
                             uint64_t start_pos, VerifyRuntime* rt,
-                            std::span<int64_t> out, const char* tag) {
+                            std::span<int64_t> out, const char* tag,
+                            bool tentative_states = false) {
   auto fail = [tag](const char* why) {
     std::cerr << tag << why << "\n";
     return false;
@@ -4989,8 +5018,11 @@ static bool run_verify_step(const Gemma4Model& m,
   }
   // Replay only while the capture's recorded resources are still this
   // session's; otherwise run the same graph through the uncaptured executor.
+  // A tentative-state verify never replays: a capture records the commit form
+  // of a GdnScan, and the flag cannot change what a recorded graph does.
   const bool replay_ok =
-      rt->prog && rt->cuda->capture_resources_ok(session.cache_id);
+      !tentative_states && rt->prog &&
+      rt->cuda->capture_resources_ok(session.cache_id);
   if (rt->prog && !replay_ok)
     log_capture_refusal("verify", m, session.n_ctx, session.cache_id);
   if (replay_ok) {
@@ -5009,12 +5041,28 @@ static bool run_verify_step(const Gemma4Model& m,
     if (!replayed || !rt->prog->sync())
       return fail("graph replay failed");
   } else {
+    // A tentative verify scans the session's recurrent state set. The set
+    // belongs to the decode runtime the session's prefill/decode steps
+    // advanced; a session caller never had it published into
+    // KvCacheSession::states, so take it from the decode runtime (already
+    // built by the steps that led here). A verify backend built without it
+    // would scan a fresh zeroed state at position 0. Captures are never
+    // replayed for a tentative verify, so adopting cannot disturb a recorded
+    // graph.
+    if (tentative_states) {
+      kv_session_publish_states(m, session);
+      if (session.states &&
+          rt->cuda->states().get() != session.states.get())
+        rt->cuda->share_caches(session);
+    }
     if (!rt->cuda->set_prefill_tokens(staged) ||
         !rt->cuda->set_verify_pos(start_pos, capacity))
       return fail("staging failed");
     std::vector<sx::Bytes> in{encode_i64(0), encode_i64(start_pos)};
     rt->add_steer(in);
+    rt->cuda->set_recurrent_tentative(tentative_states);
     auto res = rt->exec->execute(rt->plan, rt->snap, in);
+    rt->cuda->set_recurrent_tentative(false);
     if (!res) {
       std::cerr << tag << "execute failed: " << res.error().message << "\n";
       return false;
@@ -5050,6 +5098,12 @@ bool verify_step_spine_cuda(const Gemma4Model& m,
   // verify set; the per-row argmax is the prefill graph's hidden state
   // projected through the lm-head.
   if (spec_mode() == SpecMode::Reckless) {
+    // The reckless path's GdnScan commits every row of the batch. A recurrent
+    // model needs the tentative form and a rollback after the draft decision,
+    // which only the decode-dealt verify set provides.
+    if (model_has_recurrent_state(m))
+      return fail("reckless verify needs the tentative state path, which the "
+                  "prefill graph does not carry");
     if (!verify_step_reckless(m, tokens, start_pos, session, out))
       return fail("reckless prefill verify failed");
     return true;
@@ -5060,8 +5114,31 @@ bool verify_step_spine_cuda(const Gemma4Model& m,
   // hold the bucket, not just the feed.
   if (start_pos + uint64_t(rt->rows_capacity) > session.n_ctx)
     return fail("the verify bucket exceeds the session cache");
+  // A recurrent model's verify scans each GdnScan node tentatively: the
+  // committed state stands until the caller resolves the batch with
+  // verify_resolve_states (or discards it).
   return run_verify_step(m, session, tokens, start_pos, rt, out,
-                         "[spec] verify: ");
+                         "[spec] verify: ", model_has_recurrent_state(m));
+}
+
+bool verify_resolve_states(const Gemma4Model& m,
+                           planner::KvCacheSession& session, uint64_t keep) {
+  if (!model_has_recurrent_state(m) || !session.states) return true;
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
+  auto* set = static_cast<planner::StateSetDev*>(session.states.get());
+  for (size_t i = 0; i < set->size(); ++i) {
+    if (set->state(i).pending() == 0) continue;
+    if (keep == 0) {
+      set->state(i).discard();
+      continue;
+    }
+    auto r = set->state(i).accept(keep);
+    if (!r) {
+      std::cerr << "[spec] state commit: " << r.error() << "\n";
+      return false;
+    }
+  }
+  return true;
 }
 
 // One batch of forced tokens: rows 2..15, the same per-row arithmetic as plain
@@ -5090,8 +5167,16 @@ bool verify_step_forced_cuda(const Gemma4Model& m,
   if (!rt) return fail("verify runtime build failed");
   if (start_pos + uint64_t(rt->rows_capacity) > session.n_ctx)
     return fail("the verify bucket exceeds the session cache");
-  return run_verify_step(m, session, tokens, start_pos, rt, out,
-                         "[grammar] verify: ");
+  // The caller takes every fed row of a forced batch, so the batch commits
+  // whole; a recurrent model still scans tentatively so the padding rows the
+  // bucket writes past the feed are dropped, not committed.
+  const bool tentative = model_has_recurrent_state(m);
+  if (!run_verify_step(m, session, tokens, start_pos, rt, out,
+                       "[grammar] verify: ", tentative))
+    return false;
+  if (tentative && !verify_resolve_states(m, session, uint64_t(rows)))
+    return fail("state commit failed");
+  return true;
 }
 
 bool spec_step_spine_cuda(const Gemma4Model& m, uint64_t last_token,
@@ -5121,13 +5206,20 @@ bool spec_step_spine_cuda(const Gemma4Model& m, uint64_t last_token,
   feed[0] = last_token;
   for (size_t i = 0; i < drafts.size(); ++i) feed[i + 1] = drafts[i];
   std::vector<int64_t> row_argmax(rows, -1);
-  if (!verify_step_spine_cuda(m, feed, start_pos, session, row_argmax))
+  if (!verify_step_spine_cuda(m, feed, start_pos, session, row_argmax)) {
+    if (model_has_recurrent_state(m)) verify_resolve_states(m, session, 0);
     return fail("verify step failed");
+  }
 
   uint64_t accepted = 0;
   while (accepted < drafts.size() &&
          row_argmax[size_t(accepted)] == int64_t(drafts[size_t(accepted)]))
     ++accepted;
+  // The committed run is the fed rows 0..accepted (last_token plus the
+  // accepted drafts); the verifier's own token is sampled, not fed.
+  if (model_has_recurrent_state(m) &&
+      !verify_resolve_states(m, session, accepted + 1))
+    return fail("state commit failed");
   for (uint64_t i = 0; i < accepted; ++i) out[i] = int64_t(drafts[size_t(i)]);
   out[accepted] = row_argmax[size_t(accepted)];
   if (accepted_out) *accepted_out = accepted;
@@ -6103,6 +6195,13 @@ bool kv_read_rows_cuda(const planner::KvCacheSession&, uint32_t, bool,
 }
 
 void release_session_runtimes(const Gemma4Model&, uint64_t, uint64_t) {}
+bool kv_session_publish_states(const Gemma4Model&, planner::KvCacheSession&) {
+  return false;  // built without CUDA: there is no device state to publish
+}
+bool verify_resolve_states(const Gemma4Model&, planner::KvCacheSession&,
+                           uint64_t) {
+  return true;  // built without CUDA: there is no tentative scan to resolve
+}
 DevicePoolStats device_pool_stats() { return DevicePoolStats{}; }
 
 std::optional<planner::PlanRunRecord> record_decode_plan(const Gemma4Model&,

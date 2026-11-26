@@ -423,11 +423,28 @@ DevicePoolStats device_pool_stats();
 // would leave it.
 // Returns false on a build/step failure. The first call for a (model, n_ctx,
 // bucket, cache) builds, plans and captures the step; later calls replay it.
+//
+// A model with recurrent state (recipe.states > 0) runs the batch's scans
+// tentatively: the committed state stands until the caller resolves the batch
+// after deciding how many rows it keeps — a partial accept re-runs the kept
+// prefix from the same committed state (the scan is row-serial, so the result
+// is bit-identical to plain decoding those rows). The spec program loop,
+// spec_step_spine_cuda and verify_step_forced_cuda resolve their own batches;
+// a direct caller resolves with verify_resolve_states before the next step.
 bool verify_step_spine_cuda(const Gemma4Model& m,
                             std::span<const uint64_t> tokens,
                             uint64_t start_pos,
                             planner::KvCacheSession& session,
                             std::span<int64_t> out);
+
+// Resolve a verify's tentative recurrent scans: commit the first `keep` rows of
+// each state's pending scan (the rows the sequence keeps, at most the batch) or
+// drop the whole batch when `keep` is 0. A committed row is re-run from the
+// same committed state over the journaled inputs, so the state matches plain
+// decoding those rows. A model with no recurrent state, or a session with
+// nothing pending, is a no-op; returns false only on a kernel failure.
+bool verify_resolve_states(const Gemma4Model& m,
+                           planner::KvCacheSession& session, uint64_t keep);
 
 // The same step for a forced-token run: a grammar step with exactly one allowed
 // token continues through the next ones the same way, so a whole run of them
@@ -462,6 +479,17 @@ bool decode_steps_spine_cuda(const Gemma4Model& m,
 uintptr_t decode_runtime_identity(const Gemma4Model& m, uint64_t n_ctx,
                                   const planner::KvCacheSession& session);
 
+// Publish the committed recurrent state set of `session`'s decode runtime into
+// the session (KvCacheSession::states) — the same adoption a tentative verify
+// performs, so a caller can snapshot it (planner::StateSetDev::save()) or
+// measure it. A session that has decoded on a model with recurrent state keeps
+// that set behind its decode runtime; this hands it out without running a scan
+// or committing anything. Resolves the session's decode runtime, building it
+// if the session has not reached one yet. Returns false for a model with no
+// recurrent state, a session with no cache, or a runtime build failure.
+bool kv_session_publish_states(const Gemma4Model& m,
+                               planner::KvCacheSession& session);
+
 // SONICBOOM_SPEC=reckless runs the verify rows through the batch prefill
 // kernels instead of the decode graph dealt over rows, so a speculative run is
 // no longer bit-identical to plain decoding (the mode logs that once). Under
@@ -489,6 +517,13 @@ bool spec_reckless_unsupported();
 // order. The session's token history records exactly the accepted run
 // (last_token and drafts[0..a-1]), so prefix reuse after a speculative session
 // matches only KV that belongs to accepted tokens.
+//
+// A model with recurrent state rolls its state back the same way: the verify's
+// tentative scans are committed for exactly the fed rows of the accepted run
+// (last_token and drafts[0..a-1]) and the rejected ones are dropped, so the
+// state the next step continues from is the state plain decoding the accepted
+// tokens would have produced. The session's state position therefore always
+// matches its token history.
 bool spec_step_spine_cuda(const Gemma4Model& m, uint64_t last_token,
                           std::span<const uint64_t> drafts,
                           planner::KvCacheSession& session,
