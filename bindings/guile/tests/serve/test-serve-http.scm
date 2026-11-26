@@ -44,22 +44,30 @@
 (define log-file (format #f "~a/sonicboom-serve-test-~a.log" tmp (getpid)))
 (define request-log-file
   (format #f "~a/sonicboom-serve-requests-~a.jsonl" tmp (getpid)))
+(define replay-dir (format #f "~a/sonicboom-serve-replay-~a" tmp (getpid)))
 ;; The server appends to the request log; start each run with no stale lines.
 (when (file-exists? request-log-file) (delete-file request-log-file))
+(when (file-exists? replay-dir)
+  (system* "rm" "-rf" replay-dir))
 
-(define server-pid
+(define (spawn-server p rt log rlog rdir)
   (let ((pid (primitive-fork)))
     (if (zero? pid)
-        (let ((out (open-output-file log-file)))
+        (let ((out (open-output-file log)))
           (dup2 (fileno out) 1)
           (dup2 (fileno out) 2)
           (execlp "guile" "guile" "-L" "bindings/guile/scheme"
                   "bindings/guile/scheme/sonicboom/serve/app.scm"
                   "--backend" (or (getenv "SONICBOOM_SERVE_BACKEND") "mock")
-                  "--port" (number->string port) "--queue" "1" "--step-delay" "0.01"
-                  "--request-log" request-log-file
-                  "--runtime-dir" (format #f "~a/sonicboom-serve-test-~a" tmp (getpid))))
+                  "--port" (number->string p) "--queue" "1" "--step-delay" "0.01"
+                  "--request-log" rlog
+                  "--replay-store" rdir
+                  "--runtime-dir" rt))
         pid)))
+
+(define server-pid
+  (spawn-server port (format #f "~a/sonicboom-serve-test-~a" tmp (getpid))
+                log-file request-log-file replay-dir))
 
 (define (stop-server)
   (catch #t (lambda () (kill server-pid SIGKILL) (waitpid server-pid)) (lambda _ #f)))
@@ -74,11 +82,11 @@
                 (else (match (assoc k o) ((_ . v) v) (#f #f)))))
         obj path))
 
-(define* (http method path #:optional body)
+(define* (http-at base-url method path #:optional body)
   ;; -> (status . json)
   (call-with-values
       (lambda ()
-        (http-request (string-append base path) #:method method
+        (http-request (string-append base-url path) #:method method
                       #:body (and body (string->utf8 (if (string? body)
                                                          body
                                                          (scm->json-string body))))
@@ -89,6 +97,24 @@
             (and bv (> (bytevector-length bv) 0)
                  (catch #t (lambda () (json-string->scm (utf8->string bv)))
                    (lambda _ (utf8->string bv))))))))
+
+(define* (http method path #:optional body) (http-at base method path body))
+
+;; The response headers of one request, for the header checks.
+(define* (http-response method path #:optional body)
+  (call-with-values
+      (lambda ()
+        (http-request (string-append base path) #:method method
+                      #:body (and body (string->utf8 (scm->json-string body)))
+                      #:headers '((content-type application/json))
+                      #:decode-body? #f #:keep-alive? #f))
+    (lambda (resp bv) resp)))
+
+;; HTTP header names are case-insensitive; Artanis canonicalises them.
+(define (header-value resp name)
+  (any (lambda (h)
+         (and (string-ci=? (symbol->string (car h)) name) (cdr h)))
+       (response-headers resp)))
 
 (define (chat body) (http 'POST "/v1/chat/completions" body))
 
@@ -366,7 +392,7 @@
                    ("temperature" . 2.0) ("repeat_penalty" . 1.2) ("seed" . 3)))))
     (test-equal "repeat_penalty: accepted" 200 (car r))
     (test-equal "repeat_penalty: the seed is echoed" 3
-      (jref (cdr r) "sonicboom_seed"))))
+      (jref (cdr r) "seed"))))
 
 ;; A sampling request that names no seed gets one, and the reply reports it;
 ;; replaying it reproduces the reply.
@@ -374,17 +400,99 @@
                ("messages" . #((("role" . "user") ("content" . "a seedless sample"))))
                ("temperature" . 2.0)))
        (first (cdr (chat body)))
-       (seed (jref first "sonicboom_seed")))
+       (seed (jref first "seed")))
   (test-assert "seed: a sampling request without one gets a seed"
     (integer? seed))
   (test-equal "seed: the reply reports it" seed
-    (jref (cdr (chat `(,@body ("seed" . ,seed)))) "sonicboom_seed"))
+    (jref (cdr (chat `(,@body ("seed" . ,seed)))) "seed"))
   (test-equal "seed: replaying it reproduces the reply"
     (jref first "choices" 0 "message" "content")
     (jref (cdr (chat `(,@body ("seed" . ,seed)))) "choices" 0 "message" "content"))
-  (test-equal "seed: a greedy reply reports 0" 0
-    (jref (cdr (chat (request gemma (list (msg "user" "greedy seed")))))
-          "sonicboom_seed")))
+  (test-equal "seed: a greedy reply reports null" 'null
+    (jref (cdr (chat (request gemma (list (msg "user" "greedy seed"))))) "seed")))
+
+;; The reproducibility fields: the sonicboom object on every reply, the seed
+;; header on a sampled one, and no header on a greedy one.
+(let ((resp (http-response 'POST "/v1/chat/completions"
+                           (request gemma (list (msg "user" "the header seed"))
+                                    '("temperature" . 0.8) '("seed" . 9)))))
+  (test-equal "header: X-SonicBoom-Seed is the request's seed" "9"
+    (header-value resp "X-SonicBoom-Seed")))
+(test-equal "header: a greedy reply has no seed header" #f
+  (header-value (http-response 'POST "/v1/chat/completions"
+                               (request gemma (list (msg "user" "no header"))))
+                "X-SonicBoom-Seed"))
+(let* ((r (cdr (chat (request gemma (list (msg "user" "the object"))
+                             '("temperature" . 0.8) '("seed" . 9)))))
+       (sb (jref r "sonicboom"))
+       (fp (jref sb "fingerprint")))
+  (test-equal "sonicboom: guarantee" "bit-identical" (jref sb "guarantee"))
+  (test-assert "sonicboom: replay_id"
+    (and (string? (jref sb "replay_id"))
+         (string-prefix? "rp-" (jref sb "replay_id"))))
+  (test-assert "sonicboom: the fingerprint names its scope"
+    (and (string? (jref fp "engine")) (string? (jref fp "commit"))
+         (string? (jref fp "numerics")) (string? (jref fp "gpu"))
+         (string? (jref fp "driver")) (string? (jref fp "tune"))
+         (string? (jref fp "model")) (= 16 (string-length (jref fp "id"))))))
+
+;; The replay store: a stored reply regenerates byte for byte, and the history
+;; page lists it.
+(let* ((body (request gemma (list (msg "user" "a replayable sample"))
+                     '("temperature" . 0.8) '("seed" . 21)))
+       (first (cdr (chat body)))
+       (id (jref first "sonicboom" "replay_id"))
+       (again (cdr (http 'POST (string-append "/sonicboom/replay/" id)))))
+  (test-equal "replay: the same content" (jref first "choices" 0 "message" "content")
+    (jref again "choices" 0 "message" "content"))
+  (test-equal "replay: the same seed" 21 (jref again "seed"))
+  (test-equal "replay: the same replay id" id (jref again "sonicboom" "replay_id"))
+  (test-equal "replay: the same guarantee" "bit-identical"
+    (jref again "sonicboom" "guarantee"))
+  (test-assert "replay: the history page lists it"
+    (let ((page (cdr (http 'GET "/sonicboom/history"))))
+      (and (string? page) (string-contains page id)))))
+
+;; The same request and seed, byte for byte: on a second request (which reuses
+;; the first one's prefix) and in a second server process.
+(let* ((body (request gemma (list (msg "user" "same bytes please"))
+                     '("temperature" . 0.8) '("seed" . 33)))
+       (one (jref (cdr (chat body)) "choices" 0 "message" "content"))
+       (two (jref (cdr (chat body)) "choices" 0 "message" "content")))
+  (test-equal "reproducible: the same request and seed twice" one two)
+  ;; The mock's plan token outranks its noise at any temperature, so two seeds
+  ;; can share a sample; the engine's contract is only that the seed it
+  ;; reports is the one the caller chose. Real models are covered by
+  ;; tools/repro-conformance.
+  (test-equal "reproducible: the reply reports the seed it was given"
+    '(33 34)
+    (list (jref (cdr (chat body)) "seed")
+          (jref (cdr (chat (request gemma
+                                    (list (msg "user" "same bytes please"))
+                                    '("temperature" . 0.8) '("seed" . 34))))
+                "seed"))))
+(let* ((p2 (free-port))
+       (rt2 (format #f "~a/sonicboom-serve-test2-~a" tmp (getpid)))
+       (log2 (format #f "~a/sonicboom-serve-test2-~a.log" tmp (getpid)))
+       (rlog2 (format #f "~a/sonicboom-serve-requests2-~a.jsonl" tmp (getpid)))
+       (rdir2 (format #f "~a/sonicboom-serve-replay2-~a" tmp (getpid)))
+       (b2 (format #f "http://127.0.0.1:~a" p2))
+       (pid2 (spawn-server p2 rt2 log2 rlog2 rdir2)))
+  (test-assert "second process: starts"
+    (let lp ((i 0))
+      (cond ((catch #t (lambda () (= 200 (car (http-at b2 'GET "/health"))))
+                    (lambda _ #f)) #t)
+            ((> i 240) #f)
+            (else (usleep 250000) (lp (1+ i))))))
+  (test-equal "second process: the same request and seed are byte-identical"
+    (jref (cdr (chat (request gemma (list (msg "user" "across processes"))
+                               '("temperature" . 0.8) '("seed" . 77))))
+          "choices" 0 "message" "content")
+    (jref (cdr (http-at b2 'POST "/v1/chat/completions"
+                        (request gemma (list (msg "user" "across processes"))
+                                 '("temperature" . 0.8) '("seed" . 77))))
+          "choices" 0 "message" "content"))
+  (kill pid2 SIGKILL) (waitpid pid2))
 
 (match (stream `(("model" . ,gemma)
                  ("messages" . #((("role" . "user") ("content" . "the seed over the wire"))))
@@ -392,9 +500,13 @@
   ((_ chunks done?)
    (test-assert "stream seed: [DONE]" done?)
    (test-equal "stream seed: the first chunk carries it" 5
-     (jref (car chunks) "sonicboom_seed"))
-   (test-equal "stream seed: later chunks do not repeat it" #f
-     (jref (cadr chunks) "sonicboom_seed"))))
+     (jref (car chunks) "seed"))
+   (test-equal "stream seed: the first chunk carries the sonicboom object"
+     "bit-identical" (jref (car chunks) "sonicboom" "guarantee"))
+   (test-equal "stream seed: an interior chunk does not repeat it" #f
+     (and (> (length chunks) 2) (jref (cadr chunks) "seed")))
+   (test-equal "stream seed: the final chunk repeats it" 5
+     (jref (last chunks) "seed"))))
 
 ;;; --- errors ------------------------------------------------------------------------
 

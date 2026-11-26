@@ -41,6 +41,7 @@
 ;;
 ;; Output:
 ;;   turn=NN gen_tokens=G seconds=S hash=<16 hex digits>
+;;          seed=<n|greedy> guarantee=<sonicboom guarantee> fingerprint=<id>
 ;;   RESULT serve arm=NAME turns=10 gen_tokens=TOTAL seconds=TOTAL tok_s=X
 ;;          hash00=<hex> ... hash09=<hex>
 ;; and each turn's text in DIR/NAME.NN.txt. The hash is FNV-1a over the
@@ -189,15 +190,18 @@ Returns: a boolean; any connection error is #f."
           (lambda (resp body) (= (response-code resp) 200)))))
     (lambda _ #f)))
 
-;; One streamed /v1/chat/completions request; returns text, tokens, seconds.
+;; One streamed /v1/chat/completions request; returns text, tokens, seconds,
+;; and the reply's seed and sonicboom object.
 (define (complete prompt n-predict)
   "Stream one greedy chat-completion request and collect its text.
 
 Args:
   prompt: the turn's instruction followed by the file, as one user message.
   n-predict: max_tokens, the turn's generation budget.
-Returns: (text completion-tokens seconds), where completion-tokens is the
-server's usage count and seconds is the wall time from request to [DONE]."
+Returns: (text completion-tokens seconds seed guarantee fingerprint), where
+completion-tokens is the server's usage count, seconds is the wall time from
+request to [DONE], seed is the reply's seed (the symbol null for greedy) and
+the last two come from the reply's sonicboom object."
   (let* ((body `(("model" . ,model-id)
                  ("messages" . #((("role" . "user") ("content" . ,prompt))))
                  ("max_tokens" . ,n-predict)
@@ -222,7 +226,7 @@ server's usage count and seconds is the wall time from request to [DONE]."
         ;; Under LC_ALL=C the default port encoding is ASCII; the stream is
         ;; UTF-8 JSON and the answers may be any script.
         (set-port-encoding! body-port "UTF-8")
-        (let loop ((chunks '()) (gen #f) (done #f))
+        (let loop ((chunks '()) (gen #f) (done #f) (seed #f) (sb #f))
           (let ((line (read-line body-port)))
             (cond
              ((eof-object? line)
@@ -232,12 +236,15 @@ server's usage count and seconds is the wall time from request to [DONE]."
                      (/ (- (get-internal-real-time) t0)
                         (exact->inexact internal-time-units-per-second))))
                 (list (apply string-append (reverse chunks))
-                      (or gen 0) seconds)))
+                      (or gen 0) seconds
+                      (or seed 'null)
+                      (jref sb "guarantee" #f)
+                      (jref (jref sb "fingerprint" #f) "id" #f))))
              ((string-prefix? "data: " line)
               (let ((payload (string-trim-both (substring line 6))))
                 (cond
-                 ((string-null? payload) (loop chunks gen done))
-                 ((string=? payload "[DONE]") (loop chunks gen #t))
+                 ((string-null? payload) (loop chunks gen done seed sb))
+                 ((string=? payload "[DONE]") (loop chunks gen #t seed sb))
                  (else
                   (let ((obj (json->scm (open-input-string payload))))
                     ;; A mid-stream error object ends the reply without the
@@ -250,6 +257,10 @@ server's usage count and seconds is the wall time from request to [DONE]."
                     (let ((usage (jref obj "usage" #f)))
                       (when (pair? usage)
                         (set! gen (jref usage "completion_tokens" gen))))
+                    (let ((s (jref obj "seed" #f)))
+                      (unless (eq? s #f) (set! seed s)))
+                    (let ((o (jref obj "sonicboom" #f)))
+                      (when (pair? o) (set! sb o)))
                     (let* ((choices (jref obj "choices" #f))
                            (choice (and (vector? choices)
                                         (> (vector-length choices) 0)
@@ -259,8 +270,8 @@ server's usage count and seconds is the wall time from request to [DONE]."
                       (loop (if (string? content)
                                 (cons content chunks)
                                 chunks)
-                            gen done)))))))
-             (else (loop chunks gen done)))))))))
+                            gen done seed sb)))))))
+             (else (loop chunks gen done seed sb)))))))))
 
 (define (parse-args args)
   "Parse the command line ARGS.
@@ -320,6 +331,9 @@ Returns: nothing; exits non-zero on a failed request or a missing turn."
                 (text (list-ref res 0))
                 (gen (list-ref res 1))
                 (seconds (list-ref res 2))
+                (seed (list-ref res 3))
+                (guarantee (list-ref res 4))
+                (fingerprint (list-ref res 5))
                 (hash (hex64 (fnv1a-64 text))))
            ;; Bytes, not a textual port: the default output encoding under
            ;; LC_ALL=C is ASCII and would replace every non-ASCII character
@@ -328,8 +342,11 @@ Returns: nothing; exits non-zero on a failed request or a missing turn."
                (format #f "~a/~a.~a.txt" out-dir arm-name index)
              (lambda (p) (put-bytevector p (string->utf8 text)))
              #:binary #t)
-           (format #t "turn=~a gen_tokens=~a seconds=~a hash=~a~%"
-                   index gen seconds hash)
+           (format #t "turn=~a gen_tokens=~a seconds=~a hash=~a seed=~a ~
+                       guarantee=~a fingerprint=~a~%"
+                   index gen seconds hash
+                   (if (eq? seed 'null) "greedy" seed)
+                   (or guarantee "none") (or fingerprint "none"))
            (set! gen-sum (+ gen-sum gen))
            (set! seconds-sum (+ seconds-sum seconds))
            (set! hashes (cons (cons index hash) hashes)))))

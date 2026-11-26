@@ -200,7 +200,7 @@ PyTorch: none"
     (_ (invalid "stop must be a string or an array of up to 4 strings" "stop"))))
 
 ;; A seed for a sampling request that did not ask for one. It is reported back
-;; in the reply (sonicboom_seed), so a client that keeps it replays the reply.
+;; in the reply (seed), so a client that keeps it replays the reply.
 (define (pick-seed)
   (random (expt 2 32) (random-state-from-platform)))
 
@@ -213,7 +213,7 @@ PyTorch: none"
 JSON values are the guile-json ones: objects are alists with string keys,
 arrays are vectors and null is the symbol null. An omitted temperature is 0
 (greedy). An omitted seed is 0 for a greedy request and a fresh random seed
-for a sampling one (the reply's sonicboom_seed tells the client which). Only
+for a sampling one (the reply's seed tells the client which). Only
 n=1 is supported.
 
 Args:
@@ -265,7 +265,7 @@ Note: a bad body raises (openai-error status type message param)."
                   (#f 0.0)
                   (v (number-in "min_p" v 0 1))))
          ;; A seed is only meaningful when sampling. A request that omits it
-         ;; gets a fresh one, returned as sonicboom_seed, so the client can
+         ;; gets a fresh one, returned as seed, so the client can
          ;; replay the reply; a greedy request keeps 0.
          (seed (match (ref body "seed")
                  (#f (if (> temperature 0) (pick-seed) 0))
@@ -534,21 +534,25 @@ PyTorch: none"
        ("type" . "function")
        ("function" . (("name" . ,name) ("arguments" . ,args)))))))
 
-(define* (completion-object id created model result #:key (seed 0))
+(define* (completion-object id created model result #:key (seed 'null) sonicboom)
   "The chat-completion object for RESULT.
 
 A reply that consists only of tool calls has a null content, as the OpenAI
 schema expects.
 
-Besides the OpenAI fields it carries sonicboom_seed, the sampling seed the
-reply was drawn with (0 for greedy), so a sampling client can replay it.
+Besides the OpenAI fields it carries seed, the sampling seed the reply was
+drawn with (null for greedy), so a sampling client can replay it, and the
+sonicboom object (fingerprint, replay_id, guarantee) that names the scope in
+which a replay is bit-identical.
 
 Args:
   id: the completion id.
   created: the creation time.
   model: the model id.
   result: a result.
-  seed: keyword; the request's sampling seed (default 0).
+  seed: keyword; the request's sampling seed, or null for greedy (default null).
+  sonicboom: keyword; the sonicboom object alist (default: no field, for a
+    caller that is not the server).
 Returns: a JSON object alist.
 Example:
   (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
@@ -574,7 +578,8 @@ PyTorch: none"
       ("object" . "chat.completion")
       ("created" . ,created)
       ("model" . ,model)
-      ("sonicboom_seed" . ,seed)
+      ("seed" . ,seed)
+      ,@(if sonicboom `(("sonicboom" . ,sonicboom)) '())
       ("choices"
        . #((("index" . 0)
             ("message"
@@ -588,7 +593,7 @@ PyTorch: none"
       ("usage" . ,(usage-object result)))))
 
 (define* (chunk-object id created model delta #:optional (finish-reason 'null)
-                      #:key seed)
+                      #:key seed sonicboom)
   "One streaming chat-completion chunk.
 
 Args:
@@ -598,8 +603,10 @@ Args:
   delta: the delta alist.
   finish-reason: optional; the finish reason, null while streaming is under
     way (default null).
-  seed: keyword; the request's sampling seed, carried on the first chunk
-    (default: no sonicboom_seed field).
+  seed: keyword; the request's sampling seed (null for greedy), carried on the
+    first and final chunks (default: no seed field).
+  sonicboom: keyword; the sonicboom object, carried on the first and final
+    chunks (default: no sonicboom field).
 Returns: a JSON object alist.
 Example:
   (use-modules (sonicboom serve openai))
@@ -610,23 +617,29 @@ PyTorch: none"
     ("object" . "chat.completion.chunk")
     ("created" . ,created)
     ("model" . ,model)
-    ,@(if seed `(("sonicboom_seed" . ,seed)) '())
+    ,@(if (eq? seed #f) '() `(("seed" . ,seed)))
+    ,@(if sonicboom `(("sonicboom" . ,sonicboom)) '())
     ("choices" . #((("index" . 0)
                     ("delta" . ,delta)
                     ("logprobs" . null)
                     ("finish_reason" . ,finish-reason))))))
 
 ;; The last chunk when stream_options.include_usage is set: no choices.
-(define (usage-chunk-object id created model result)
+(define* (usage-chunk-object id created model result #:key seed sonicboom)
   "The last streaming chunk, carrying the usage counts.
 
-It has no choices, as the OpenAI schema specifies for this chunk.
+It has no choices, as the OpenAI schema specifies for this chunk. When the
+reply streamed with include_usage this chunk is the final one, so seed and
+sonicboom are repeated here (the first chunk carried them too).
 
 Args:
   id: the completion id.
   created: the creation time.
   model: the model id.
   result: a result.
+  seed: keyword; the request's sampling seed (null for greedy); omitted when
+    not given.
+  sonicboom: keyword; the sonicboom object; omitted when not given.
 Returns: a JSON object alist.
 Example:
   (use-modules (sonicboom serve backend) (sonicboom serve mock-backend)
@@ -648,6 +661,8 @@ PyTorch: none"
     ("object" . "chat.completion.chunk")
     ("created" . ,created)
     ("model" . ,model)
+    ,@(if (eq? seed #f) '() `(("seed" . ,seed)))
+    ,@(if sonicboom `(("sonicboom" . ,sonicboom)) '())
     ("choices" . #())
     ("usage" . ,(usage-object result))))
 

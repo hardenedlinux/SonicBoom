@@ -393,11 +393,17 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
        "max_tokens":32,"temperature":0.8,"top_p":0.95,"seed":7}'
 ```
 
-An omitted `temperature` is 0 (greedy, not OpenAI's 1.0) and an omitted `seed`
-is 0, so a request that says nothing repeats exactly. `top_k` is an extension;
-`presence_penalty`/`frequency_penalty` apply only when `temperature` > 0 (the
-greedy path is a plain argmax). See `docs/serve-openai.md` §6 for the full
-request-field list.
+An omitted `temperature` is 0 (greedy, not OpenAI's 1.0), so a request that
+says nothing repeats exactly. A sampling request that omits `seed` gets a fresh
+one, reported back as the reply's top-level `seed` (`null` for greedy); a
+sampled reply also has the `X-SonicBoom-Seed` header. Every reply carries a
+`sonicboom` object — `fingerprint`, `replay_id`, `guarantee` — and
+`--replay-store DIR` (off by default) makes stored replies replayable through
+`POST /sonicboom/replay/:replay_id`, with `GET /sonicboom/history` listing
+them. `top_k` is an extension; `presence_penalty`/`frequency_penalty` apply
+only when `temperature` > 0 (the greedy path is a plain argmax). See
+`docs/reproducible-api.md` for the fingerprint's scope and the replay store,
+and `docs/serve-openai.md` §6 for the full request-field list.
 
 `tools/test-api-server.sh` takes the GGUFs to test — defaulting to the Gemma and
 Qwen files under `models/` when both are present — and runs the whole suite

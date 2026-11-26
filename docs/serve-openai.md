@@ -232,6 +232,8 @@ Endpoints:
 | `DELETE /sonicboom/jobs/:id` | cancel a generation by job id: `{"id", "status": "cancelled"}`; 404 `job_not_found` for an unknown or finished job (not OpenAI) |
 | `GET /v1/ws/chat` | WebSocket: one request (the same JSON body) per text message; the reply is the chunk objects as text messages, then `[DONE]`; a bad request gets an `error` object |
 | `GET /sonicboom/stats` | engine, pool and backend counters (not OpenAI) |
+| `POST /sonicboom/replay/:replay_id` | regenerate a stored reply from its request body and seed; 404 `replay_not_found` when the id is unknown or no replay store is configured (not OpenAI; see `docs/reproducible-api.md`) |
+| `GET /sonicboom/history` | a minimal HTML page of recent stored replies with seed, model, time and replay/copy-seed links; empty without a replay store (not OpenAI) |
 | `GET /health` | `ok` |
 
 Request fields: `model`, `messages` (string or text-part content; roles
@@ -252,11 +254,18 @@ ranges: `temperature` [0, 2], `top_p` and `min_p` [0, 1], `top_k` a
 non-negative integer, `repeat_penalty` ≥ 0 (0 is read as its 1 default).
 
 A seed is only meaningful when `temperature` > 0. A sampling request that
-omits `seed` gets a fresh one, and the reply carries it as `sonicboom_seed`
-(a non-OpenAI field on the completion object, and on the first chunk of a
-streamed reply); replaying the request with that `seed` reproduces the reply,
-including across a restart of the server. A greedy request reports
-`sonicboom_seed` 0 and ignores it.
+omits `seed` gets a fresh one; a greedy request ignores an explicit seed. The
+reply carries the seed as the top-level `seed` field (`null` for greedy), on
+the completion object and on the first and final chunks of a streamed reply,
+and a sampled reply also has the `X-SonicBoom-Seed` response header. Every
+reply also carries a `sonicboom` object — `fingerprint`, `replay_id` and
+`guarantee` — naming the scope inside which the same request and seed are
+bit-identical. Replaying the request with that `seed` reproduces the reply,
+including across a restart of the server on the same machine and build.
+`docs/reproducible-api.md` defines the fingerprint and the replay store;
+briefly, `--replay-store DIR` (off by default) keeps the request body locally,
+`POST /sonicboom/replay/:replay_id` regenerates a stored reply, and
+`GET /sonicboom/history` lists recent replies.
 
 With the real backend, `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
 `repeat_penalty` and the two penalties are passed to `boom_llm_decode` on
@@ -278,7 +287,9 @@ are accepted and ignored there.
  "ms": 1214, "model": "qwen2.5-7b", "kind": "chat", "queue_ms": 3,
  "switch_ms": 812, "prompt_tokens": 42, "completion_tokens": 128,
  "cached_tokens": 0, "size": null, "steps": null, "n": null,
- "free_mib_start": 5210, "free_mib_end": 5188}
+ "free_mib_start": 5210, "free_mib_end": 5188,
+ "seed": 2871560934, "fingerprint": "03d4602d080e8a6e",
+ "replay_id": "rp-4bd0f1a2c3d4e5f6"}
 ```
 
 - `id` names the request; `time` and `end` are its start and finish in Unix
@@ -296,6 +307,9 @@ are accepted and ignored there.
 - `free_mib_start` and `free_mib_end` are the device memory free at the
   request's start and end, read from `nvidia-smi`; null when it cannot be
   read.
+- `seed` is the sampling seed the reply used (`null` for greedy),
+  `fingerprint` is the reply's fingerprint id, and `replay_id` names the
+  reply. None of them contains request content.
 
 Request and response bodies are never written — no prompt, no conversation,
 no image description — so prompts stay out of the file. A streaming request's
@@ -441,9 +455,12 @@ Options: `--backend real|mock`, `--model` (default
 `qwen2.5-7b`), `--image-model`, `--host`, `--port`, `--queue`,
 `--max-sessions` (default 1 for the real backend, 4 for the mock), `--token-budget`,
 `--context-length` (default 16384 for the real backend, 8192 for the mock),
-`--step-delay`, `--prefill-delay`, `--runtime-dir`. The
-app sets `server.websocket = true` and `server.runners = queue + 2` (each
-running or waiting stream holds a runner).
+`--step-delay`, `--prefill-delay`, `--runtime-dir`, `--request-log`,
+`--replay-store`. The app sets `server.websocket = true` and
+`server.runners = queue + 2` (each running or waiting stream holds a runner).
+`--replay-store DIR` is off by default and stores request bodies locally; see
+[`reproducible-api.md`](reproducible-api.md) for what it keeps and the privacy
+consequences.
 
 ## 7. Running
 
@@ -470,7 +487,7 @@ guile -L bindings/guile/scheme bindings/guile/tests/serve/test-serve-http.scm
 python3 bindings/guile/tests/serve/test-openai-sdk.py      # pip install openai
 ```
 
-Results: units 80/80, HTTP 140/140, images 36/36; openai SDK (3.29.0) 24/24
+Results: units 85/85, HTTP 169/169, images 36/36; openai SDK (3.29.0) 24/24
 when last run.
 
 ## 8. Limits of the prototype
