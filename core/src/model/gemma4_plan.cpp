@@ -470,8 +470,8 @@ bool capture_residual_spine(const Gemma4Model& m,
     if (t >= m.config.vocab_size) return false;
   std::lock_guard<std::recursive_mutex> exec_lock(execution_mutex());
   planner::Graph graph =
-      build_gemma4_prefill_graph(m, n, /*symbolic=*/false, /*steer=*/-1,
-                                 /*stop=*/layer);
+      build_gemma4_prefill_graph(m, n, /*symbolic=*/false, /*steer_layer=*/-1,
+                                 /*stop_layer=*/layer);
   if (graph.nodes.empty()) return false;
   auto snap = planner::CpuResourceProvider::snapshot({.enumerate_cuda = false});
   if (!snap) return false;
